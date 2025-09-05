@@ -374,6 +374,27 @@ impl PyGraphConfig {
         }
     }
 
+    /// Create a randomised production-scale configuration for PGO training.
+    ///
+    /// Adds controlled noise to prevent PGO overfitting whilst maintaining
+    /// realistic test scenarios.
+    ///
+    /// Example:
+    ///     ```python
+    ///     config = GraphConfig.production_1m_randomized(None, 10.0)
+    ///     # 550k left + 550k right records with randomised thresholds
+    ///     ```
+    #[classmethod]
+    fn production_1m_randomized(
+        _cls: &Bound<'_, PyType>,
+        seed: Option<u64>,
+        jitter_percent: f64,
+    ) -> Self {
+        Self {
+            config: GraphConfig::production_1m_randomized(seed, jitter_percent),
+        }
+    }
+
     /// String representation for debugging.
     fn __repr__(&self) -> String {
         format!(
@@ -425,6 +446,34 @@ fn generate_hierarchical_graph(config: PyGraphConfig, _py: Python<'_>) -> GraphR
     Ok((python_edges, graph_data.total_nodes))
 }
 
+/// Generate a randomised hierarchical bipartite graph for PGO training.
+///
+/// Creates randomised variants to prevent PGO overfitting by varying
+/// probability values around standard production configurations.
+///
+/// Example:
+///     ```python
+///     edges, total_nodes = generate_production_1m_randomized(None, 10.0)
+///     collection = Collection.from_edges(edges)
+///     ```
+#[pyfunction]
+fn generate_production_1m_randomized(
+    seed: Option<u64>,
+    jitter_percent: f64,
+    _py: Python<'_>,
+) -> GraphResult {
+    let graph_data =
+        starlings_core::test_utils::generate_production_1m_randomized(seed, jitter_percent);
+
+    let python_edges: Vec<(i64, i64, f64)> = graph_data
+        .edges
+        .into_iter()
+        .map(|(id1, id2, weight)| (id1 as i64, id2 as i64, weight))
+        .collect();
+
+    Ok((python_edges, graph_data.total_nodes))
+}
+
 /// Convert Python object to Rust Key (optimised for performance)
 fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
     // Try integer types first (most common in large datasets)
@@ -456,5 +505,6 @@ fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPartition>()?;
     m.add_class::<PyGraphConfig>()?;
     m.add_function(wrap_pyfunction!(generate_hierarchical_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_production_1m_randomized, m)?)?;
     Ok(())
 }

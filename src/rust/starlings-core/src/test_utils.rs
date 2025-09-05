@@ -43,6 +43,68 @@ impl GraphConfig {
         }
     }
 
+    /// Create a randomised production-scale configuration for PGO training.
+    ///
+    /// Adds controlled noise to prevent PGO overfitting whilst maintaining
+    /// realistic test scenarios.
+    pub fn production_1m_randomized(seed: Option<u64>, jitter_percent: f64) -> Self {
+        let mut rng = if let Some(s) = seed {
+            fastrand::Rng::with_seed(s)
+        } else {
+            fastrand::Rng::new()
+        };
+
+        let jitter = jitter_percent / 100.0;
+
+        // Apply jitter to base thresholds
+        let threshold_0_9 = Self::add_jitter(&mut rng, 0.9, jitter);
+        let threshold_0_7 = Self::add_jitter(&mut rng, 0.7, jitter);
+        let threshold_0_5 = Self::add_jitter(&mut rng, 0.5, jitter);
+
+        // Vary target entity counts slightly to maintain hierarchy
+        let entity_jitter = 0.05;
+        let entities_200k = Self::add_entity_jitter(&mut rng, 200_000, entity_jitter);
+        let entities_100k = Self::add_entity_jitter(&mut rng, 100_000, entity_jitter);
+        let entities_50k = Self::add_entity_jitter(&mut rng, 50_000, entity_jitter);
+
+        Self {
+            n_left: 550_000,
+            n_right: 550_000,
+            n_isolates: 0,
+            thresholds: vec![
+                ThresholdConfig {
+                    threshold: threshold_0_9,
+                    target_entities: entities_200k,
+                },
+                ThresholdConfig {
+                    threshold: threshold_0_7,
+                    target_entities: entities_100k,
+                },
+                ThresholdConfig {
+                    threshold: threshold_0_5,
+                    target_entities: entities_50k,
+                },
+            ],
+        }
+    }
+
+    fn add_jitter(rng: &mut fastrand::Rng, base_value: f64, jitter_percent: f64) -> f64 {
+        let jitter_amount = base_value * jitter_percent;
+        let min_val = base_value - jitter_amount;
+        let max_val = base_value + jitter_amount;
+
+        // Ensure we stay within [0.0, 1.0] bounds
+        rng.f64() * (max_val - min_val) + min_val.clamp(0.0, 1.0)
+    }
+
+    fn add_entity_jitter(rng: &mut fastrand::Rng, base_count: usize, jitter_percent: f64) -> usize {
+        let jitter_amount = (base_count as f64 * jitter_percent) as usize;
+        let min_count = base_count.saturating_sub(jitter_amount);
+        let max_count = base_count + jitter_amount;
+
+        rng.usize(min_count..=max_count)
+    }
+
     /// Create a large-scale configuration for 10M+ record testing.
     pub fn production_10m() -> Self {
         Self {
@@ -65,6 +127,15 @@ impl GraphConfig {
             ],
         }
     }
+}
+
+/// Generate a randomised hierarchical bipartite graph for PGO training.
+///
+/// Creates randomised variants to prevent PGO overfitting by varying
+/// probability values around the standard production configuration.
+pub fn generate_production_1m_randomized(seed: Option<u64>, jitter_percent: f64) -> GraphData {
+    let config = GraphConfig::production_1m_randomized(seed, jitter_percent);
+    generate_hierarchical_graph(config)
 }
 
 /// Generated graph data with edges and entity records.

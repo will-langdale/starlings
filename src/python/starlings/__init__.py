@@ -51,6 +51,9 @@ from .starlings import Collection as PyCollection
 from .starlings import GraphConfig as PyGraphConfig
 from .starlings import Partition as PyPartition
 from .starlings import generate_hierarchical_graph as _generate_hierarchical_graph
+from .starlings import (
+    generate_production_1m_randomized as _generate_production_1m_randomized,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,24 @@ def generate_production_1m_graph() -> tuple[list[tuple[int, int, float]], int]:
     """
     config = PyGraphConfig.production_1m()
     result = _generate_hierarchical_graph(config)
+    return result  # type: ignore[no-any-return]
+
+
+def generate_production_1m_graph_randomized(
+    seed: int | None = None, jitter_percent: float = 10.0
+) -> tuple[list[tuple[int, int, float]], int]:
+    """Generate a randomised production-scale 1M record graph for PGO training.
+
+    Creates production-scale datasets with controlled randomness to prevent
+    PGO overfitting whilst maintaining realistic test scenarios.
+
+    Example:
+        ```python
+        edges, total_nodes = generate_production_1m_graph_randomized(None, 10.0)
+        collection = Collection.from_edges(edges)
+        ```
+    """
+    result = _generate_production_1m_randomized(seed, jitter_percent)
     return result  # type: ignore[no-any-return]
 
 

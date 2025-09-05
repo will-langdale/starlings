@@ -30,9 +30,10 @@ pgo:
     RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
         uv run maturin develop --release
 
-    # Step 3: Run representative workloads
-    echo "🏃 Step 2/3: Running profiling workloads..."
-    just bench collection || echo "⚠️  Benchmarks failed, continuing with available profile data"
+    # Step 3: Run representative workloads with randomisation to prevent overfitting
+    echo "🏃 Step 2/3: Running randomised profiling workloads..."
+    timeout 300s just bench pgo || echo "⚠️  PGO benchmarks timed out or failed, falling back to deterministic benchmark"
+    timeout 120s just bench collection || echo "⚠️  Backup benchmarks also failed, continuing with available profile data"
 
     # Check if profile data was generated
     if ls /tmp/pgo-data/*.profraw 1> /dev/null 2>&1; then
