@@ -73,7 +73,11 @@ This project uses `just` as a command runner with a modular structure and `uv` f
   - `just test rust`: Run Rust core tests only
 - `just bench`: Run benchmarks (see `just bench list` for options)
   - `just bench rust`: Rust core benchmarks for performance validation
-  - `just bench collection`: End-to-end processing benchmarks
+  - `just bench collection`: End-to-end processing benchmarks (accepts scale parameter)
+    - `just bench collection`: Default N=1 (1M entities)
+    - `just bench collection 2`: N=2 (2M entities)
+    - `just bench collection 0.5`: N=0.5 (500k entities)
+    - N parameter scales all benchmark sizes proportionally
 
 ## Testing strategy
 

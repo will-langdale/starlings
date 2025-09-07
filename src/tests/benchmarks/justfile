@@ -13,8 +13,8 @@ rust:
     cargo bench -p starlings-core
 
 # Benchmarks for end-to-end processing
-collection:
-    uv run python src/tests/benchmarks/test_bench_collections.py
+collection N="1":
+    uv run python src/tests/benchmarks/test_bench_collections.py {{N}}
 
 # Randomised benchmarks for PGO training (prevents overfitting)
 pgo:

@@ -6,6 +6,7 @@ and only run via `just bench` for detailed performance analysis.
 
 import logging
 import os
+import sys
 import time
 
 import pytest
@@ -19,6 +20,10 @@ pytestmark = pytest.mark.benchmark
 
 class TestPerformanceBenchmarks:
     """Production-scale benchmarks for performance analysis."""
+
+    def __init__(self, n: float = 1.0) -> None:
+        """Initialize with scale parameter N."""
+        self.n = n
 
     @classmethod
     def setup_class(cls) -> None:
@@ -37,12 +42,14 @@ class TestPerformanceBenchmarks:
         logger.info("=" * 60)
 
         # Generate production-scale dataset using unified generator
-        logger.info("📊 Generating 1M entity production dataset...")
+        logger.info(f"📊 Generating {self.n:.1f}M entity production dataset...")
         start_generation = time.perf_counter()
-        edges = sl.generate_entity_resolution_edges(1_000_000)
+        edges = sl.generate_entity_resolution_edges(int(self.n * 1_000_000))
         generation_time = time.perf_counter() - start_generation
 
-        logger.info(f"   Dataset: {len(edges):,} edges, {1_000_000:,} entities")
+        logger.info(
+            f"   Dataset: {len(edges):,} edges, {int(self.n * 1_000_000):,} entities"
+        )
         logger.info(f"   Generation time: {generation_time:.3f}s")
 
         # Benchmark Collection.from_edges with full instrumentation
@@ -61,10 +68,11 @@ class TestPerformanceBenchmarks:
 
         # Validate the unified generator structure
         logger.info(
-            f"   Validation: 1M entities at 1.0 -> {collection.at(1.0).num_entities:,}"
+            f"   Validation: {self.n:.1f}M entities at 1.0 -> "
+            f"{collection.at(1.0).num_entities:,}"
         )
         logger.info(
-            f"   Validation: 500k entities at 0.0 -> "
+            f"   Validation: {int(self.n * 500_000):,} entities at 0.0 -> "
             f"{collection.at(0.0).num_entities:,}"
         )
         logger.info(f"   Partition time: {partition_time:.3f}s")
@@ -87,8 +95,8 @@ class TestPerformanceBenchmarks:
         # The constructive algorithm guarantees n entities at 1.0 and n/2 at 0.0
         # Intermediate values should be monotonically decreasing between these bounds
         actual_entities_08 = len(partition.entities)
-        min_entities = 1_000_000 // 2  # n/2 at complete merging
-        max_entities = 1_000_000  # n at full separation
+        min_entities = (self.n * 1_000_000) // 2  # n/2 at complete merging
+        max_entities = self.n * 1_000_000  # n at full separation
 
         assert min_entities <= actual_entities_08 <= max_entities, (
             f"Entity count at 0.8 should be between {min_entities:,} and "
@@ -104,7 +112,12 @@ class TestPerformanceBenchmarks:
         logger.info("📈 SCALABILITY ANALYSIS")
         logger.info("=" * 60)
 
-        sizes = [10_000, 50_000, 100_000, 500_000]
+        sizes = [
+            int(self.n * 10_000),
+            int(self.n * 50_000),
+            int(self.n * 100_000),
+            int(self.n * 500_000),
+        ]
         results: list[tuple[int, float, float]] = []
 
         for size in sizes:
@@ -114,7 +127,7 @@ class TestPerformanceBenchmarks:
             # Note: size represents number of entities, not edges
             # Each entity produces 5 edges, so divide by 5 to get entity count
             entity_count = max(size // 5, 1000)  # Minimum 1000 entities
-            edges = sl.generate_entity_resolution_edges(entity_count)
+            edges = sl.generate_entity_resolution_edges(int(entity_count))
             edges = edges[:size]  # Trim to exact edge size for comparison
 
             # Benchmark
@@ -141,8 +154,8 @@ class TestPerformanceBenchmarks:
         logger.info("=" * 60)
 
         # Create test collection using unified generator
-        # Generate 20k entities (produces 100k edges)
-        edges = sl.generate_entity_resolution_edges(20_000)
+        # Generate N*20k entities (produces N*100k edges)
+        edges = sl.generate_entity_resolution_edges(int(self.n * 20_000))
         collection = sl.Collection.from_edges(edges)
 
         thresholds = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
@@ -170,13 +183,13 @@ class TestPerformanceBenchmarks:
         logger.info("\n✅ Cache performance validated")
 
 
-def run_benchmarks() -> None:
+def run_benchmarks(n: float = 1.0) -> None:
     """Run all benchmarks programmatically (for use in justfile)."""
-    logger.info("🚀 Starting Starlings Performance Benchmarks")
+    logger.info(f"🚀 Starting Starlings Performance Benchmarks (N={n}M entities)")
     logger.info("=" * 60)
 
-    # Create test instance
-    benchmark_tests = TestPerformanceBenchmarks()
+    # Create test instance with N parameter
+    benchmark_tests = TestPerformanceBenchmarks(n)
     benchmark_tests.setup_class()
 
     try:
@@ -195,4 +208,6 @@ def run_benchmarks() -> None:
 
 
 if __name__ == "__main__":
-    run_benchmarks()
+    # Parse N parameter from command line (default to 1)
+    n = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+    run_benchmarks(n)
