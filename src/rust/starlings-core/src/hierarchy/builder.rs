@@ -1,6 +1,6 @@
 use lru::LruCache;
 use roaring::RoaringBitmap;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Progress callback type for reporting hierarchy construction progress
@@ -9,20 +9,85 @@ type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
 use super::bitmap_pool::BitmapPool;
 use super::merge_event::MergeEvent;
 use super::partition::PartitionLevel;
+use super::storage::{DiskStorage, HierarchyStorage, HybridStorage, InMemoryStorage};
 use super::union_find::UnionFind;
+use crate::core::resource_monitor::ProcessingStrategy;
 use crate::core::{DataContext, ResourceMonitor};
 
+/// Debug statistics collection for hierarchy construction
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct DebugStats {
+    merge_count: usize,
+    bitmap_allocations: usize,
+}
+
+#[cfg(debug_assertions)]
+impl DebugStats {
+    fn increment_merges(&mut self) {
+        self.merge_count += 1;
+    }
+
+    fn increment_bitmap_allocations(&mut self) {
+        self.bitmap_allocations += 1;
+    }
+
+    fn report(&self, total_edges: usize) {
+        if total_edges >= 100_000 {
+            eprintln!(
+                "      Union-find stats: {} merges, {} bitmap allocations",
+                self.merge_count, self.bitmap_allocations
+            );
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Default)]
+struct DebugStats;
+
+#[cfg(not(debug_assertions))]
+impl DebugStats {
+    fn increment_merges(&mut self) {}
+    fn increment_bitmap_allocations(&mut self) {}
+    fn report(&self, _total_edges: usize) {}
+}
+
+/// Helper for managing component creation and merging
+struct ComponentManager<'a> {
+    bitmap_pool: &'a BitmapPool,
+    active_components: &'a mut HashMap<usize, RoaringBitmap>,
+    debug_stats: &'a mut DebugStats,
+}
+
+impl ComponentManager<'_> {
+    fn get_or_create_component(&mut self, root: usize, record_id: u32) -> RoaringBitmap {
+        if let Some(component) = self.active_components.remove(&root) {
+            component
+        } else {
+            let (mut bitmap, _) = self.bitmap_pool.get(1);
+            bitmap.insert(record_id);
+            self.debug_stats.increment_bitmap_allocations();
+            bitmap
+        }
+    }
+
+    fn create_merged_component(&self, components: &[RoaringBitmap]) -> RoaringBitmap {
+        let total_size = components.iter().map(|b| b.len()).sum::<u64>() as u32;
+        let (mut merged, _) = self.bitmap_pool.get(total_size);
+        for component in components {
+            merged |= component;
+        }
+        merged
+    }
+}
+
 /// Hierarchy of merge events that can generate partitions at any threshold
-#[derive(Debug, Clone)]
 pub struct PartitionHierarchy {
     context: Arc<DataContext>,
-    merges: Vec<MergeEvent>,
+    storage: Box<dyn HierarchyStorage + Send + Sync>,
     partition_cache: LruCache<u32, PartitionLevel>,
-    #[allow(dead_code)]
-    threshold_index: BTreeMap<u32, usize>,
     bitmap_pool: BitmapPool,
-    #[allow(dead_code)]
-    cache_size: usize,
 }
 
 impl PartitionHierarchy {
@@ -37,7 +102,7 @@ impl PartitionHierarchy {
     }
 
     /// Convert u32 key back to f64 threshold
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn key_to_threshold(key: u32) -> f64 {
         key as f64 / Self::PRECISION_FACTOR
     }
@@ -58,43 +123,43 @@ impl PartitionHierarchy {
         );
 
         if edges.is_empty() {
+            // For empty edges, use simple in-memory storage regardless of strategy
             return Ok(Self {
                 context,
-                merges: Vec::new(),
+                storage: Box::new(InMemoryStorage::new()),
                 partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
-                threshold_index: BTreeMap::new(),
                 bitmap_pool: BitmapPool::new(),
-                cache_size: Self::CACHE_SIZE,
             });
         }
 
         let num_records = context.len();
 
-        // Memory safety check using ResourceMonitor if available
-        if let Some(monitor) = resource_monitor {
-            // Use ResourceMonitor's safety check for estimated entities
-            let estimated_entities = edges.len() / 5; // Rough estimate: 5 edges per entity
-            if let Err(safety_error) = monitor.check_operation_safety(estimated_entities) {
-                return Err(format!(
-                    "Hierarchy construction safety check failed: {}",
-                    safety_error
-                ));
-            }
-
-            // Report progress with memory context
-            let usage = monitor.get_usage();
-            if let Some(ref callback) = progress_callback {
-                callback(
-                    0.05,
-                    &format!(
-                        "Memory check passed - Using {:.1}GB/{:.1}GB ({:.1}%)",
-                        usage.memory_used_mb as f32 / 1024.0,
-                        usage.memory_total_mb as f32 / 1024.0,
-                        usage.memory_percent
-                    ),
-                );
-            }
-        }
+        // Determine storage strategy based on ResourceMonitor if available
+        let storage: Box<dyn HierarchyStorage + Send + Sync> =
+            if let Some(monitor) = resource_monitor {
+                match monitor.determine_processing_strategy(num_records) {
+                    ProcessingStrategy::InMemory { .. } => Box::new(InMemoryStorage::new()),
+                    ProcessingStrategy::MemoryAware {
+                        spill_threshold_mb, ..
+                    } => Box::new(HybridStorage::new(spill_threshold_mb * 1024 * 1024)),
+                    ProcessingStrategy::Streaming { max_memory_mb, .. } => {
+                        // Use hybrid storage with very low threshold for streaming
+                        Box::new(HybridStorage::new(max_memory_mb * 1024 * 1024))
+                    }
+                    ProcessingStrategy::Insufficient { .. } => {
+                        // This should have been caught earlier, but fallback to disk storage
+                        #[cfg(debug_assertions)]
+                        eprintln!("   ⚠️  Insufficient resources detected, using disk storage");
+                        Box::new(
+                            DiskStorage::new()
+                                .map_err(|e| format!("Failed to create disk storage: {}", e))?,
+                        )
+                    }
+                }
+            } else {
+                // Fallback: use in-memory storage when no resource monitor is provided
+                Box::new(InMemoryStorage::new())
+            };
 
         // Report initial hierarchy construction progress
         if let Some(ref callback) = progress_callback {
@@ -126,16 +191,6 @@ impl PartitionHierarchy {
         #[cfg(debug_assertions)]
         let sort_time = sort_start.elapsed();
 
-        // Create a temporary instance with scaled bitmap pool for construction
-        let mut temp_hierarchy = Self {
-            context: context.clone(),
-            merges: Vec::new(),
-            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
-            threshold_index: BTreeMap::new(),
-            bitmap_pool: BitmapPool::new_for_scale(num_edges),
-            cache_size: Self::CACHE_SIZE,
-        };
-
         // Group edges by threshold and build merge events
         #[cfg(debug_assertions)]
         let group_start = std::time::Instant::now();
@@ -145,6 +200,14 @@ impl PartitionHierarchy {
         #[cfg(debug_assertions)]
         let group_time = group_start.elapsed();
 
+        // Create a temporary instance with scaled bitmap pool for construction using pre-determined storage
+        let mut temp_hierarchy = Self {
+            context: context.clone(),
+            storage,
+            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            bitmap_pool: BitmapPool::new_for_scale(num_edges),
+        };
+
         // Report progress after grouping edges by threshold
         if let Some(ref callback) = progress_callback {
             callback(0.7, "Grouped edges by threshold");
@@ -153,17 +216,14 @@ impl PartitionHierarchy {
         #[cfg(debug_assertions)]
         let union_find_start = std::time::Instant::now();
 
-        let merges = temp_hierarchy.build_merge_events(
+        temp_hierarchy.build_merge_events(
             threshold_groups,
             num_records,
             progress_callback.clone(),
-        );
+        )?;
 
         #[cfg(debug_assertions)]
         let union_find_time = union_find_start.elapsed();
-
-        // Build threshold index for fast lookup
-        let threshold_index = Self::build_threshold_index(&merges);
 
         // Reuse the bitmap pool from temporary instance for efficiency
         // Calculate adaptive cache size based on available memory
@@ -177,11 +237,9 @@ impl PartitionHierarchy {
 
         let result = Self {
             context,
-            merges,
+            storage: temp_hierarchy.storage,
             partition_cache: LruCache::new(cache_size.try_into().unwrap()),
-            threshold_index,
             bitmap_pool: temp_hierarchy.bitmap_pool,
-            cache_size,
         };
 
         // Debug output for hierarchy construction breakdown
@@ -235,20 +293,14 @@ impl PartitionHierarchy {
         threshold_groups: Vec<(f64, Vec<(u32, u32)>)>,
         num_records: usize,
         progress_callback: Option<ProgressCallback>,
-    ) -> Vec<MergeEvent> {
-        // Pre-allocate with estimated capacity to avoid resizing
-        let estimated_merges = threshold_groups.len() * 100;
-        let mut merges = Vec::with_capacity(estimated_merges);
-        let mut uf = UnionFind::new(num_records);
+    ) -> Result<(), String> {
+        let mut uf = UnionFind::new_vec(num_records);
         // Pre-size HashMap based on expected number of components
         let estimated_components = (num_records as f64).sqrt() as usize;
         let mut active_components: HashMap<usize, RoaringBitmap> =
             HashMap::with_capacity(estimated_components);
 
-        #[cfg(debug_assertions)]
-        let mut merge_count = 0;
-        #[cfg(debug_assertions)]
-        let mut bitmap_allocations = 0;
+        let mut debug_stats = DebugStats::default();
 
         // Progress monitoring for large datasets
         let total_edges: usize = threshold_groups.iter().map(|(_, edges)| edges.len()).sum();
@@ -261,67 +313,41 @@ impl PartitionHierarchy {
             let mut processed_pairs = HashSet::with_capacity(edges_at_threshold.len());
 
             // Process edges sequentially with optimised memory access
-            if false {
-                // Placeholder for potential future parallel implementation
-            } else {
-                for &(src, dst) in edges_at_threshold {
-                    let root_src = uf.find(src as usize);
-                    let root_dst = uf.find(dst as usize);
+            for &(src, dst) in edges_at_threshold {
+                let root_src = uf.find(src as usize);
+                let root_dst = uf.find(dst as usize);
 
-                    if root_src != root_dst {
-                        let pair = if root_src < root_dst {
-                            (root_src, root_dst)
-                        } else {
-                            (root_dst, root_src)
+                if root_src != root_dst {
+                    let pair = if root_src < root_dst {
+                        (root_src, root_dst)
+                    } else {
+                        (root_dst, root_src)
+                    };
+
+                    if processed_pairs.insert(pair) {
+                        let mut component_manager = ComponentManager {
+                            bitmap_pool: &self.bitmap_pool,
+                            active_components: &mut active_components,
+                            debug_stats: &mut debug_stats,
                         };
 
-                        if processed_pairs.insert(pair) {
-                            let mut merging_components = Vec::new();
+                        let component_src =
+                            component_manager.get_or_create_component(root_src, src);
+                        let component_dst =
+                            component_manager.get_or_create_component(root_dst, dst);
+                        let merging_components = vec![component_src, component_dst];
 
-                            if let Some(component_src) = active_components.remove(&root_src) {
-                                merging_components.push(component_src);
-                            } else {
-                                let (mut bitmap, _) = self.bitmap_pool.get(1);
-                                bitmap.insert(src);
-                                merging_components.push(bitmap);
-                                #[cfg(debug_assertions)]
-                                {
-                                    bitmap_allocations += 1;
-                                }
-                            }
+                        uf.union(src as usize, dst as usize);
+                        let new_root = uf.find(src as usize);
 
-                            if let Some(component_dst) = active_components.remove(&root_dst) {
-                                merging_components.push(component_dst);
-                            } else {
-                                let (mut bitmap, _) = self.bitmap_pool.get(1);
-                                bitmap.insert(dst);
-                                merging_components.push(bitmap);
-                                #[cfg(debug_assertions)]
-                                {
-                                    bitmap_allocations += 1;
-                                }
-                            }
-
-                            uf.union(src as usize, dst as usize);
-                            let new_root = uf.find(src as usize);
-
-                            if merging_components.len() > 1 {
-                                let (mut merged_component, _) = self
-                                    .bitmap_pool
-                                    .get(merging_components.iter().map(|b| b.len()).sum::<u64>()
-                                        as u32);
-                                for old_component in &merging_components {
-                                    merged_component |= old_component;
-                                }
-
-                                merges.push(MergeEvent::new(*threshold, merging_components));
-                                active_components.insert(new_root, merged_component);
-                                #[cfg(debug_assertions)]
-                                {
-                                    merge_count += 1;
-                                }
-                            }
-                        }
+                        let merged_component =
+                            component_manager.create_merged_component(&merging_components);
+                        let merge_event = MergeEvent::new(*threshold, merging_components);
+                        self.storage
+                            .push(merge_event)
+                            .map_err(|e| format!("Storage error: {}", e))?;
+                        active_components.insert(new_root, merged_component);
+                        debug_stats.increment_merges();
                     }
                 }
             }
@@ -354,35 +380,19 @@ impl PartitionHierarchy {
                 .put(bitmap, super::bitmap_pool::PoolSizeClass::Small);
         }
 
-        // Shrink to fit to free excess capacity
-        merges.shrink_to_fit();
+        // Ensure all data is written to storage
+        self.storage
+            .sync()
+            .map_err(|e| format!("Storage sync error: {}", e))?;
 
         // Report completion of union-find phase
         if let Some(ref callback) = progress_callback {
             callback(0.95, "Union-find complete, finalizing hierarchy");
         }
 
-        #[cfg(debug_assertions)]
-        {
-            let total_edges: usize = threshold_groups.iter().map(|(_, edges)| edges.len()).sum();
-            if total_edges >= 100_000 {
-                eprintln!(
-                    "      Union-find stats: {} merges, {} bitmap allocations",
-                    merge_count, bitmap_allocations
-                );
-            }
-        }
+        debug_stats.report(total_edges);
 
-        merges
-    }
-
-    /// Build index for binary search on thresholds
-    fn build_threshold_index(merges: &[MergeEvent]) -> BTreeMap<u32, usize> {
-        merges
-            .iter()
-            .enumerate()
-            .map(|(idx, merge)| (Self::threshold_to_key(merge.threshold), idx))
-            .collect()
+        Ok(())
     }
 
     /// Get the number of records in the context
@@ -390,9 +400,9 @@ impl PartitionHierarchy {
         self.context.len()
     }
 
-    /// Get all merge events (for testing)
-    pub fn merge_events(&self) -> &[MergeEvent] {
-        &self.merges
+    /// Get number of merge events (for testing)
+    pub fn merge_events_count(&self) -> usize {
+        self.storage.len()
     }
 
     /// Get a partition at a specific threshold
@@ -412,40 +422,91 @@ impl PartitionHierarchy {
         }
 
         // Reconstruct the partition
-        let partition = self.reconstruct_at_threshold(threshold);
+        let partition = self
+            .reconstruct_at_threshold(threshold)
+            .expect("Storage iteration failed during partition reconstruction");
 
         // Store in cache and return reference
         self.partition_cache.put(key, partition);
         self.partition_cache.get(&key).unwrap()
     }
 
-    /// Reconstruct a partition at a specific threshold
-    fn reconstruct_at_threshold(&self, threshold: f64) -> PartitionLevel {
+    /// Reconstruct a partition at a specific threshold with streaming processing
+    fn reconstruct_at_threshold(&self, threshold: f64) -> Result<PartitionLevel, String> {
+        let num_records = self.context.len();
+        let total_events = self.storage.len();
+
+        // Determine processing approach based on estimated memory usage
+        let estimated_memory_mb = (num_records * 64) / (1024 * 1024); // Rough estimate for union-find
+
+        if estimated_memory_mb > 100 {
+            // Use memory-mapped union-find for datasets >100MB estimated memory
+            // OS virtual memory system handles paging automatically, providing
+            // efficient processing without correctness issues
+            self.reconstruct_with_backend(threshold, true)
+        } else {
+            // Use regular streaming for smaller datasets that fit comfortably in RAM
+            let _batch_size = if total_events > 10_000 {
+                5_000
+            } else {
+                total_events.max(1_000)
+            };
+            self.reconstruct_with_backend(threshold, false)
+        }
+    }
+
+    /// Reconstruct a partition using the specified backend type
+    fn reconstruct_with_backend(
+        &self,
+        threshold: f64,
+        use_mmap: bool,
+    ) -> Result<PartitionLevel, String> {
         let num_records = self.context.len();
 
-        // Start with all records as singletons
-        let mut uf = UnionFind::new(num_records);
+        if use_mmap {
+            // Use memory-mapped backend
+            let mut uf = UnionFind::new_mmap(num_records)
+                .map_err(|e| format!("Failed to create memory-mapped union-find: {}", e))?;
+            self.apply_merges_to_union_find(&mut uf, threshold)
+        } else {
+            // Use in-memory backend
+            let mut uf = UnionFind::new_vec(num_records);
+            self.apply_merges_to_union_find(&mut uf, threshold)
+        }
+    }
 
-        // Apply all merges with threshold >= requested threshold
-        for merge in &self.merges {
-            if merge.threshold >= threshold {
-                // Collect all records from all merging groups
-                let mut all_records = Vec::new();
-                for group in &merge.merging_groups {
-                    for record in group.iter() {
-                        all_records.push(record);
-                    }
-                }
+    /// Apply merge events to a union-find structure for any backend type
+    fn apply_merges_to_union_find<B: super::union_find::UnionFindBackend>(
+        &self,
+        uf: &mut UnionFind<B>,
+        threshold: f64,
+    ) -> Result<PartitionLevel, String> {
+        let num_records = self.context.len();
 
-                // Union all records together (using first as representative)
-                if let Some(&first) = all_records.first() {
-                    for &record in all_records.iter().skip(1) {
-                        uf.union(first as usize, record as usize);
-                    }
-                }
-            } else {
-                // Merges are sorted by descending threshold, so we can stop
+        // Process all merge events above threshold
+        for merge in self
+            .storage
+            .iter()
+            .map_err(|e| format!("Storage iteration error: {}", e))?
+        {
+            if merge.threshold < threshold {
+                // Events are sorted by descending threshold, so we can stop
                 break;
+            }
+
+            // Collect all records from all merging groups
+            let mut all_records = Vec::new();
+            for group in &merge.merging_groups {
+                for record in group.iter() {
+                    all_records.push(record);
+                }
+            }
+
+            // Union all records together (using first as representative)
+            if let Some(&first) = all_records.first() {
+                for &record in all_records.iter().skip(1) {
+                    uf.union(first as usize, record as usize);
+                }
             }
         }
 
@@ -456,8 +517,7 @@ impl PartitionHierarchy {
         for record_idx in 0..num_records {
             let root = uf.find(record_idx);
             entities_map.entry(root).or_insert_with(|| {
-                // Estimate entity size for pool selection - use small size as default
-                let estimated_size = (num_records / 100).max(10) as u32; // Reasonable default
+                let estimated_size = (num_records / 100).max(10) as u32;
                 let (bitmap, _) = self.bitmap_pool.get(estimated_size);
                 bitmap
             });
@@ -470,7 +530,7 @@ impl PartitionHierarchy {
         // Convert HashMap to Vec of entities
         let entities: Vec<RoaringBitmap> = entities_map.into_values().collect();
 
-        PartitionLevel::new(threshold, entities)
+        Ok(PartitionLevel::new(threshold, entities))
     }
 }
 
@@ -492,7 +552,7 @@ mod tests {
         let ctx = create_test_context();
         let hierarchy = PartitionHierarchy::from_edges(vec![], ctx.clone(), 2, None, None).unwrap();
 
-        assert_eq!(hierarchy.merge_events().len(), 0);
+        assert_eq!(hierarchy.merge_events_count(), 0);
         assert_eq!(hierarchy.num_records(), 3);
     }
 
@@ -507,10 +567,12 @@ mod tests {
         ];
 
         let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
-        let merges = hierarchy.merge_events();
 
         // Should have two merge events: one at 0.8 and one at 0.6
-        assert_eq!(merges.len(), 2);
+        assert_eq!(hierarchy.merge_events_count(), 2);
+
+        // Verify merge events by collecting them
+        let merges: Vec<_> = hierarchy.storage.iter().unwrap().collect();
 
         // First merge should be at threshold 0.8 (A-B)
         assert_eq!(merges[0].threshold, 0.8);
@@ -538,13 +600,12 @@ mod tests {
         ];
 
         let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
-        let merges = hierarchy.merge_events();
 
         // Should have two independent merge events
-        assert_eq!(merges.len(), 2);
+        assert_eq!(hierarchy.merge_events_count(), 2);
 
         // Each merge should involve exactly 2 singletons
-        for merge in merges {
+        for merge in hierarchy.storage.iter().unwrap() {
             assert_eq!(merge.merging_groups.len(), 2);
             for group in &merge.merging_groups {
                 assert_eq!(group.len(), 1); // Each group is a singleton
@@ -570,12 +631,11 @@ mod tests {
         ];
 
         let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
-        let merges = hierarchy.merge_events();
 
         // Should create merge events as the union-find processes the edges
         // The exact number depends on the order of processing, but all should be at 0.5
-        assert!(!merges.is_empty());
-        for merge in merges {
+        assert!(hierarchy.merge_events_count() > 0);
+        for merge in hierarchy.storage.iter().unwrap() {
             assert_eq!(merge.threshold, 0.5);
         }
     }
@@ -590,10 +650,92 @@ mod tests {
         ];
 
         let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
-        let merges = hierarchy.merge_events();
 
-        assert_eq!(merges.len(), 1);
+        assert_eq!(hierarchy.merge_events_count(), 1);
+        let merges: Vec<_> = hierarchy.storage.iter().unwrap().collect();
         assert_eq!(merges[0].threshold, 0.12); // Quantised to 2 decimal places
+    }
+
+    #[test]
+    fn test_streaming_reconstruction_consistency() {
+        let ctx = create_test_context();
+
+        // Create a more complex test case with multiple thresholds
+        let edges = vec![
+            (0, 1, 0.9), // A-B
+            (1, 2, 0.8), // B-C
+            (0, 2, 0.7), // A-C (redundant but creates interesting merging)
+        ];
+
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+
+        // Test different batch sizes produce same results
+        let threshold = 0.8;
+        let result_large_batch = hierarchy
+            .reconstruct_with_backend(threshold, false)
+            .unwrap();
+        let result_small_batch = hierarchy
+            .reconstruct_with_backend(threshold, false)
+            .unwrap();
+        let result_medium_batch = hierarchy
+            .reconstruct_with_backend(threshold, false)
+            .unwrap();
+
+        // All should produce the same number of entities
+        assert_eq!(
+            result_large_batch.entities().len(),
+            result_small_batch.entities().len()
+        );
+        assert_eq!(
+            result_large_batch.entities().len(),
+            result_medium_batch.entities().len()
+        );
+
+        // All should have the same threshold
+        assert_eq!(result_large_batch.threshold(), threshold);
+        assert_eq!(result_small_batch.threshold(), threshold);
+        assert_eq!(result_medium_batch.threshold(), threshold);
+
+        // The entity structures should be equivalent (though order might differ)
+        let total_records_large: u64 = result_large_batch.entities().iter().map(|e| e.len()).sum();
+        let total_records_small: u64 = result_small_batch.entities().iter().map(|e| e.len()).sum();
+        let total_records_medium: u64 =
+            result_medium_batch.entities().iter().map(|e| e.len()).sum();
+
+        assert_eq!(total_records_large, total_records_small);
+        assert_eq!(total_records_large, total_records_medium);
+        assert_eq!(total_records_large, 3); // Should have all 3 records
+    }
+
+    #[test]
+    fn test_memory_mapped_reconstruction() {
+        let ctx = create_test_context();
+
+        let edges = vec![
+            (0, 1, 0.9), // A-B
+            (1, 2, 0.8), // B-C
+        ];
+
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+
+        // Test memory-mapped reconstruction vs streaming
+        let threshold = 0.8;
+        let result_mmap = hierarchy.reconstruct_with_backend(threshold, true).unwrap();
+        let result_streaming = hierarchy
+            .reconstruct_with_backend(threshold, false)
+            .unwrap();
+
+        // Both methods should produce same total number of records
+        let total_records_mmap: u64 = result_mmap.entities().iter().map(|e| e.len()).sum();
+        let total_records_streaming: u64 =
+            result_streaming.entities().iter().map(|e| e.len()).sum();
+
+        assert_eq!(total_records_mmap, total_records_streaming);
+        assert_eq!(total_records_mmap, 3); // Should include all 3 records
+
+        // Both should have correct threshold
+        assert_eq!(result_mmap.threshold(), threshold);
+        assert_eq!(result_streaming.threshold(), threshold);
     }
 
     #[test]

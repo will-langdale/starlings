@@ -41,16 +41,15 @@ class TestPerformanceBenchmarks:
         logger.info("🔬 PRODUCTION-SCALE PERFORMANCE ANALYSIS")
         logger.info("=" * 60)
 
-        # Pre-flight memory safety check
+        # System resource overview - Starlings will automatically manage resources
         num_entities = int(self.n * 1_000_000)
-        # 150 bytes per edge estimate
         estimated_memory_mb = (num_entities * 5 * 150) // (1024 * 1024)
         estimated_memory_gb = estimated_memory_mb / 1024
 
-        logger.info("🔍 Pre-flight Safety Check:")
-        logger.info(f"   Entities: {num_entities:,}")
+        logger.info("🔍 Resource Overview:")
+        logger.info(f"   Target entities: {num_entities:,}")
         logger.info(
-            f"   Estimated memory: ~{estimated_memory_mb:,}MB "
+            f"   Estimated peak memory: ~{estimated_memory_mb:,}MB "
             f"({estimated_memory_gb:.1f}GB)"
         )
 
@@ -62,21 +61,17 @@ class TestPerformanceBenchmarks:
             f"   System memory: {available_gb:.1f}GB available / {total_gb:.1f}GB total"
         )
 
-        if estimated_memory_gb > available_gb * 0.8:
-            logger.warning(
-                f"⚠️  WARNING: Benchmark may require {estimated_memory_gb:.1f}GB "
-                f"but only {available_gb:.1f}GB available. Consider reducing N."
-            )
-            if estimated_memory_gb > available_gb:
-                logger.error(
-                    f"❌ DANGER: Estimated memory ({estimated_memory_gb:.1f}GB) "
-                    f"exceeds available memory ({available_gb:.1f}GB). May crash!"
-                )
-                logger.error(
-                    "   Reduce the N parameter or free up memory before proceeding."
-                )
+        # With automatic resource management, we inform what strategy will be used
+        if estimated_memory_gb <= available_gb / 4:
+            logger.info("✅ Expected strategy: In-memory processing")
+        elif estimated_memory_gb <= available_gb:
+            logger.info("✅ Expected strategy: Memory-aware with potential spilling")
         else:
-            logger.info("✅ Memory check passed - safe to proceed")
+            logger.info("✅ Expected strategy: Streaming with aggressive spilling")
+
+        logger.info(
+            "   🔄 Starlings will automatically choose the optimal processing strategy"
+        )
 
         # Generate production-scale dataset using unified generator
         logger.info(
@@ -95,11 +90,10 @@ class TestPerformanceBenchmarks:
         logger.info("\n🏗️  Running Collection.from_edges with tqdm progress bars...")
 
         collection_start = time.perf_counter()
-        # Collection.from_edges with memory-aware processing and progress bars
+        # Collection.from_edges with automatic resource management and progress bars
         collection = sl.Collection.from_edges(
             edge_generator,
             show_progress=True,
-            max_batch_size=100_000,  # Allow system to adapt this down if needed
         )
         collection_time = time.perf_counter() - collection_start
 
@@ -140,7 +134,7 @@ class TestPerformanceBenchmarks:
             f"   Throughput: {expected_edges / collection_time:,.0f} edges/second"
         )
 
-        # Performance assertions - verify realistic intermediate behavior
+        # Performance assertions - verify realistic intermediate behaviour
         # The constructive algorithm guarantees n entities at 1.0 and n/2 at 0.0
         # Intermediate values should be monotonically decreasing between these bounds
         actual_entities_08 = len(partition.entities)
@@ -194,12 +188,10 @@ class TestPerformanceBenchmarks:
 
             # Benchmark with memory-aware processing
             start = time.perf_counter()
-            # Use memory-aware processing even for small datasets
+            # Use automatic resource management for all datasets
             sl.Collection.from_edges(
                 edges,
                 show_progress=False,
-                # Smaller batches for accuracy
-                max_batch_size=min(10_000, len(edges) // 2),
             )
             elapsed = time.perf_counter() - start
 
@@ -227,7 +219,6 @@ class TestPerformanceBenchmarks:
         collection = sl.Collection.from_edges(
             edge_generator,
             show_progress=False,
-            max_batch_size=50_000,  # Moderate batch size for threshold testing
         )
 
         thresholds = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]

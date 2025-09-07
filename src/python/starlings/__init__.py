@@ -221,16 +221,18 @@ class Collection:
         *,
         source: str | None = None,
         show_progress: bool = True,
-        memory_limit_mb: int | None = None,
-        max_batch_size: int | None = None,
     ) -> Collection:
-        """Build collection from weighted edges.
+        """Build collection from weighted edges with automatic resource management.
 
         Creates a hierarchical partition structure from similarity edges between
         records. Records can be any hashable Python type (int, str, bytes) and are
         automatically converted to internal indices for efficient processing.
 
-        Unified processing: handles both edge lists and generators seamlessly.
+        **Streaming Processing**: Automatically chooses the optimal processing strategy
+        based on dataset size and available system resources:
+        - **In-memory**: Small datasets that fit comfortably in RAM
+        - **Memory-aware**: Medium datasets with potential disk spilling
+        - **Streaming**: Large datasets with aggressive memory management
 
         Args:
             edges: Iterable of (record_i, record_j, similarity) tuples.
@@ -238,10 +240,6 @@ class Collection:
                 type (int, str, bytes). Similarities should be between 0.0 and 1.0.
             source: Source name for record context. Defaults to "default".
             show_progress: Whether to show tqdm progress bar. Defaults to True.
-            memory_limit_mb: Optional memory limit in MB. If not provided, uses 80%
-                of available system memory (following Polars pattern).
-            max_batch_size: Maximum batch size for processing. Defaults to 100k.
-                Will be reduced automatically under memory pressure.
 
         Returns:
             New Collection with hierarchy of merge events.
@@ -251,15 +249,15 @@ class Collection:
 
         Example:
             ```python
-            # With edge list (known size - shows total progress)
+            # Automatic resource management - no manual tuning needed
             edges = [("cust_123", "cust_456", 0.95), (123, 456, 0.85)]
             collection = Collection.from_edges(edges)
 
-            # With generator (streaming - shows streaming progress)
-            edge_gen = generate_entity_resolution_edges(1_000_000)
-            collection = Collection.from_edges(edge_gen)
+            # Works seamlessly with generators of any size
+            edge_gen = generate_entity_resolution_edges(100_000_000)  # 100M entities!
+            collection = Collection.from_edges(edge_gen)  # Automatically uses streaming
 
-            # Both show tqdm progress bars automatically
+            # Progress bars show processing strategy and resource usage
             ```
         """
         # Convert edges to list, handling both sequences and generators
@@ -285,16 +283,12 @@ class Collection:
                 edge_list,
                 source=source,
                 progress_callback=progress_callback,
-                memory_limit_mb=memory_limit_mb,
-                max_batch_size=max_batch_size,
             )
         else:
             rust_collection = PyCollection.from_edges(
                 edge_list,
                 source=source,
                 progress_callback=None,
-                memory_limit_mb=memory_limit_mb,
-                max_batch_size=max_batch_size,
             )
 
         if progress_bar is not None:

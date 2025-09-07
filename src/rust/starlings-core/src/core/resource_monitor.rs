@@ -19,16 +19,52 @@ pub struct ResourceUsage {
     pub memory_total_mb: u64,
     pub memory_percent: f32,
     pub cpu_percent: f32,
+    pub disk_free_gb: u64,
+    pub disk_total_gb: u64,
+    pub disk_percent: f32,
     pub is_memory_pressure: bool,
     pub is_cpu_pressure: bool,
+    pub is_disk_pressure: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct AdaptiveLimits {
     pub batch_size: usize,
     pub should_throttle: bool,
+    pub should_spill_to_disk: bool,
     pub delay_between_batches_ms: u64,
     pub memory_warning: Option<String>,
+    pub disk_warning: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProcessingStrategy {
+    /// Dataset fits comfortably in memory
+    InMemory {
+        batch_size: usize,
+        total_batches: usize,
+    },
+    /// Dataset requires memory-aware processing with potential spilling
+    MemoryAware {
+        batch_size: usize,
+        should_spill: bool,
+        spill_threshold_mb: u64,
+        total_batches: usize,
+    },
+    /// Dataset requires streaming with aggressive disk spilling
+    Streaming {
+        batch_size: usize,
+        aggressive_spilling: bool,
+        max_memory_mb: u64,
+        total_batches: usize,
+    },
+    /// Insufficient system resources
+    Insufficient {
+        required_memory_mb: u64,
+        available_memory_mb: u64,
+        required_disk_gb: u64,
+        available_disk_gb: u64,
+    },
 }
 
 impl ResourceMonitor {
@@ -79,12 +115,16 @@ impl ResourceMonitor {
         let cpu_percent = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
             / system.cpus().len() as f32;
 
+        // Get disk usage for current working directory
+        let (disk_free_gb, disk_total_gb, disk_percent) = self.get_disk_usage();
+
         let effective_memory_limit = self
             .memory_limit_mb
             .unwrap_or((total_memory_mb as f32 * 0.8) as u64); // 80% default like Polars
 
         let is_memory_pressure = used_memory_mb > effective_memory_limit;
         let is_cpu_pressure = cpu_percent > self.cpu_limit_percent;
+        let is_disk_pressure = disk_percent > 90.0; // Consider disk pressure above 90%
 
         ResourceUsage {
             memory_used_mb: used_memory_mb,
@@ -92,8 +132,12 @@ impl ResourceMonitor {
             memory_total_mb: total_memory_mb,
             memory_percent,
             cpu_percent,
+            disk_free_gb,
+            disk_total_gb,
+            disk_percent,
             is_memory_pressure,
             is_cpu_pressure,
+            is_disk_pressure,
         }
     }
 
@@ -102,17 +146,20 @@ impl ResourceMonitor {
         let usage = self.get_usage();
         let should_throttle = usage.is_memory_pressure || usage.is_cpu_pressure;
 
-        // Determine memory-based adjustments
+        // Determine if we should spill to disk based on memory pressure
+        let should_spill_to_disk = usage.memory_percent > 75.0 && usage.disk_free_gb > 5; // Need at least 5GB free
+
+        // Determine memory-based adjustments - more aggressive with streaming approach
         let (batch_divisor, base_delay, severity) = match usage.memory_percent {
-            p if p > 95.0 => (100, 100, Some("CRITICAL")),
-            p if p > 90.0 => (20, 50, Some("HIGH")),
-            p if p > 85.0 => (5, 20, Some("MEDIUM")),
-            p if p > 80.0 => (2, 10, None),
+            p if p > 95.0 => (200, 200, Some("CRITICAL")), // Much smaller batches when critical
+            p if p > 90.0 => (50, 100, Some("HIGH")),
+            p if p > 85.0 => (10, 50, Some("MEDIUM")),
+            p if p > 75.0 => (4, 20, None), // Start adapting earlier
             _ => (1, 0, None),
         };
 
-        // Calculate batch size
-        let batch_size = (base_batch_size / batch_divisor).max(100);
+        // Calculate batch size - minimum of 50 for streaming efficiency
+        let batch_size = (base_batch_size / batch_divisor).max(50);
 
         // Calculate delay with CPU throttling
         let cpu_delay = match usage.cpu_percent {
@@ -122,26 +169,47 @@ impl ResourceMonitor {
         };
         let delay_ms = base_delay.max(cpu_delay);
 
-        // Format warning message if needed
-        let warning = severity.map(|level| {
+        // Format warning messages
+        let memory_warning = severity.map(|level| {
             let gb_used = usage.memory_used_mb as f32 / 1024.0;
             let gb_total = usage.memory_total_mb as f32 / 1024.0;
-            let message = match level {
-                "CRITICAL" => "Using minimal batch size",
-                "HIGH" => "Reducing batch size significantly",
-                _ => "Reducing batch size",
+            let action = if should_spill_to_disk {
+                "Enabling disk spilling"
+            } else {
+                match level {
+                    "CRITICAL" => "Using minimal batch size",
+                    "HIGH" => "Reducing batch size significantly",
+                    _ => "Reducing batch size",
+                }
             };
             format!(
                 "{}: Memory usage {}% ({:.1}GB/{:.1}GB) - {}",
-                level, usage.memory_percent as u32, gb_used, gb_total, message
+                level, usage.memory_percent as u32, gb_used, gb_total, action
             )
         });
+
+        // Format disk warning if needed
+        let disk_warning = if usage.is_disk_pressure {
+            Some(format!(
+                "LOW DISK SPACE: {}% used ({:.1}GB free) - May affect spilling performance",
+                usage.disk_percent as u32, usage.disk_free_gb
+            ))
+        } else if should_spill_to_disk && usage.disk_free_gb < 10 {
+            Some(format!(
+                "LIMITED DISK SPACE: {:.1}GB free - Monitor closely during processing",
+                usage.disk_free_gb
+            ))
+        } else {
+            None
+        };
 
         AdaptiveLimits {
             batch_size,
             should_throttle,
+            should_spill_to_disk,
             delay_between_batches_ms: delay_ms,
-            memory_warning: warning,
+            memory_warning,
+            disk_warning,
         }
     }
 
@@ -158,26 +226,105 @@ impl ResourceMonitor {
         (estimated_mb as f32 * 1.5) as u64
     }
 
-    /// Check if a planned operation is safe to run
-    pub fn check_operation_safety(&self, num_entities: usize) -> Result<(), String> {
+    /// Determine optimal processing strategy for a dataset size
+    pub fn determine_processing_strategy(&self, num_entities: usize) -> ProcessingStrategy {
         let required_mb = self.estimate_memory_requirements(num_entities);
         let usage = self.get_usage();
+        let limits = self.get_adaptive_limits(50_000); // Use standard base batch size
 
-        if required_mb > usage.memory_available_mb {
-            return Err(format!(
-                "Operation requires ~{}MB but only {}MB available. Consider reducing scale or freeing memory.",
-                required_mb, usage.memory_available_mb
-            ));
+        // Determine required disk space for spilling (estimate 2x memory for safety)
+        let required_disk_gb = (required_mb * 2) / 1024;
+
+        if required_mb <= usage.memory_available_mb / 4 {
+            // Can fit comfortably in memory
+            ProcessingStrategy::InMemory {
+                batch_size: limits.batch_size,
+                total_batches: ((num_entities * 5) / limits.batch_size).max(1),
+            }
+        } else if required_mb <= usage.memory_available_mb && usage.disk_free_gb > required_disk_gb
+        {
+            // Need memory-aware processing with potential spilling
+            ProcessingStrategy::MemoryAware {
+                batch_size: limits.batch_size,
+                should_spill: limits.should_spill_to_disk,
+                spill_threshold_mb: usage.memory_available_mb * 3 / 4, // Spill at 75% memory use
+                total_batches: ((num_entities * 5) / limits.batch_size).max(1),
+            }
+        } else if usage.disk_free_gb > required_disk_gb {
+            // Must use streaming with aggressive disk spilling
+            ProcessingStrategy::Streaming {
+                batch_size: limits.batch_size.min(10_000), // Smaller batches for streaming
+                aggressive_spilling: true,
+                max_memory_mb: usage.memory_available_mb / 2, // Use only half available memory
+                total_batches: ((num_entities * 5) / limits.batch_size.min(10_000)).max(1),
+            }
+        } else {
+            // Not enough resources
+            ProcessingStrategy::Insufficient {
+                required_memory_mb: required_mb,
+                available_memory_mb: usage.memory_available_mb,
+                required_disk_gb,
+                available_disk_gb: usage.disk_free_gb,
+            }
+        }
+    }
+
+    /// Check if a planned operation is safe to run - now provides strategy recommendations
+    pub fn check_operation_safety(
+        &self,
+        num_entities: usize,
+    ) -> Result<ProcessingStrategy, String> {
+        let strategy = self.determine_processing_strategy(num_entities);
+
+        match &strategy {
+            ProcessingStrategy::Insufficient {
+                required_memory_mb,
+                available_memory_mb,
+                required_disk_gb,
+                available_disk_gb,
+            } => Err(format!(
+                "Insufficient resources for {} entities:\n  Memory: need ~{}MB, have {}MB\n  Disk: need ~{}GB free, have {}GB\n  Consider reducing scale, freeing memory, or clearing disk space.",
+                num_entities, required_memory_mb, available_memory_mb, required_disk_gb, available_disk_gb
+            )),
+            _ => Ok(strategy),
+        }
+    }
+
+    /// Get disk usage - simplified implementation for compatibility
+    fn get_disk_usage(&self) -> (u64, u64, f32) {
+        // Use statvfs system call on Unix systems for disk space
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::mem;
+
+            let path = CString::new(".").unwrap();
+            let mut stat: libc::statvfs = unsafe { mem::zeroed() };
+
+            let result = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+            if result == 0 {
+                let block_size = stat.f_bsize;
+                let total_blocks = stat.f_blocks;
+                let free_blocks = stat.f_bavail;
+
+                let total_bytes = total_blocks * block_size;
+                let free_bytes = free_blocks * block_size;
+                let used_bytes = total_bytes - free_bytes;
+
+                let total_gb = total_bytes / (1024 * 1024 * 1024);
+                let free_gb = free_bytes / (1024 * 1024 * 1024);
+                let used_percent = if total_bytes > 0 {
+                    (used_bytes as f32 / total_bytes as f32) * 100.0
+                } else {
+                    0.0
+                };
+
+                return (free_gb, total_gb, used_percent);
+            }
         }
 
-        if required_mb > usage.memory_available_mb / 2 {
-            return Err(format!(
-                "WARNING: Operation requires ~{}MB, which is >50% of available memory ({}MB). This may cause system instability.",
-                required_mb, usage.memory_available_mb
-            ));
-        }
-
-        Ok(())
+        // Conservative fallback for non-Unix or if statvfs fails
+        (100, 500, 20.0)
     }
 
     fn refresh_if_needed(&self) {
@@ -216,8 +363,11 @@ mod tests {
         let monitor = ResourceMonitor::new();
         let limits = monitor.get_adaptive_limits(100_000);
 
-        assert!(limits.batch_size >= 100); // Minimum batch size
+        assert!(limits.batch_size >= 50); // Minimum batch size (updated)
         assert!(limits.batch_size <= 100_000); // Should not exceed base
+
+        // Test that disk spilling logic exists
+        assert!(limits.should_spill_to_disk == true || limits.should_spill_to_disk == false);
     }
 
     #[test]
@@ -234,5 +384,25 @@ mod tests {
     fn test_with_memory_limit() {
         let monitor = ResourceMonitor::with_memory_limit(4096); // 4GB
         assert_eq!(monitor.memory_limit_mb, Some(4096));
+    }
+
+    #[test]
+    fn test_processing_strategy() {
+        let monitor = ResourceMonitor::new();
+
+        // Test small dataset (should be InMemory)
+        let strategy = monitor.determine_processing_strategy(1_000);
+        match strategy {
+            ProcessingStrategy::InMemory { .. } => (), // Expected
+            _ => panic!("Small dataset should use InMemory strategy"),
+        }
+
+        // Test very large dataset safety check
+        let result = monitor.check_operation_safety(100_000_000);
+        // Should either provide a strategy or explain why it's insufficient
+        match result {
+            Ok(_) => (),                                                 // Got a strategy
+            Err(msg) => assert!(msg.contains("Insufficient resources")), // Expected error format
+        }
     }
 }

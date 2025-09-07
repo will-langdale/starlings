@@ -67,7 +67,7 @@ def validate_entity_resolution_data(
             )
             return False
 
-        # Check monotonic merging behavior
+        # Check monotonic merging behaviour
         thresholds = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
         entity_counts = [collection.at(t).num_entities for t in thresholds]
 

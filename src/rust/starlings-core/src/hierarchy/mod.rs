@@ -2,6 +2,7 @@ pub mod bitmap_pool;
 pub mod builder;
 pub mod merge_event;
 pub mod partition;
+pub mod storage;
 pub mod union_find;
 
 pub use builder::PartitionHierarchy;

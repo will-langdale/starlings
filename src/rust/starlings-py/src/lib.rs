@@ -2,11 +2,85 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
+use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy};
 use starlings_core::test_utils;
 use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel, ResourceMonitor};
 
 /// Progress callback type for Rust-level progress reporting
 type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
+
+/// Helper function to create progress callback wrapper
+fn create_progress_wrapper(callback: Py<pyo3::PyAny>) -> ProgressCallback {
+    Arc::new(move |progress: f64, message: &str| {
+        Python::attach(|py| {
+            if let Err(e) = callback.call1(py, (progress, message)) {
+                eprintln!("Progress callback error: {}", e);
+            }
+        });
+    })
+}
+
+/// Helper function to get strategy message
+fn get_strategy_message(strategy: &ProcessingStrategy) -> &'static str {
+    match strategy {
+        ProcessingStrategy::InMemory { .. } => "Starting in-memory processing",
+        ProcessingStrategy::MemoryAware { should_spill, .. } => {
+            if *should_spill {
+                "Starting memory-aware processing with disk spilling enabled"
+            } else {
+                "Starting memory-aware processing"
+            }
+        }
+        ProcessingStrategy::Streaming { .. } => {
+            "Starting streaming processing with aggressive disk spilling"
+        }
+        ProcessingStrategy::Insufficient { .. } => {
+            unreachable!("Should have been caught earlier")
+        }
+    }
+}
+
+/// Helper function to map storage errors to Python exceptions
+fn map_storage_error(error: String) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error)
+}
+
+/// Helper function to map safety errors to Python exceptions
+fn map_safety_error(error: String) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyMemoryError, _>(error)
+}
+
+/// Extract batch size from any processing strategy
+fn extract_batch_size(strategy: &ProcessingStrategy) -> usize {
+    match strategy {
+        ProcessingStrategy::InMemory { batch_size, .. }
+        | ProcessingStrategy::MemoryAware { batch_size, .. }
+        | ProcessingStrategy::Streaming { batch_size, .. } => *batch_size,
+        ProcessingStrategy::Insufficient { .. } => unreachable!(),
+    }
+}
+
+/// Check if strategy requires streaming processing
+fn requires_streaming(strategy: &ProcessingStrategy) -> bool {
+    matches!(strategy, ProcessingStrategy::Streaming { .. })
+}
+
+/// Report resource warnings if present
+fn report_resource_warnings(
+    adaptive_limits: &AdaptiveLimits,
+    progress_callback: &Option<ProgressCallback>,
+) {
+    if let Some(warning) = &adaptive_limits.memory_warning {
+        if let Some(ref callback) = progress_callback {
+            callback(0.25, warning);
+        }
+    }
+    if let Some(warning) = &adaptive_limits.disk_warning {
+        if let Some(ref callback) = progress_callback {
+            callback(0.26, warning);
+        }
+    }
+}
 
 /// Generator for entity resolution edges that yields batches
 #[pyclass]
@@ -73,7 +147,6 @@ impl PyPartition {
 
 /// Hierarchical partition structure that generates entities at any threshold.
 #[pyclass(name = "Collection")]
-#[derive(Clone)]
 pub struct PyCollection {
     hierarchy: PartitionHierarchy,
 }
@@ -113,14 +186,12 @@ impl PyCollection {
     ///     print(f"Entities: {len(partition.entities)}")
     ///     ```
     #[classmethod]
-    #[pyo3(signature = (edges, *, source=None, progress_callback=None, memory_limit_mb=None, max_batch_size=None))]
+    #[pyo3(signature = (edges, *, source=None, progress_callback=None))]
     fn from_edges(
         _cls: &Bound<'_, PyType>,
         edges: Vec<(Py<PyAny>, Py<PyAny>, f64)>,
         source: Option<String>,
         progress_callback: Option<Py<PyAny>>,
-        memory_limit_mb: Option<u64>,
-        max_batch_size: Option<usize>,
         py: Python,
     ) -> PyResult<Self> {
         #[cfg(debug_assertions)]
@@ -128,35 +199,23 @@ impl PyCollection {
 
         let source_name = source.unwrap_or_else(|| "default".to_string());
 
-        // Initialize resource monitor with optional memory limit
-        let resource_monitor = if let Some(limit) = memory_limit_mb {
-            ResourceMonitor::with_memory_limit(limit)
-        } else {
-            ResourceMonitor::new()
-        };
+        // Initialize resource monitor for automatic resource management
+        let resource_monitor = ResourceMonitor::new();
 
-        // Safety check: estimate memory requirements
+        // Automatically determine the best processing strategy based on dataset size and system resources
         let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
-        if let Err(safety_error) = resource_monitor.check_operation_safety(num_entities) {
-            return Err(PyErr::new::<pyo3::exceptions::PyMemoryError, _>(
-                safety_error,
-            ));
-        }
+        let strategy = resource_monitor
+            .check_operation_safety(num_entities)
+            .map_err(map_safety_error)?;
 
         // Create progress callback wrapper for Rust use
-        let progress_callback: Option<ProgressCallback> = progress_callback.map(|callback| {
-            Arc::new(move |progress: f64, message: &str| {
-                Python::attach(|py| {
-                    if let Err(e) = callback.call1(py, (progress, message)) {
-                        eprintln!("Progress callback error: {}", e);
-                    }
-                });
-            }) as Arc<dyn Fn(f64, &str) + Send + Sync>
-        });
+        let progress_callback: Option<ProgressCallback> =
+            progress_callback.map(create_progress_wrapper);
 
-        // Report initial progress
+        // Report initial progress with processing strategy info
         if let Some(ref callback) = progress_callback {
-            callback(0.0, "Starting edge processing...");
+            let strategy_message = get_strategy_message(&strategy);
+            callback(0.0, strategy_message);
         }
 
         // Pre-calculate capacity based on edge count (assume ~70% unique records)
@@ -211,17 +270,14 @@ impl PyCollection {
             keys_set.into_keys().collect()
         };
 
-        // Register keys in parallel batches using adaptive batch sizing
-        let base_batch_size = max_batch_size.unwrap_or(5000);
-        let adaptive_limits = resource_monitor.get_adaptive_limits(base_batch_size);
-        let batch_size = adaptive_limits.batch_size;
+        // Extract batch size and processing parameters from strategy
+        let batch_size = extract_batch_size(&strategy);
 
-        // Show memory warning if present
-        if let Some(warning) = &adaptive_limits.memory_warning {
-            if let Some(ref callback) = progress_callback {
-                callback(0.25, warning);
-            }
-        }
+        // Get adaptive limits for current conditions
+        let adaptive_limits = resource_monitor.get_adaptive_limits(batch_size);
+
+        // Show resource warnings if present
+        report_resource_warnings(&adaptive_limits, &progress_callback);
 
         let key_to_id_mutex = Mutex::new(key_to_id);
 
@@ -235,21 +291,37 @@ impl PyCollection {
             key_to_id_mutex.lock().unwrap().extend(local_map);
         };
 
-        // Process batches with or without throttling
-        if adaptive_limits.should_throttle {
-            // Sequential processing with delays when under memory pressure
-            for batch in unique_keys.chunks(batch_size) {
+        // Process batches based on strategy and current system pressure
+        let should_use_streaming = requires_streaming(&strategy)
+            || adaptive_limits.should_throttle
+            || adaptive_limits.should_spill_to_disk;
+
+        if should_use_streaming {
+            // Sequential streaming processing with memory management
+            for batch in unique_keys.chunks(adaptive_limits.batch_size) {
                 process_batch(batch);
 
+                // Add delay if under resource pressure
                 if adaptive_limits.delay_between_batches_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(
                         adaptive_limits.delay_between_batches_ms,
                     ));
                 }
             }
+
+            if let Some(ref callback) = progress_callback {
+                callback(
+                    0.35,
+                    "Used streaming processing due to resource constraints",
+                );
+            }
         } else {
-            // Normal parallel processing when resources are available
+            // Normal parallel processing when resources are abundant
             unique_keys.par_chunks(batch_size).for_each(process_batch);
+
+            if let Some(ref callback) = progress_callback {
+                callback(0.35, "Used parallel processing");
+            }
         }
 
         let key_to_id = key_to_id_mutex.into_inner().unwrap();
@@ -300,7 +372,7 @@ impl PyCollection {
             progress_callback.clone(),
             Some(&resource_monitor),
         )
-        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        .map_err(map_storage_error)?;
         #[cfg(debug_assertions)]
         let hierarchy_time = hierarchy_start.elapsed();
 

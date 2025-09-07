@@ -39,7 +39,7 @@ def test_user_eda_workflow():
         f"Expected {total_nodes // 2} entities at 0.0, got {entities_at_0_0}"
     )
 
-    # Test hierarchical behavior around the main transition (~0.9)
+    # Test hierarchical behaviour around the main transition (~0.9)
     test_thresholds = [0.95, 0.9, 0.8, 0.5]
     entity_counts = [collection.at(t).num_entities for t in test_thresholds]
 
