@@ -1,30 +1,45 @@
 /// Union-Find (Disjoint Set Union) data structure
-#[derive(Debug)]
+/// Optimised for cache locality and performance
+#[derive(Debug, Clone)]
 pub struct UnionFind {
-    parent: Vec<u32>,
-    rank: Vec<u32>,
+    /// Packed parent and rank for better cache locality
+    /// parent is u32, rank is u8 (sufficient for our use case)
+    data: Vec<(u32, u8)>,
     size: usize,
 }
 
 impl UnionFind {
     /// Create a new Union-Find structure with n elements
     pub fn new(size: usize) -> Self {
-        let parent: Vec<u32> = (0..size).map(|i| i as u32).collect();
-        let rank: Vec<u32> = vec![0; size];
-        Self { parent, rank, size }
+        // Pre-allocate with exact capacity for better performance
+        let mut data = Vec::with_capacity(size);
+        for i in 0..size {
+            data.push((i as u32, 0));
+        }
+        Self { data, size }
     }
 
-    /// Find the root of the set containing element x with path compression
+    /// Find the root of the set containing element x with path halving
+    /// Path halving provides better cache behaviour than full path compression
+    #[inline(always)]
     pub fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x as u32 {
-            let grandparent = self.parent[self.parent[x] as usize];
-            self.parent[x] = grandparent;
-            x = self.parent[x] as usize;
+        // Bounds check once at the start
+        debug_assert!(x < self.size);
+
+        unsafe {
+            // Path halving: make every node point to its grandparent
+            while self.data.get_unchecked(x).0 != x as u32 {
+                let parent = self.data.get_unchecked(x).0 as usize;
+                let grandparent = self.data.get_unchecked(parent).0;
+                self.data.get_unchecked_mut(x).0 = grandparent;
+                x = grandparent as usize;
+            }
         }
         x
     }
 
     /// Union two sets containing elements x and y
+    #[inline(always)]
     pub fn union(&mut self, x: usize, y: usize) -> bool {
         let root_x = self.find(x);
         let root_y = self.find(y);
@@ -33,19 +48,22 @@ impl UnionFind {
             return false;
         }
 
-        let rank_x = self.rank[root_x];
-        let rank_y = self.rank[root_y];
+        unsafe {
+            let (_, rank_x) = *self.data.get_unchecked(root_x);
+            let (_, rank_y) = *self.data.get_unchecked(root_y);
 
-        match rank_x.cmp(&rank_y) {
-            std::cmp::Ordering::Less => {
-                self.parent[root_x] = root_y as u32;
-            }
-            std::cmp::Ordering::Greater => {
-                self.parent[root_y] = root_x as u32;
-            }
-            std::cmp::Ordering::Equal => {
-                self.parent[root_y] = root_x as u32;
-                self.rank[root_x] += 1;
+            // Union by rank - attach smaller tree under larger one
+            match rank_x.cmp(&rank_y) {
+                std::cmp::Ordering::Less => {
+                    self.data.get_unchecked_mut(root_x).0 = root_y as u32;
+                }
+                std::cmp::Ordering::Greater => {
+                    self.data.get_unchecked_mut(root_y).0 = root_x as u32;
+                }
+                std::cmp::Ordering::Equal => {
+                    self.data.get_unchecked_mut(root_y).0 = root_x as u32;
+                    self.data.get_unchecked_mut(root_x).1 += 1;
+                }
             }
         }
 
@@ -53,6 +71,7 @@ impl UnionFind {
     }
 
     /// Check if two elements are in the same set
+    #[inline]
     pub fn connected(&mut self, x: usize, y: usize) -> bool {
         self.find(x) == self.find(y)
     }
@@ -69,8 +88,9 @@ impl UnionFind {
 
     /// Get all connected components as a vector of vectors
     pub fn get_all_components(&mut self) -> Vec<Vec<usize>> {
+        // Pre-allocate HashMap with estimated capacity
         let mut components: std::collections::HashMap<usize, Vec<usize>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(self.size / 4);
 
         for element in 0..self.size {
             let root = self.find(element);

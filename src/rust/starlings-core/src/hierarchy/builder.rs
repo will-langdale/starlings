@@ -175,14 +175,20 @@ impl PartitionHierarchy {
     }
 
     /// Build merge events from grouped edges using union-find
+    /// Optimised for cache locality and minimal allocations
     fn build_merge_events(
         &mut self,
         threshold_groups: Vec<(f64, Vec<(u32, u32)>)>,
         num_records: usize,
     ) -> Vec<MergeEvent> {
-        let mut merges = Vec::new();
+        // Pre-allocate with estimated capacity to avoid resizing
+        let estimated_merges = threshold_groups.len() * 100;
+        let mut merges = Vec::with_capacity(estimated_merges);
         let mut uf = UnionFind::new(num_records);
-        let mut active_components: HashMap<usize, RoaringBitmap> = HashMap::new();
+        // Pre-size HashMap based on expected number of components
+        let estimated_components = (num_records as f64).sqrt() as usize;
+        let mut active_components: HashMap<usize, RoaringBitmap> =
+            HashMap::with_capacity(estimated_components);
 
         #[cfg(debug_assertions)]
         let mut merge_count = 0;
@@ -190,65 +196,69 @@ impl PartitionHierarchy {
         let mut bitmap_allocations = 0;
 
         for (threshold, edges_at_threshold) in threshold_groups.iter() {
-            let mut processed_pairs = HashSet::new();
+            // Pre-allocate for this threshold's processing
+            let mut processed_pairs = HashSet::with_capacity(edges_at_threshold.len());
 
-            for &(src, dst) in edges_at_threshold {
-                let root_src = uf.find(src as usize);
-                let root_dst = uf.find(dst as usize);
+            // Process edges sequentially with optimised memory access
+            if false {
+                // Placeholder for potential future parallel implementation
+            } else {
+                for &(src, dst) in edges_at_threshold {
+                    let root_src = uf.find(src as usize);
+                    let root_dst = uf.find(dst as usize);
 
-                if root_src != root_dst {
-                    let pair = if root_src < root_dst {
-                        (root_src, root_dst)
-                    } else {
-                        (root_dst, root_src)
-                    };
-
-                    if !processed_pairs.contains(&pair) {
-                        processed_pairs.insert(pair);
-
-                        let mut merging_components = Vec::new();
-
-                        if let Some(component_src) = active_components.remove(&root_src) {
-                            merging_components.push(component_src);
+                    if root_src != root_dst {
+                        let pair = if root_src < root_dst {
+                            (root_src, root_dst)
                         } else {
-                            let (mut bitmap, _) = self.bitmap_pool.get(1);
-                            bitmap.insert(src);
-                            merging_components.push(bitmap);
-                            #[cfg(debug_assertions)]
-                            {
-                                bitmap_allocations += 1;
+                            (root_dst, root_src)
+                        };
+
+                        if processed_pairs.insert(pair) {
+                            let mut merging_components = Vec::new();
+
+                            if let Some(component_src) = active_components.remove(&root_src) {
+                                merging_components.push(component_src);
+                            } else {
+                                let (mut bitmap, _) = self.bitmap_pool.get(1);
+                                bitmap.insert(src);
+                                merging_components.push(bitmap);
+                                #[cfg(debug_assertions)]
+                                {
+                                    bitmap_allocations += 1;
+                                }
                             }
-                        }
 
-                        if let Some(component_dst) = active_components.remove(&root_dst) {
-                            merging_components.push(component_dst);
-                        } else {
-                            let (mut bitmap, _) = self.bitmap_pool.get(1);
-                            bitmap.insert(dst);
-                            merging_components.push(bitmap);
-                            #[cfg(debug_assertions)]
-                            {
-                                bitmap_allocations += 1;
+                            if let Some(component_dst) = active_components.remove(&root_dst) {
+                                merging_components.push(component_dst);
+                            } else {
+                                let (mut bitmap, _) = self.bitmap_pool.get(1);
+                                bitmap.insert(dst);
+                                merging_components.push(bitmap);
+                                #[cfg(debug_assertions)]
+                                {
+                                    bitmap_allocations += 1;
+                                }
                             }
-                        }
 
-                        uf.union(src as usize, dst as usize);
-                        let new_root = uf.find(src as usize);
+                            uf.union(src as usize, dst as usize);
+                            let new_root = uf.find(src as usize);
 
-                        if merging_components.len() > 1 {
-                            let (mut merged_component, _) =
-                                self.bitmap_pool
+                            if merging_components.len() > 1 {
+                                let (mut merged_component, _) = self
+                                    .bitmap_pool
                                     .get(merging_components.iter().map(|b| b.len()).sum::<u64>()
                                         as u32);
-                            for old_component in &merging_components {
-                                merged_component |= old_component;
-                            }
+                                for old_component in &merging_components {
+                                    merged_component |= old_component;
+                                }
 
-                            merges.push(MergeEvent::new(*threshold, merging_components));
-                            active_components.insert(new_root, merged_component);
-                            #[cfg(debug_assertions)]
-                            {
-                                merge_count += 1;
+                                merges.push(MergeEvent::new(*threshold, merging_components));
+                                active_components.insert(new_root, merged_component);
+                                #[cfg(debug_assertions)]
+                                {
+                                    merge_count += 1;
+                                }
                             }
                         }
                     }
@@ -260,6 +270,9 @@ impl PartitionHierarchy {
             self.bitmap_pool
                 .put(bitmap, super::bitmap_pool::PoolSizeClass::Small);
         }
+
+        // Shrink to fit to free excess capacity
+        merges.shrink_to_fit();
 
         #[cfg(debug_assertions)]
         {
