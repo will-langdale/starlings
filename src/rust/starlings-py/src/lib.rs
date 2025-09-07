@@ -3,7 +3,37 @@ use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
 use starlings_core::test_utils;
-use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel};
+use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel, ResourceMonitor};
+
+/// Progress callback type for Rust-level progress reporting
+type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
+
+/// Generator for entity resolution edges that yields batches
+#[pyclass]
+pub struct EdgeGenerator {
+    edges: Vec<(i64, i64, f64)>,
+    batch_size: usize,
+    current_index: usize,
+}
+
+#[pymethods]
+impl EdgeGenerator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> Option<Vec<(i64, i64, f64)>> {
+        if self.current_index >= self.edges.len() {
+            return None;
+        }
+
+        let end_index = (self.current_index + self.batch_size).min(self.edges.len());
+        let batch = self.edges[self.current_index..end_index].to_vec();
+        self.current_index = end_index;
+
+        Some(batch)
+    }
+}
 
 /// A partition of records into entities at a specific threshold.
 #[pyclass(name = "Partition")]
@@ -83,17 +113,51 @@ impl PyCollection {
     ///     print(f"Entities: {len(partition.entities)}")
     ///     ```
     #[classmethod]
-    #[pyo3(signature = (edges, *, source=None))]
+    #[pyo3(signature = (edges, *, source=None, progress_callback=None, memory_limit_mb=None, max_batch_size=None))]
     fn from_edges(
         _cls: &Bound<'_, PyType>,
         edges: Vec<(Py<PyAny>, Py<PyAny>, f64)>,
         source: Option<String>,
+        progress_callback: Option<Py<PyAny>>,
+        memory_limit_mb: Option<u64>,
+        max_batch_size: Option<usize>,
         py: Python,
     ) -> PyResult<Self> {
         #[cfg(debug_assertions)]
         let start_time = std::time::Instant::now();
 
         let source_name = source.unwrap_or_else(|| "default".to_string());
+
+        // Initialize resource monitor with optional memory limit
+        let resource_monitor = if let Some(limit) = memory_limit_mb {
+            ResourceMonitor::with_memory_limit(limit)
+        } else {
+            ResourceMonitor::new()
+        };
+
+        // Safety check: estimate memory requirements
+        let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
+        if let Err(safety_error) = resource_monitor.check_operation_safety(num_entities) {
+            return Err(PyErr::new::<pyo3::exceptions::PyMemoryError, _>(
+                safety_error,
+            ));
+        }
+
+        // Create progress callback wrapper for Rust use
+        let progress_callback: Option<ProgressCallback> = progress_callback.map(|callback| {
+            Arc::new(move |progress: f64, message: &str| {
+                Python::attach(|py| {
+                    if let Err(e) = callback.call1(py, (progress, message)) {
+                        eprintln!("Progress callback error: {}", e);
+                    }
+                });
+            }) as Arc<dyn Fn(f64, &str) + Send + Sync>
+        });
+
+        // Report initial progress
+        if let Some(ref callback) = progress_callback {
+            callback(0.0, "Starting edge processing...");
+        }
 
         // Pre-calculate capacity based on edge count (assume ~70% unique records)
         let estimated_records = (edges.len() * 14) / 10; // 1.4x edges for safety
@@ -125,6 +189,11 @@ impl PyCollection {
         #[cfg(debug_assertions)]
         let phase1_time = phase1_start.elapsed();
 
+        // Report progress after Python conversion
+        if let Some(ref callback) = progress_callback {
+            callback(0.2, "Converted Python objects to Rust");
+        }
+
         // Phase 2: Parallel batch key registration with rayon
         #[cfg(debug_assertions)]
         let phase2_start = std::time::Instant::now();
@@ -142,29 +211,56 @@ impl PyCollection {
             keys_set.into_keys().collect()
         };
 
-        // Register keys in parallel batches using batch method
-        let batch_size = 5000;
+        // Register keys in parallel batches using adaptive batch sizing
+        let base_batch_size = max_batch_size.unwrap_or(5000);
+        let adaptive_limits = resource_monitor.get_adaptive_limits(base_batch_size);
+        let batch_size = adaptive_limits.batch_size;
+
+        // Show memory warning if present
+        if let Some(warning) = &adaptive_limits.memory_warning {
+            if let Some(ref callback) = progress_callback {
+                callback(0.25, warning);
+            }
+        }
+
         let key_to_id_mutex = Mutex::new(key_to_id);
 
-        unique_keys.par_chunks(batch_size).for_each(|batch| {
-            // Call batch registration method
+        // Helper closure for batch processing
+        let process_batch = |batch: &[Key]| {
             let ids = context.ensure_records_batch(&source_name, batch);
-
-            // Build local map
             let mut local_map = FxHashMap::default();
             for (key, id) in batch.iter().zip(ids.iter()) {
                 local_map.insert(key.clone(), *id);
             }
+            key_to_id_mutex.lock().unwrap().extend(local_map);
+        };
 
-            // Merge local results back
-            let mut global_map = key_to_id_mutex.lock().unwrap();
-            global_map.extend(local_map);
-        });
+        // Process batches with or without throttling
+        if adaptive_limits.should_throttle {
+            // Sequential processing with delays when under memory pressure
+            for batch in unique_keys.chunks(batch_size) {
+                process_batch(batch);
+
+                if adaptive_limits.delay_between_batches_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        adaptive_limits.delay_between_batches_ms,
+                    ));
+                }
+            }
+        } else {
+            // Normal parallel processing when resources are available
+            unique_keys.par_chunks(batch_size).for_each(process_batch);
+        }
 
         let key_to_id = key_to_id_mutex.into_inner().unwrap();
 
         #[cfg(debug_assertions)]
         let phase2_time = phase2_start.elapsed();
+
+        // Report progress after key registration
+        if let Some(ref callback) = progress_callback {
+            callback(0.4, "Registered unique keys");
+        }
 
         // Phase 3: Parallel edge ID mapping
         #[cfg(debug_assertions)]
@@ -186,18 +282,35 @@ impl PyCollection {
         #[cfg(debug_assertions)]
         let conversion_time = conversion_start.elapsed();
 
+        // Report progress after ID mapping
+        if let Some(ref callback) = progress_callback {
+            callback(0.6, "Mapped keys to IDs");
+        }
+
         #[cfg(debug_assertions)]
         let hierarchy_start = std::time::Instant::now();
         #[cfg(debug_assertions)]
         let edge_count = rust_edges.len();
         #[cfg(debug_assertions)]
         let record_count = context.len();
-        let hierarchy = PartitionHierarchy::from_edges(rust_edges, Arc::new(context), 6);
+        let hierarchy = PartitionHierarchy::from_edges(
+            rust_edges,
+            Arc::new(context),
+            6,
+            progress_callback.clone(),
+            Some(&resource_monitor),
+        )
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
         #[cfg(debug_assertions)]
         let hierarchy_time = hierarchy_start.elapsed();
 
         #[cfg(debug_assertions)]
         let total_time = start_time.elapsed();
+
+        // Report final progress
+        if let Some(ref callback) = progress_callback {
+            callback(1.0, "Collection created successfully");
+        }
 
         // Production-scale performance metrics (debug builds and large datasets only)
         #[cfg(debug_assertions)]
@@ -288,26 +401,27 @@ impl PyCollection {
 ///     n (int): Number of entities at threshold 1.0
 ///     num_thresholds (Optional[int]): If provided, snap to discrete thresholds;
 ///         if None, add jitter for PGO training
+///     batch_size (int): Size of each batch yielded by the generator (default 100_000)
 ///
 /// Returns:
-///     List[Tuple[int, int, float]]: List of (entity1, entity2, threshold) tuples
+///     EdgeGenerator: Generator that yields batches of (entity1, entity2, threshold) tuples
 ///
 /// Example:
 ///     ```python
-///     # Generate 1M entity dataset with jitter for PGO
-///     edges = generate_entity_resolution_edges(1_000_000, None)
+///     # Generate 1M entity dataset as a generator
+///     edge_gen = generate_entity_resolution_edges(1_000_000)
 ///     
-///     # Generate dataset with 10 discrete thresholds
-///     edges = generate_entity_resolution_edges(100_000, 10)
-///     
-///     collection = Collection.from_edges([(i, j, t) for i, j, t in edges])
+///     # Use with Collection.from_edges (handles generators automatically)
+///     collection = Collection.from_edges(edge_gen)
 ///     ```
 #[pyfunction]
+#[pyo3(signature = (n, num_thresholds=None, batch_size=100_000))]
 fn generate_entity_resolution_edges(
     n: usize,
     num_thresholds: Option<usize>,
+    batch_size: usize,
     _py: Python<'_>,
-) -> PyResult<Vec<(i64, i64, f64)>> {
+) -> PyResult<EdgeGenerator> {
     let edges = test_utils::generate_entity_resolution_edges(n, num_thresholds);
 
     let python_edges: Vec<(i64, i64, f64)> = edges
@@ -315,7 +429,11 @@ fn generate_entity_resolution_edges(
         .map(|(id1, id2, weight)| (id1 as i64, id2 as i64, weight))
         .collect();
 
-    Ok(python_edges)
+    Ok(EdgeGenerator {
+        edges: python_edges,
+        batch_size,
+        current_index: 0,
+    })
 }
 
 /// Convert Python object to Rust Key (optimised for performance)
@@ -347,6 +465,7 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
 fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCollection>()?;
     m.add_class::<PyPartition>()?;
+    m.add_class::<EdgeGenerator>()?;
     m.add_function(wrap_pyfunction!(generate_entity_resolution_edges, m)?)?;
     Ok(())
 }

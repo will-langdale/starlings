@@ -3,11 +3,14 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+/// Progress callback type for reporting hierarchy construction progress
+type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
+
 use super::bitmap_pool::BitmapPool;
 use super::merge_event::MergeEvent;
 use super::partition::PartitionLevel;
 use super::union_find::UnionFind;
-use crate::core::DataContext;
+use crate::core::{DataContext, ResourceMonitor};
 
 /// Hierarchy of merge events that can generate partitions at any threshold
 #[derive(Debug, Clone)]
@@ -44,7 +47,9 @@ impl PartitionHierarchy {
         edges: Vec<(u32, u32, f64)>,
         context: Arc<DataContext>,
         quantise: u32,
-    ) -> Self {
+        progress_callback: Option<ProgressCallback>,
+        resource_monitor: Option<&ResourceMonitor>,
+    ) -> Result<Self, String> {
         // Validate quantise is between 1 and 6
         assert!(
             (1..=6).contains(&quantise),
@@ -53,17 +58,48 @@ impl PartitionHierarchy {
         );
 
         if edges.is_empty() {
-            return Self {
+            return Ok(Self {
                 context,
                 merges: Vec::new(),
                 partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
                 threshold_index: BTreeMap::new(),
                 bitmap_pool: BitmapPool::new(),
                 cache_size: Self::CACHE_SIZE,
-            };
+            });
         }
 
         let num_records = context.len();
+
+        // Memory safety check using ResourceMonitor if available
+        if let Some(monitor) = resource_monitor {
+            // Use ResourceMonitor's safety check for estimated entities
+            let estimated_entities = edges.len() / 5; // Rough estimate: 5 edges per entity
+            if let Err(safety_error) = monitor.check_operation_safety(estimated_entities) {
+                return Err(format!(
+                    "Hierarchy construction safety check failed: {}",
+                    safety_error
+                ));
+            }
+
+            // Report progress with memory context
+            let usage = monitor.get_usage();
+            if let Some(ref callback) = progress_callback {
+                callback(
+                    0.05,
+                    &format!(
+                        "Memory check passed - Using {:.1}GB/{:.1}GB ({:.1}%)",
+                        usage.memory_used_mb as f32 / 1024.0,
+                        usage.memory_total_mb as f32 / 1024.0,
+                        usage.memory_percent
+                    ),
+                );
+            }
+        }
+
+        // Report initial hierarchy construction progress
+        if let Some(ref callback) = progress_callback {
+            callback(0.65, "Starting hierarchy construction...");
+        }
 
         // Store edge count for pool scaling before consuming edges
         let num_edges = edges.len();
@@ -109,10 +145,19 @@ impl PartitionHierarchy {
         #[cfg(debug_assertions)]
         let group_time = group_start.elapsed();
 
+        // Report progress after grouping edges by threshold
+        if let Some(ref callback) = progress_callback {
+            callback(0.7, "Grouped edges by threshold");
+        }
+
         #[cfg(debug_assertions)]
         let union_find_start = std::time::Instant::now();
 
-        let merges = temp_hierarchy.build_merge_events(threshold_groups, num_records);
+        let merges = temp_hierarchy.build_merge_events(
+            threshold_groups,
+            num_records,
+            progress_callback.clone(),
+        );
 
         #[cfg(debug_assertions)]
         let union_find_time = union_find_start.elapsed();
@@ -121,13 +166,22 @@ impl PartitionHierarchy {
         let threshold_index = Self::build_threshold_index(&merges);
 
         // Reuse the bitmap pool from temporary instance for efficiency
+        // Calculate adaptive cache size based on available memory
+        let cache_size = if let Some(monitor) = resource_monitor {
+            let usage = monitor.get_usage();
+            // 1 cache entry per 100MB available memory, bounded between 5 and 100
+            (usage.memory_available_mb / 100).clamp(5, 100) as usize
+        } else {
+            Self::CACHE_SIZE // Fallback to default
+        };
+
         let result = Self {
             context,
             merges,
-            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            partition_cache: LruCache::new(cache_size.try_into().unwrap()),
             threshold_index,
             bitmap_pool: temp_hierarchy.bitmap_pool,
-            cache_size: Self::CACHE_SIZE,
+            cache_size,
         };
 
         // Debug output for hierarchy construction breakdown
@@ -144,7 +198,7 @@ impl PartitionHierarchy {
             );
         }
 
-        result
+        Ok(result)
     }
 
     /// Group consecutive edges with the same threshold
@@ -180,6 +234,7 @@ impl PartitionHierarchy {
         &mut self,
         threshold_groups: Vec<(f64, Vec<(u32, u32)>)>,
         num_records: usize,
+        progress_callback: Option<ProgressCallback>,
     ) -> Vec<MergeEvent> {
         // Pre-allocate with estimated capacity to avoid resizing
         let estimated_merges = threshold_groups.len() * 100;
@@ -195,7 +250,13 @@ impl PartitionHierarchy {
         #[cfg(debug_assertions)]
         let mut bitmap_allocations = 0;
 
-        for (threshold, edges_at_threshold) in threshold_groups.iter() {
+        // Progress monitoring for large datasets
+        let total_edges: usize = threshold_groups.iter().map(|(_, edges)| edges.len()).sum();
+        let show_progress = total_edges > 1_000_000; // Lower threshold for progress reporting
+        let mut processed_edges = 0;
+        let mut last_progress_report = std::time::Instant::now();
+
+        for (group_idx, (threshold, edges_at_threshold)) in threshold_groups.iter().enumerate() {
             // Pre-allocate for this threshold's processing
             let mut processed_pairs = HashSet::with_capacity(edges_at_threshold.len());
 
@@ -264,6 +325,28 @@ impl PartitionHierarchy {
                     }
                 }
             }
+
+            // Progress reporting for large datasets
+            processed_edges += edges_at_threshold.len();
+            if show_progress && last_progress_report.elapsed().as_secs() >= 3 {
+                let progress_pct = (processed_edges as f64 / total_edges as f64) * 0.25; // Use 25% of total progress range for union-find
+                let hierarchy_progress = 0.7 + progress_pct; // Start at 0.7, go up to 0.95
+                let progress_message = format!(
+                    "Union-find: {}/{} groups ({:.1}M/{:.1}M edges)",
+                    group_idx + 1,
+                    threshold_groups.len(),
+                    processed_edges as f64 / 1_000_000.0,
+                    total_edges as f64 / 1_000_000.0
+                );
+
+                // Use callback if available, otherwise fall back to eprintln
+                if let Some(ref callback) = progress_callback {
+                    callback(hierarchy_progress, &progress_message);
+                } else {
+                    eprintln!("      🔄 {}", progress_message);
+                }
+                last_progress_report = std::time::Instant::now();
+            }
         }
 
         for (_, bitmap) in active_components {
@@ -273,6 +356,11 @@ impl PartitionHierarchy {
 
         // Shrink to fit to free excess capacity
         merges.shrink_to_fit();
+
+        // Report completion of union-find phase
+        if let Some(ref callback) = progress_callback {
+            callback(0.95, "Union-find complete, finalizing hierarchy");
+        }
 
         #[cfg(debug_assertions)]
         {
@@ -402,7 +490,7 @@ mod tests {
     #[test]
     fn test_empty_edges() {
         let ctx = create_test_context();
-        let hierarchy = PartitionHierarchy::from_edges(vec![], ctx.clone(), 2);
+        let hierarchy = PartitionHierarchy::from_edges(vec![], ctx.clone(), 2, None, None).unwrap();
 
         assert_eq!(hierarchy.merge_events().len(), 0);
         assert_eq!(hierarchy.num_records(), 3);
@@ -418,7 +506,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
         let merges = hierarchy.merge_events();
 
         // Should have two merge events: one at 0.8 and one at 0.6
@@ -449,7 +537,7 @@ mod tests {
             (2, 3, 0.7), // C-D
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
         let merges = hierarchy.merge_events();
 
         // Should have two independent merge events
@@ -481,7 +569,7 @@ mod tests {
             (2, 3, 0.5), // C-D
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
         let merges = hierarchy.merge_events();
 
         // Should create merge events as the union-find processes the edges
@@ -501,7 +589,7 @@ mod tests {
             (0, 1, 0.123456789), // Should be quantised to 0.12 with quantise=2
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
         let merges = hierarchy.merge_events();
 
         assert_eq!(merges.len(), 1);
@@ -526,7 +614,7 @@ mod tests {
         let edges = vec![(0, 1, 0.5)];
 
         // Should panic with quantise=0
-        PartitionHierarchy::from_edges(edges, ctx, 0);
+        PartitionHierarchy::from_edges(edges, ctx, 0, None, None).unwrap();
     }
 
     #[test]
@@ -539,7 +627,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // At threshold 0.0, all records should be in one entity
         let partition = hierarchy.at_threshold(0.0);
@@ -565,7 +653,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // At threshold 1.0, each record should be a singleton
         let partition = hierarchy.at_threshold(1.0);
@@ -590,7 +678,7 @@ mod tests {
             (1, 2, 0.4), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // At threshold 0.5, A-B should be merged but C separate
         let partition = hierarchy.at_threshold(0.5);
@@ -625,7 +713,7 @@ mod tests {
             (1, 2, 0.6), // Connect 1-2
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // At threshold 0.5, should have:
         // - One entity with {0, 1, 2}
@@ -650,7 +738,7 @@ mod tests {
 
         let edges = vec![(0, 1, 0.8), (1, 2, 0.6)];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // First access - should reconstruct
         let partition1 = hierarchy.at_threshold(0.7);
@@ -678,7 +766,7 @@ mod tests {
     fn test_invalid_threshold_negative() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // Should panic with negative threshold
         hierarchy.at_threshold(-0.1);
@@ -689,7 +777,7 @@ mod tests {
     fn test_invalid_threshold_too_large() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // Should panic with threshold > 1.0
         hierarchy.at_threshold(1.1);
@@ -712,7 +800,7 @@ mod tests {
             (4, 5, 0.9), // E-F
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // At threshold 0.9, should have 3 components (3 pairs)
         let partition = hierarchy.at_threshold(0.9);
@@ -760,7 +848,7 @@ mod tests {
             (6, 7, 0.7), // Pair 4 (lowest threshold)
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
 
         // Test hierarchical behaviour
         let partition_high = hierarchy.at_threshold(0.95);
@@ -815,7 +903,8 @@ mod tests {
         ];
 
         // Test with quantise=2 (2 decimal places)
-        let mut hierarchy = PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 2);
+        let mut hierarchy =
+            PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 2, None, None).unwrap();
 
         let partition_high = hierarchy.at_threshold(0.9);
         assert_eq!(

@@ -28,7 +28,7 @@ fn generate_test_hierarchy(entity_count: usize) -> PartitionHierarchy {
         edges.len(),
         ctx.len()
     );
-    PartitionHierarchy::from_edges(edges, ctx, 6)
+    PartitionHierarchy::from_edges(edges, ctx, 6, None, None).unwrap()
 }
 
 fn bench_partition_reconstruction_1m(c: &mut Criterion) {

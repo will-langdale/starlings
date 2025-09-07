@@ -68,10 +68,13 @@ def test_user_eda_workflow():
     eda_thresholds = [1.0, 0.95, 0.9, 0.8, 0.5, 0.0]
     eda_counts = [collection.at(t).num_entities for t in eda_thresholds]
 
+    # Calculate expected edge count (n entities * 5 edges per entity on average)
+    expected_edges = total_nodes * 5
+
     logger.info(
-        "EDA workflow: %d edges, %d total nodes. Graph: %.2fs, "
+        "EDA workflow: ~%d edges, %d total nodes. Graph: %.2fs, "
         "Collection: %.2fs. Entity counts: %s",
-        len(edges),
+        expected_edges,
         total_nodes,
         graph_time,
         collection_time,

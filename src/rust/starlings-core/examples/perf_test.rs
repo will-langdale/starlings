@@ -131,7 +131,7 @@ fn test_entity_resolution_vs_random_construction(num_entities: usize) {
 
     println!("Starting entity resolution hierarchy construction...");
     let start = Instant::now();
-    let mut er_hierarchy = PartitionHierarchy::from_edges(er_edges, er_ctx, 6);
+    let mut er_hierarchy = PartitionHierarchy::from_edges(er_edges, er_ctx, 6, None, None).unwrap();
     let er_construction_time = start.elapsed();
 
     println!(
@@ -171,7 +171,7 @@ fn test_entity_resolution_vs_random_construction(num_entities: usize) {
 
     println!("Starting random hierarchy construction...");
     let start = Instant::now();
-    let mut r_hierarchy = PartitionHierarchy::from_edges(r_edges, r_ctx, 6);
+    let mut r_hierarchy = PartitionHierarchy::from_edges(r_edges, r_ctx, 6, None, None).unwrap();
     let r_construction_time = start.elapsed();
 
     println!(
@@ -235,7 +235,7 @@ fn test_exact_production_scale() {
 
     println!("Starting hierarchy construction...");
     let start = Instant::now();
-    let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 6);
+    let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 6, None, None).unwrap();
     let construction_time = start.elapsed();
 
     println!(
@@ -267,7 +267,7 @@ fn test_exact_production_scale() {
     } else if construction_time.as_secs_f64() < 10.0 {
         println!("✅ Production-scale performance is GOOD (<10s)");
     } else {
-        println!("⚠️  Production-scale performance needs optimization (>10s)");
+        println!("⚠️  Production-scale performance needs optimisation (>10s)");
     }
 }
 
@@ -342,6 +342,6 @@ fn main() {
     println!("✅ Unified generator produces exactly n entities at 1.0, n/2 entities at 0.0");
     println!("✅ Edge count is exactly n*5 for predictable memory usage");
     println!("✅ Jitter provides diversity for PGO training");
-    println!("✅ Performance is optimized for entity resolution patterns");
+    println!("✅ Performance is optimised for entity resolution patterns");
     println!("✅ API is simple and consistent across all scales");
 }

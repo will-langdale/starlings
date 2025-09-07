@@ -64,10 +64,18 @@ pub fn generate_entity_resolution_edges(
         snap_to_discrete_thresholds(&mut edges, num_thresh);
     }
 
-    // Remove duplicates and shuffle
-    edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    rng.shuffle(&mut edges);
+    // Remove duplicates and shuffle - optimise for large datasets
+    if edges.len() > 100_000 {
+        // Use parallel sort and more efficient deduplication for large datasets
+        use rayon::prelude::*;
+        edges.par_sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        // Skip shuffle for large datasets (not needed for correctness, just for variety)
+    } else {
+        edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        rng.shuffle(&mut edges);
+    }
 
     edges
 }
@@ -231,18 +239,32 @@ fn generate_noise_edges(
     target_count: usize,
     rng: &mut Rng,
 ) -> Vec<(u32, u32, f64)> {
-    let mut edges = Vec::new();
-    let mut edge_set = std::collections::HashSet::new();
+    let mut edges = Vec::with_capacity(target_count);
 
-    // First, add all possible intra-cluster edges to maximize edge count
-    for cluster in final_clusters {
-        if cluster.len() < 2 {
-            continue;
-        }
+    // For large datasets, use a simpler, more efficient approach
+    if target_count > 1_000_000 {
+        // Generate edges more efficiently for large scale
+        let mut generated = 0;
 
-        // Generate multiple edges for each possible pair in cluster (with different thresholds)
-        for i in 0..cluster.len() {
-            for j in (i + 1)..cluster.len() {
+        for cluster in final_clusters {
+            if cluster.len() < 2 || generated >= target_count {
+                break;
+            }
+
+            // For large clusters, sample pairs instead of generating all
+            let cluster_edge_budget = (target_count - generated).min(cluster.len() * cluster.len());
+
+            for _ in 0..cluster_edge_budget {
+                if generated >= target_count {
+                    break;
+                }
+
+                let i = rng.usize(0..cluster.len());
+                let mut j = rng.usize(0..cluster.len());
+                if i == j {
+                    j = (j + 1) % cluster.len();
+                }
+
                 let entity1 = cluster[i];
                 let entity2 = cluster[j];
                 let (e1, e2) = if entity1 < entity2 {
@@ -251,29 +273,51 @@ fn generate_noise_edges(
                     (entity2, entity1)
                 };
 
-                // Add 3-5 edges per pair with different thresholds to increase density
-                let num_edges_for_pair = 3 + (rng.usize(0..3)); // 3-5 edges per pair
-                for _ in 0..num_edges_for_pair {
-                    if edges.len() >= target_count {
-                        break;
-                    }
+                let threshold = 0.1 + rng.f64() * 0.8; // Range [0.1, 0.9]
+                edges.push((e1, e2, threshold));
+                generated += 1;
+            }
+        }
+    } else {
+        // Original approach for smaller datasets
+        let mut edge_set = std::collections::HashSet::new();
 
-                    let threshold = 0.1 + rng.f64() * 0.8; // Range [0.1, 0.9]
+        for cluster in final_clusters {
+            if cluster.len() < 2 {
+                continue;
+            }
 
-                    // Use threshold as part of uniqueness check
-                    let edge_key = (e1, e2, (threshold * 1000.0).round() as i32);
-                    if !edge_set.contains(&edge_key) {
-                        edge_set.insert(edge_key);
-                        edges.push((e1, e2, threshold));
+            // Generate multiple edges for each possible pair in cluster (with different thresholds)
+            for i in 0..cluster.len() {
+                for j in (i + 1)..cluster.len() {
+                    let entity1 = cluster[i];
+                    let entity2 = cluster[j];
+                    let (e1, e2) = if entity1 < entity2 {
+                        (entity1, entity2)
+                    } else {
+                        (entity2, entity1)
+                    };
+
+                    // Add 3-5 edges per pair with different thresholds to increase density
+                    let num_edges_for_pair = 3 + (rng.usize(0..3)); // 3-5 edges per pair
+                    for _ in 0..num_edges_for_pair {
+                        if edges.len() >= target_count {
+                            break;
+                        }
+
+                        let threshold = 0.1 + rng.f64() * 0.8; // Range [0.1, 0.9]
+
+                        // Use threshold as part of uniqueness check
+                        let edge_key = (e1, e2, (threshold * 1000.0).round() as i32);
+                        if !edge_set.contains(&edge_key) {
+                            edge_set.insert(edge_key);
+                            edges.push((e1, e2, threshold));
+                        }
                     }
                 }
             }
         }
     }
-
-    // Don't add cross-cluster edges - this would violate the n/2 guarantee
-    // If we can't reach target_count with intra-cluster edges, that's acceptable
-    // The deduplication will reduce the final count anyway
 
     edges
 }
@@ -360,7 +404,8 @@ mod tests {
         }
 
         println!("Generated {} edges for {} entities", edges.len(), n);
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, Arc::new(context), 6);
+        let mut hierarchy =
+            PartitionHierarchy::from_edges(edges, Arc::new(context), 6, None, None).unwrap();
 
         // Test entity counts at key thresholds
         let entities_at_1_0 = hierarchy.at_threshold(1.0).entities().len();

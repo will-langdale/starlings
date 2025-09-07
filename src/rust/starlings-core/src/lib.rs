@@ -3,7 +3,7 @@ pub mod hierarchy;
 pub mod test_utils;
 
 // Re-export commonly used types for easier access
-pub use core::{DataContext, Key};
+pub use core::{DataContext, Key, ResourceMonitor};
 pub use hierarchy::{MergeEvent, PartitionHierarchy, PartitionLevel};
 
 #[cfg(test)]

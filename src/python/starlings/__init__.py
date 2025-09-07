@@ -42,11 +42,12 @@ from __future__ import annotations
 
 import logging
 import os
-import time
+from collections.abc import Iterable
 from importlib.metadata import version  # noqa: PLC0415
 from typing import Any, cast
 
-from .debug import DebugTimer, get_memory_mb
+from tqdm import tqdm
+
 from .starlings import Collection as PyCollection
 from .starlings import Partition as PyPartition
 from .starlings import (
@@ -216,9 +217,12 @@ class Collection:
     @classmethod
     def from_edges(
         cls,
-        edges: list[tuple[Key, Key, float]],
+        edges: Iterable[tuple[Key, Key, float]],
         *,
         source: str | None = None,
+        show_progress: bool = True,
+        memory_limit_mb: int | None = None,
+        max_batch_size: int | None = None,
     ) -> Collection:
         """Build collection from weighted edges.
 
@@ -226,61 +230,115 @@ class Collection:
         records. Records can be any hashable Python type (int, str, bytes) and are
         automatically converted to internal indices for efficient processing.
 
+        Unified processing: handles both edge lists and generators seamlessly.
+
         Args:
-            edges: List of (record_i, record_j, similarity) tuples.
-                Records can be any hashable type (int, str, bytes). Similarities
-                should be between 0.0 and 1.0.
+            edges: Iterable of (record_i, record_j, similarity) tuples.
+                Can be a list, generator, or any iterable. Records can be any hashable
+                type (int, str, bytes). Similarities should be between 0.0 and 1.0.
             source: Source name for record context. Defaults to "default".
+            show_progress: Whether to show tqdm progress bar. Defaults to True.
+            memory_limit_mb: Optional memory limit in MB. If not provided, uses 80%
+                of available system memory (following Polars pattern).
+            max_batch_size: Maximum batch size for processing. Defaults to 100k.
+                Will be reduced automatically under memory pressure.
 
         Returns:
             New Collection with hierarchy of merge events.
 
         Complexity:
-            O(m log m) where m = len(edges)
+            O(m log m) where m = total number of edges
 
         Example:
             ```python
-            # Basic usage with different key types
-            edges = [
-                ("cust_123", "cust_456", 0.95),
-                (123, 456, 0.85),
-                (b"hash1", b"hash2", 0.75),
-            ]
+            # With edge list (known size - shows total progress)
+            edges = [("cust_123", "cust_456", 0.95), (123, 456, 0.85)]
             collection = Collection.from_edges(edges)
 
-            # Get partition at threshold
-            partition = collection.at(0.8)
-            print(f"Entities: {len(partition.entities)}")
+            # With generator (streaming - shows streaming progress)
+            edge_gen = generate_entity_resolution_edges(1_000_000)
+            collection = Collection.from_edges(edge_gen)
+
+            # Both show tqdm progress bars automatically
             ```
         """
-        start_time = time.perf_counter() if _DEBUG_ENABLED else 0.0
-        start_memory = get_memory_mb() if _DEBUG_ENABLED else 0.0
+        # Convert edges to list, handling both sequences and generators
+        edge_list = cls._collect_edges(edges, show_progress)
 
-        if _DEBUG_ENABLED:
-            logger.debug(
-                "Starting with %s edges, memory: %.1fMB",
-                f"{len(edges):,}",
-                start_memory,
+        # Create progress callback if needed
+        progress_bar = None
+
+        if show_progress:
+            progress_bar = tqdm(
+                total=len(edge_list),
+                desc="Processing edges",
+                unit="edges",
+                unit_scale=True,
             )
 
-        with DebugTimer("Edge validation & preprocessing", _DEBUG_ENABLED):
-            # Let Rust handle the actual processing, but we can measure overall time
-            pass
+            def progress_callback(progress: float, message: str) -> None:
+                progress_bar.set_description(f"Processing edges - {message}")
+                progress_bar.n = int(progress * len(edge_list))
+                progress_bar.refresh()
 
-        with DebugTimer("Hierarchy construction & partitioning", _DEBUG_ENABLED):
-            rust_collection = PyCollection.from_edges(edges, source=source)
-
-        if _DEBUG_ENABLED:
-            total_time = time.perf_counter() - start_time
-            final_memory = get_memory_mb()
-            peak_delta = final_memory - start_memory
-            logger.debug(
-                "Total: %.3fs, %+.1fMB peak memory",
-                total_time,
-                peak_delta,
+            rust_collection = PyCollection.from_edges(
+                edge_list,
+                source=source,
+                progress_callback=progress_callback,
+                memory_limit_mb=memory_limit_mb,
+                max_batch_size=max_batch_size,
             )
+        else:
+            rust_collection = PyCollection.from_edges(
+                edge_list,
+                source=source,
+                progress_callback=None,
+                memory_limit_mb=memory_limit_mb,
+                max_batch_size=max_batch_size,
+            )
+
+        if progress_bar is not None:
+            progress_bar.close()
 
         return cls(rust_collection)
+
+    @staticmethod
+    def _collect_edges(
+        edges: Iterable[tuple[Key, Key, float]], show_progress: bool
+    ) -> list[tuple[Key, Key, float]]:
+        """Collect edges from any iterable into a list."""
+        # Fast path for lists and sequences
+        if hasattr(edges, "__len__"):
+            return edges if isinstance(edges, list) else list(edges)
+
+        # Handle generators and iterators
+        edge_list = []
+        progress_bar = None
+
+        if show_progress:
+            progress_bar = tqdm(desc="Loading edges", unit="edges")
+
+        for item in edges:
+            # Handle batched generators
+            if isinstance(item, list):
+                edge_list.extend(item)
+                if progress_bar is not None:
+                    progress_bar.set_description(f"Loaded {len(edge_list):,} edges")
+                    progress_bar.update(len(item))
+            else:
+                edge_list.append(item)
+                if progress_bar is not None and len(edge_list) % 10000 == 0:
+                    progress_bar.set_description(f"Loaded {len(edge_list):,} edges")
+                    progress_bar.update(10000)
+
+        if progress_bar is not None:
+            # Update remaining
+            remaining = len(edge_list) % 10000
+            if remaining:
+                progress_bar.update(remaining)
+            progress_bar.close()
+
+        return edge_list
 
     def at(self, threshold: float) -> Partition:
         """Get partition at specific threshold.

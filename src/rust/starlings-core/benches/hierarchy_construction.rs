@@ -43,11 +43,10 @@ fn bench_hierarchy_construction_progressive(c: &mut Criterion) {
 
         group.bench_function(format!("{}_{}_edges", name, edges.len()), |b| {
             b.iter(|| {
-                black_box(PartitionHierarchy::from_edges(
-                    edges.clone(),
-                    ctx.clone(),
-                    6,
-                ))
+                black_box(
+                    PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 6, None, None)
+                        .unwrap(),
+                )
             })
         });
     }
