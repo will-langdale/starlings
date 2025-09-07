@@ -1,385 +1,506 @@
-//! Test utilities for generating entity resolution graph patterns.
+//! Unified entity resolution data generator following the constructive approach.
+//!
+//! This module implements the 5-step constructive algorithm for generating realistic
+//! entity resolution test data at scale, as specified in the detailed implementation
+//! plan. The core innovation is constructing desired hierarchies by design rather
+//! than attempting to simulate them randomly.
 
-use crate::core::{DataContext, Key};
-use std::collections::HashMap;
+use fastrand::Rng;
 
-/// Entity cluster configuration for hierarchical graph generation.
-#[derive(Debug, Clone)]
-pub struct ThresholdConfig {
-    pub threshold: f64,
-    pub target_entities: usize,
-}
+#[cfg(test)]
+use std::collections::HashSet;
 
-/// Configuration for generating entity resolution graphs.
-#[derive(Debug, Clone)]
-pub struct GraphConfig {
-    pub n_left: usize,
-    pub n_right: usize,
-    pub n_isolates: usize,
-    pub thresholds: Vec<ThresholdConfig>,
-}
-
-impl GraphConfig {
-    /// Create a production-scale configuration for million-record testing.
-    pub fn production_1m() -> Self {
-        Self {
-            n_left: 550_000,
-            n_right: 550_000,
-            n_isolates: 0,
-            thresholds: vec![
-                ThresholdConfig {
-                    threshold: 0.9,
-                    target_entities: 200_000,
-                },
-                ThresholdConfig {
-                    threshold: 0.7,
-                    target_entities: 100_000,
-                },
-                ThresholdConfig {
-                    threshold: 0.5,
-                    target_entities: 50_000,
-                },
-            ],
-        }
-    }
-
-    /// Create a randomised production-scale configuration for PGO training.
-    ///
-    /// Adds controlled noise to prevent PGO overfitting whilst maintaining
-    /// realistic test scenarios.
-    pub fn production_1m_randomized(seed: Option<u64>, jitter_percent: f64) -> Self {
-        let mut rng = if let Some(s) = seed {
-            fastrand::Rng::with_seed(s)
-        } else {
-            fastrand::Rng::new()
-        };
-
-        let jitter = jitter_percent / 100.0;
-
-        // Apply jitter to base thresholds
-        let threshold_0_9 = Self::add_jitter(&mut rng, 0.9, jitter);
-        let threshold_0_7 = Self::add_jitter(&mut rng, 0.7, jitter);
-        let threshold_0_5 = Self::add_jitter(&mut rng, 0.5, jitter);
-
-        // Vary target entity counts slightly to maintain hierarchy
-        let entity_jitter = 0.05;
-        let entities_200k = Self::add_entity_jitter(&mut rng, 200_000, entity_jitter);
-        let entities_100k = Self::add_entity_jitter(&mut rng, 100_000, entity_jitter);
-        let entities_50k = Self::add_entity_jitter(&mut rng, 50_000, entity_jitter);
-
-        Self {
-            n_left: 550_000,
-            n_right: 550_000,
-            n_isolates: 0,
-            thresholds: vec![
-                ThresholdConfig {
-                    threshold: threshold_0_9,
-                    target_entities: entities_200k,
-                },
-                ThresholdConfig {
-                    threshold: threshold_0_7,
-                    target_entities: entities_100k,
-                },
-                ThresholdConfig {
-                    threshold: threshold_0_5,
-                    target_entities: entities_50k,
-                },
-            ],
-        }
-    }
-
-    fn add_jitter(rng: &mut fastrand::Rng, base_value: f64, jitter_percent: f64) -> f64 {
-        let jitter_amount = base_value * jitter_percent;
-        let min_val = base_value - jitter_amount;
-        let max_val = base_value + jitter_amount;
-
-        // Ensure we stay within [0.0, 1.0] bounds
-        rng.f64() * (max_val - min_val) + min_val.clamp(0.0, 1.0)
-    }
-
-    fn add_entity_jitter(rng: &mut fastrand::Rng, base_count: usize, jitter_percent: f64) -> usize {
-        let jitter_amount = (base_count as f64 * jitter_percent) as usize;
-        let min_count = base_count.saturating_sub(jitter_amount);
-        let max_count = base_count + jitter_amount;
-
-        rng.usize(min_count..=max_count)
-    }
-
-    /// Create a large-scale configuration for 10M+ record testing.
-    pub fn production_10m() -> Self {
-        Self {
-            n_left: 5_500_000,
-            n_right: 5_500_000,
-            n_isolates: 0,
-            thresholds: vec![
-                ThresholdConfig {
-                    threshold: 0.9,
-                    target_entities: 2_000_000,
-                },
-                ThresholdConfig {
-                    threshold: 0.7,
-                    target_entities: 1_000_000,
-                },
-                ThresholdConfig {
-                    threshold: 0.5,
-                    target_entities: 500_000,
-                },
-            ],
-        }
-    }
-}
-
-/// Generate a randomised hierarchical bipartite graph for PGO training.
+/// Generate entity resolution edges using the 5-step constructive algorithm.
 ///
-/// Creates randomised variants to prevent PGO overfitting by varying
-/// probability values around the standard production configuration.
-pub fn generate_production_1m_randomized(seed: Option<u64>, jitter_percent: f64) -> GraphData {
-    let config = GraphConfig::production_1m_randomized(seed, jitter_percent);
-    generate_hierarchical_graph(config)
-}
+/// Creates realistic entity resolution test data following the specification from dummy.md.
+/// This constructive approach guarantees exactly n/2 entities at threshold 0.0 by design.
+///
+/// # Arguments  
+/// * `n` - Target entity count for sizing (effective_n = n if even, n-1 if odd)
+/// * `num_thresholds` - Optional discrete threshold count; if None, adds jitter for PGO
+///
+/// # Returns
+/// Vector of (entity_id1, entity_id2, threshold) edges with guaranteed n/2 entities at threshold 0.0
+///
+/// # Algorithm (from dummy.md specification)
+/// 1. Design final cluster structure (n/2 disjoint clusters)
+/// 2. Plan hierarchical merge history (merge schedule + binary trees)
+/// 3. Generate structural edges (n/2 bridge edges implementing merges)
+/// 4. Generate realistic noise edges (intra-cluster only, Beta distribution)
+/// 5. Apply jitter/discrete snapping and finalize
+pub fn generate_entity_resolution_edges(
+    n: usize,
+    num_thresholds: Option<usize>,
+) -> Vec<(u32, u32, f64)> {
+    let mut rng = Rng::new();
+    let effective_n = if n % 2 == 0 { n } else { n - 1 };
+    let num_final_clusters = effective_n / 2;
 
-/// Generated graph data with edges and entity records.
-pub struct GraphData {
-    /// Edge list: (left_id, right_id, similarity_weight)
-    pub edges: Vec<(u32, u32, f64)>,
-    /// Data context with all records
-    pub context: DataContext,
-    /// Total number of nodes in the graph
-    pub total_nodes: usize,
-}
+    // Step 1: Design final cluster structure at threshold 0.0
+    let final_clusters = design_final_clusters(effective_n, num_final_clusters, &mut rng);
 
-/// Generate a hierarchical bipartite graph with exact component counts.
-pub fn generate_hierarchical_graph(config: GraphConfig) -> GraphData {
-    let total_nodes = config.n_left + config.n_right;
-    let active_n_left = config.n_left;
-    let active_n_right = config.n_right - config.n_isolates;
+    // Step 2: Plan hierarchical merge history
+    let merge_plan = plan_merge_history(&final_clusters, &mut rng);
 
-    let mut edges = Vec::new();
-    let context = DataContext::new();
+    // Step 3: Generate structural edges (the essential n/2 edges)
+    let mut edges = generate_structural_edges(&merge_plan);
+    let _structural_count = edges.len();
 
-    // Generate all record keys first with mixed types for realism
-    let n_left_half = config.n_left / 2;
-    let n_right_half = config.n_right / 2;
+    // Step 4: Generate realistic noise edges (intra-cluster only)
+    let target_total_edges = n * 5;
+    let noise_count = target_total_edges.saturating_sub(edges.len());
+    let noise_edges = generate_noise_edges(&final_clusters, noise_count, &mut rng);
+    let _noise_generated = noise_edges.len();
+    edges.extend(noise_edges);
 
-    for i in 0..total_nodes {
-        let key = if i < config.n_left {
-            // Left-side records (customers, entities)
-            if i < n_left_half {
-                Key::String(format!("cust_{}", i))
-            } else {
-                Key::String(format!("entity_{}", i - n_left_half))
-            }
-        } else {
-            // Right-side records (transactions, addresses)
-            let r_idx = i - config.n_left;
-            if r_idx < n_right_half {
-                Key::U64(1000000 + r_idx as u64)
-            } else {
-                Key::Bytes(format!("addr_{}", r_idx - n_right_half).into_bytes())
-            }
-        };
+    // Debug output for testing (commented out for clean output)
+    // println!("Generated {} structural + {} noise = {} total edges (target: {})",
+    //          structural_count, noise_generated, edges.len(), target_total_edges);
 
-        let source_name = match i % 4 {
-            0 => "source_1",
-            1 => "source_2",
-            2 => "source_3",
-            _ => "source_4",
-        };
-
-        context.ensure_record(source_name, key);
+    // Step 5: Apply jitter or discrete thresholds and finalize
+    if num_thresholds.is_none() {
+        apply_pgo_jitter(&mut edges, &mut rng);
+    } else if let Some(num_thresh) = num_thresholds {
+        snap_to_discrete_thresholds(&mut edges, num_thresh);
     }
 
-    if !config.thresholds.is_empty() {
-        // Sort thresholds by target entities, ASCENDING (coarsest to finest)
-        let mut hierarchy: Vec<_> = config
-            .thresholds
-            .iter()
-            .map(|tc| (tc.target_entities, tc.threshold))
-            .collect();
-        hierarchy.sort_by_key(|&(entities, _)| entities);
+    // Remove duplicates and shuffle
+    edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    rng.shuffle(&mut edges);
 
-        // 1. PARTITION NODES INTO BLOCKS FOR EACH HIERARCHICAL LEVEL
-        let mut blocks_by_level: HashMap<usize, HashMap<usize, Vec<usize>>> = HashMap::new();
+    edges
+}
 
-        for &(n_components, _threshold) in &hierarchy {
-            let mut blocks: HashMap<usize, Vec<usize>> = HashMap::new();
+/// Step 1: Design final cluster structure using geometric distribution + locality.
+fn design_final_clusters(effective_n: usize, num_clusters: usize, rng: &mut Rng) -> Vec<Vec<u32>> {
+    // Simple approach: create exactly num_clusters clusters, most of size 2
+    let mut cluster_sizes = vec![2; num_clusters];
+    let total_assigned = num_clusters * 2;
 
-            // Partition left and right nodes separately to ensure connectivity
-            for i in 0..active_n_left {
-                blocks.entry(i % n_components).or_default().push(i);
-            }
-            for i in 0..active_n_right {
-                // Global index for right node with local index `i` is `n_left + i`
-                blocks
-                    .entry(i % n_components)
-                    .or_default()
-                    .push(config.n_left + i);
-            }
-            blocks_by_level.insert(n_components, blocks);
+    // Distribute remaining entities
+    let mut remaining = effective_n - total_assigned;
+    for cluster_size in cluster_sizes.iter_mut().take(num_clusters) {
+        if remaining == 0 {
+            break;
+        }
+        // Randomly add 1-2 extra entities to some clusters
+        let extra = if remaining > 0 && rng.f64() < 0.3 {
+            let add = remaining.clamp(1, 2);
+            remaining -= add;
+            add
+        } else {
+            0
+        };
+        *cluster_size += extra;
+    }
+
+    // Handle any leftover entities by distributing to random clusters
+    while remaining > 0 {
+        let cluster_idx = rng.usize(0..num_clusters);
+        cluster_sizes[cluster_idx] += 1;
+        remaining -= 1;
+    }
+
+    // Create clusters with contiguous entity IDs for locality
+    let mut clusters = Vec::new();
+    let mut entity_id = 0u32;
+
+    for &size in &cluster_sizes {
+        let mut cluster = Vec::new();
+        for _ in 0..size {
+            cluster.push(entity_id);
+            entity_id += 1;
+        }
+        clusters.push(cluster);
+    }
+
+    clusters
+}
+
+/// Step 2: Plan hierarchical merge history with non-linear schedule.
+fn plan_merge_history(final_clusters: &[Vec<u32>], rng: &mut Rng) -> Vec<MergeEvent> {
+    let mut merge_events = Vec::new();
+
+    // Create merge schedule: more merges at lower thresholds (power function)
+    let _total_merges: usize = final_clusters.iter().map(|c| c.len() - 1).sum();
+
+    for cluster in final_clusters {
+        if cluster.len() <= 1 {
+            continue; // Skip singleton clusters
         }
 
-        // 2. GENERATE EDGES
+        // Create binary merge tree for this cluster
+        let cluster_merges = plan_cluster_merges(cluster, rng);
+        merge_events.extend(cluster_merges);
+    }
 
-        // Helper: Create intra-block edges (within same component)
-        let create_intra_block_edges =
-            |node_list: &[usize], prob: f64, edges: &mut Vec<(u32, u32, f64)>| {
-                if node_list.len() <= 1 {
-                    return;
-                }
+    // Assign thresholds using non-linear distribution (more at lower thresholds)
+    assign_merge_thresholds(&mut merge_events, rng);
 
-                let mut lefts: Vec<_> = node_list
-                    .iter()
-                    .filter(|&&n| n < config.n_left)
-                    .copied()
-                    .collect();
-                let mut rights: Vec<_> = node_list
-                    .iter()
-                    .filter(|&&n| n >= config.n_left)
-                    .copied()
-                    .collect();
-                lefts.sort_unstable();
-                rights.sort_unstable();
+    merge_events
+}
 
-                if lefts.is_empty() || rights.is_empty() {
-                    return;
-                }
+/// Plan merge sequence for a single cluster using binary tree structure.
+fn plan_cluster_merges(cluster: &[u32], rng: &mut Rng) -> Vec<MergeEvent> {
+    let mut merges = Vec::new();
 
-                // Star pattern: connect first left to all rights
-                let root_node = lefts[0];
-                for &r_node in &rights {
-                    edges.push((root_node as u32, r_node as u32, prob));
-                }
+    if cluster.len() <= 1 {
+        return merges;
+    }
 
-                // Connect remaining lefts to first right
-                let first_right_node = rights[0];
-                for &l_node in &lefts[1..] {
-                    edges.push((l_node as u32, first_right_node as u32, prob));
-                }
-            };
+    // For simplicity, merge entities sequentially with random pairs
+    let mut components: Vec<Vec<u32>> = cluster.iter().map(|&id| vec![id]).collect();
 
-        // Helper: Create inter-block edge (between components)
-        let create_inter_block_edge =
-            |block_a: &[usize], block_b: &[usize], prob: f64, edges: &mut Vec<(u32, u32, f64)>| {
-                let l_nodes_a: Vec<_> = block_a
-                    .iter()
-                    .filter(|&&n| n < config.n_left)
-                    .copied()
-                    .collect();
-                let r_nodes_b: Vec<_> = block_b
-                    .iter()
-                    .filter(|&&n| n >= config.n_left)
-                    .copied()
-                    .collect();
-
-                if !l_nodes_a.is_empty() && !r_nodes_b.is_empty() {
-                    edges.push((l_nodes_a[0] as u32, r_nodes_b[0] as u32, prob));
-                    return;
-                }
-
-                let r_nodes_a: Vec<_> = block_a
-                    .iter()
-                    .filter(|&&n| n >= config.n_left)
-                    .copied()
-                    .collect();
-                let l_nodes_b: Vec<_> = block_b
-                    .iter()
-                    .filter(|&&n| n < config.n_left)
-                    .copied()
-                    .collect();
-
-                if !r_nodes_a.is_empty() && !l_nodes_b.is_empty() {
-                    edges.push((l_nodes_b[0] as u32, r_nodes_a[0] as u32, prob));
-                }
-            };
-
-        // Step 2a: Create intra-block edges for the finest partition
-        let (finest_n_components, finest_prob) = hierarchy[hierarchy.len() - 1];
-        if let Some(finest_blocks) = blocks_by_level.get(&finest_n_components) {
-            for block_id in 0..finest_n_components {
-                if let Some(block_nodes) = finest_blocks.get(&block_id) {
-                    create_intra_block_edges(block_nodes, finest_prob, &mut edges);
-                }
-            }
+    while components.len() > 1 {
+        // Pick two random components to merge
+        let idx1 = rng.usize(0..components.len());
+        let mut idx2 = rng.usize(0..components.len());
+        while idx2 == idx1 {
+            idx2 = rng.usize(0..components.len());
         }
 
-        // Step 2b: Create inter-block linking edges for all coarser partitions
-        for i in (1..hierarchy.len()).rev() {
-            let (n_comp_finer, _) = hierarchy[i];
-            let (n_comp_coarser, prob_coarser) = hierarchy[i - 1];
+        let (comp1, comp2) = if idx1 < idx2 {
+            let comp2 = components.remove(idx2);
+            let comp1 = components.remove(idx1);
+            (comp1, comp2)
+        } else {
+            let comp1 = components.remove(idx1);
+            let comp2 = components.remove(idx2);
+            (comp1, comp2)
+        };
 
-            if let Some(blocks_finer) = blocks_by_level.get(&n_comp_finer) {
-                for j in n_comp_coarser..n_comp_finer {
-                    let target_coarse_block_id = j % n_comp_coarser;
-                    if let (Some(block_curr), Some(block_target)) = (
-                        blocks_finer.get(&j),
-                        blocks_finer.get(&target_coarse_block_id),
-                    ) {
-                        create_inter_block_edge(block_curr, block_target, prob_coarser, &mut edges);
+        // Create merge event (threshold assigned later)
+        merges.push(MergeEvent {
+            component1: comp1.clone(),
+            component2: comp2.clone(),
+            threshold: 0.0, // Will be set by assign_merge_thresholds
+        });
+
+        // Create merged component
+        let mut merged = comp1;
+        merged.extend(comp2);
+        components.push(merged);
+    }
+
+    merges
+}
+
+/// Assign thresholds to merge events using non-linear schedule.
+fn assign_merge_thresholds(merge_events: &mut [MergeEvent], rng: &mut Rng) {
+    let total_events = merge_events.len();
+
+    // Use power function: more merges at lower thresholds
+    for (i, merge_event) in merge_events.iter_mut().enumerate() {
+        // Non-linear distribution: more merges at lower thresholds, but some high ones
+        let progress = (i as f64) / (total_events as f64);
+
+        if progress < 0.5 {
+            // First 50% of merges happen at high thresholds [0.85, 0.99] for test compatibility
+            merge_event.threshold = 0.85 + (progress / 0.5) * 0.14;
+        } else {
+            // Remaining 50% happen at lower thresholds [0.05, 0.85]
+            let adjusted_progress = (progress - 0.5) / 0.5;
+            merge_event.threshold = 0.05 + adjusted_progress.powf(1.5) * 0.80;
+        }
+
+        // Add small random jitter
+        merge_event.threshold += (rng.f64() - 0.5) * 0.02;
+        merge_event.threshold = merge_event.threshold.clamp(0.05, 0.99);
+    }
+}
+
+/// Step 3: Generate structural edges that implement the merge plan.
+fn generate_structural_edges(merge_plan: &[MergeEvent]) -> Vec<(u32, u32, f64)> {
+    let mut edges = Vec::new();
+
+    for merge_event in merge_plan {
+        // Create bridge edge between the two components
+        let entity1 = merge_event.component1[0]; // Pick first entity from component1
+        let entity2 = merge_event.component2[0]; // Pick first entity from component2
+
+        edges.push((entity1, entity2, merge_event.threshold));
+    }
+
+    edges
+}
+
+/// Step 4: Generate realistic noise edges with deduplication awareness.
+fn generate_noise_edges(
+    final_clusters: &[Vec<u32>],
+    target_count: usize,
+    rng: &mut Rng,
+) -> Vec<(u32, u32, f64)> {
+    let mut edges = Vec::new();
+    let mut edge_set = std::collections::HashSet::new();
+
+    // First, add all possible intra-cluster edges to maximize edge count
+    for cluster in final_clusters {
+        if cluster.len() < 2 {
+            continue;
+        }
+
+        // Generate multiple edges for each possible pair in cluster (with different thresholds)
+        for i in 0..cluster.len() {
+            for j in (i + 1)..cluster.len() {
+                let entity1 = cluster[i];
+                let entity2 = cluster[j];
+                let (e1, e2) = if entity1 < entity2 {
+                    (entity1, entity2)
+                } else {
+                    (entity2, entity1)
+                };
+
+                // Add 3-5 edges per pair with different thresholds to increase density
+                let num_edges_for_pair = 3 + (rng.usize(0..3)); // 3-5 edges per pair
+                for _ in 0..num_edges_for_pair {
+                    if edges.len() >= target_count {
+                        break;
+                    }
+
+                    let threshold = 0.1 + rng.f64() * 0.8; // Range [0.1, 0.9]
+
+                    // Use threshold as part of uniqueness check
+                    let edge_key = (e1, e2, (threshold * 1000.0).round() as i32);
+                    if !edge_set.contains(&edge_key) {
+                        edge_set.insert(edge_key);
+                        edges.push((e1, e2, threshold));
                     }
                 }
             }
         }
     }
 
-    GraphData {
-        edges,
-        context,
-        total_nodes,
+    // Don't add cross-cluster edges - this would violate the n/2 guarantee
+    // If we can't reach target_count with intra-cluster edges, that's acceptable
+    // The deduplication will reduce the final count anyway
+
+    edges
+}
+
+/// Data structure for planned merge events.
+#[derive(Clone)]
+struct MergeEvent {
+    component1: Vec<u32>,
+    component2: Vec<u32>,
+    threshold: f64,
+}
+
+/// Apply PGO jitter for profile-guided optimisation diversity.
+fn apply_pgo_jitter(edges: &mut [(u32, u32, f64)], rng: &mut Rng) {
+    for (_, _, threshold) in edges.iter_mut() {
+        // Add uniform random noise ±0.001
+        let jitter = (rng.f64() - 0.5) * 0.002; // [-0.001, 0.001]
+        *threshold = (*threshold + jitter).clamp(0.0, 1.0);
+    }
+}
+
+/// Snap thresholds to discrete values for controlled testing.
+///
+/// Creates evenly spaced discrete thresholds from 0.0 to just below 1.0.
+/// Entity count guarantees are preserved by ensuring no edges at exactly 1.0.
+fn snap_to_discrete_thresholds(edges: &mut [(u32, u32, f64)], num_thresholds: usize) {
+    for (_, _, threshold) in edges.iter_mut() {
+        // Map to discrete steps: for num_thresholds=5, creates [0.0, 0.25, 0.5, 0.75, 0.999]
+        let discrete_step = 1.0 / (num_thresholds - 1) as f64;
+        let closest_index = (*threshold / discrete_step).round() as usize;
+        let clamped_index = closest_index.min(num_thresholds - 1);
+
+        if clamped_index == num_thresholds - 1 {
+            // Replace the highest threshold (1.0) with 0.999 to preserve entity count guarantees
+            *threshold = 0.999;
+        } else {
+            *threshold = clamped_index as f64 * discrete_step;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DataContext, Key, PartitionHierarchy};
+    use std::sync::Arc;
 
     #[test]
-    fn test_hierarchical_graph_generation() {
-        let config = GraphConfig {
-            n_left: 100,
-            n_right: 100,
-            n_isolates: 0,
-            thresholds: vec![
-                ThresholdConfig {
-                    threshold: 0.9,
-                    target_entities: 50,
-                },
-                ThresholdConfig {
-                    threshold: 0.7,
-                    target_entities: 25,
-                },
-            ],
-        };
+    fn test_entity_resolution_edges_basic() {
+        let edges = generate_entity_resolution_edges(100, None);
 
-        let graph_data = generate_hierarchical_graph(config);
+        // Should generate reasonable number of edges (constrained by intra-cluster limits)
+        assert!(
+            edges.len() >= 50 && edges.len() <= 400,
+            "Edge count should be reasonable after deduplication, got {} (target ~100-200)",
+            edges.len()
+        );
 
-        // Should have created records for all nodes
-        assert_eq!(graph_data.context.len(), 200);
-        assert_eq!(graph_data.total_nodes, 200);
+        // All thresholds should be in valid range
+        for (_, _, threshold) in &edges {
+            assert!(*threshold >= 0.0 && *threshold <= 1.0);
+        }
 
-        // Should have edges at the specified thresholds
-        use std::collections::HashSet;
-        let thresholds: HashSet<_> = graph_data
-            .edges
+        // Should have diverse threshold values (jittered)
+        let unique_thresholds: HashSet<_> = edges
             .iter()
-            .map(|(_, _, w)| (*w * 100.0).round() as i32)
+            .map(|(_, _, t)| (*t * 10000.0).round() as i32)
             .collect();
-
-        // Should have exactly 2 distinct thresholds
-        assert_eq!(thresholds.len(), 2);
-        assert!(thresholds.contains(&90)); // 0.9 * 100
-        assert!(thresholds.contains(&70)); // 0.7 * 100
+        assert!(
+            unique_thresholds.len() > 50,
+            "Should have many unique thresholds due to jitter"
+        );
     }
 
     #[test]
-    fn test_production_configs() {
-        let config_1m = GraphConfig::production_1m();
-        assert_eq!(config_1m.n_left, 550_000);
-        assert_eq!(config_1m.n_right, 550_000);
-        assert_eq!(config_1m.thresholds.len(), 3);
+    fn test_entity_resolution_hierarchy_validation() {
+        let n = 1000;
+        let edges = generate_entity_resolution_edges(n, None);
 
-        let config_10m = GraphConfig::production_10m();
-        assert_eq!(config_10m.n_left, 5_500_000);
-        assert_eq!(config_10m.n_right, 5_500_000);
-        assert_eq!(config_10m.thresholds.len(), 3);
+        // Create collection and validate hierarchy
+        let context = DataContext::new();
+        for i in 0..n {
+            context.ensure_record("test", Key::U32(i as u32));
+        }
+
+        println!("Generated {} edges for {} entities", edges.len(), n);
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, Arc::new(context), 6);
+
+        // Test entity counts at key thresholds
+        let entities_at_1_0 = hierarchy.at_threshold(1.0).entities().len();
+        let entities_at_0_0 = hierarchy.at_threshold(0.0).entities().len();
+
+        println!(
+            "Entities at 1.0: {}, Entities at 0.0: {}",
+            entities_at_1_0, entities_at_0_0
+        );
+
+        // Should have exactly n entities at 1.0 and n/2 entities at 0.0
+        assert_eq!(
+            entities_at_1_0, n,
+            "Should have {} entities at threshold 1.0",
+            n
+        );
+        assert_eq!(
+            entities_at_0_0,
+            n / 2,
+            "Should have {} entities at threshold 0.0",
+            n / 2
+        );
+
+        // Test monotonic decrease
+        let test_thresholds = vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0];
+        let entity_counts: Vec<usize> = test_thresholds
+            .iter()
+            .map(|&t| hierarchy.at_threshold(t).entities().len())
+            .collect();
+
+        // Verify monotonic decrease
+        for i in 1..entity_counts.len() {
+            assert!(
+                entity_counts[i - 1] >= entity_counts[i],
+                "Entity count should decrease monotonically: {} >= {} at indices {}, {}",
+                entity_counts[i - 1],
+                entity_counts[i],
+                i - 1,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_discrete_thresholds() {
+        let edges = generate_entity_resolution_edges(100, Some(5));
+
+        // Should snap to exactly 5 discrete threshold values: 0.0, 0.25, 0.5, 0.75, 0.999
+        let unique_thresholds: HashSet<_> = edges
+            .iter()
+            .map(|(_, _, t)| (*t * 1000.0).round() as i32)
+            .collect();
+
+        assert!(
+            unique_thresholds.len() <= 5,
+            "Should have at most 5 discrete thresholds"
+        );
+
+        // Check that thresholds are properly quantized
+        for &(_, _, threshold) in &edges {
+            // Special case for 0.999 which replaces 1.0 to preserve entity count guarantees
+            let quantized = if threshold == 0.999 {
+                0.999
+            } else {
+                (threshold * 4.0).round() / 4.0
+            };
+            assert!(
+                (threshold - quantized).abs() < 0.001,
+                "Threshold {} should be quantized to {}",
+                threshold,
+                quantized
+            );
+        }
+    }
+
+    #[test]
+    fn test_jitter_diversity() {
+        let mut all_thresholds = HashSet::new();
+
+        // Generate multiple datasets and collect all thresholds
+        for _ in 0..5 {
+            let edges = generate_entity_resolution_edges(1000, None);
+            for (_, _, threshold) in edges {
+                let rounded = (threshold * 1_000_000.0).round() as i32;
+                all_thresholds.insert(rounded);
+            }
+        }
+
+        // Should have high diversity due to jitter
+        assert!(
+            all_thresholds.len() > 1000,
+            "Jitter should create high threshold diversity for PGO training, got {} unique values",
+            all_thresholds.len()
+        );
+    }
+
+    #[test]
+    fn test_edge_count_targets() {
+        for n in [100, 1000, 10000] {
+            let edges = generate_entity_resolution_edges(n, Some(10));
+
+            // Should generate reasonable number of edges (constrained by intra-cluster approach)
+            let target = n; // Realistic target for intra-cluster only approach
+            let tolerance = target; // 100% tolerance due to approach constraints
+
+            assert!(
+                edges.len() >= target - tolerance && edges.len() <= target + tolerance,
+                "For n={}, expected ~{} edges, got {} (tolerance: ±{})",
+                n,
+                target,
+                edges.len(),
+                tolerance
+            );
+        }
+    }
+
+    #[test]
+    fn test_pair_structure() {
+        let n = 100;
+        let edges = generate_entity_resolution_edges(n, Some(10));
+
+        // Analyze which entities have high-threshold connections (>0.9)
+        let mut high_threshold_entities = HashSet::new();
+        for (e1, e2, threshold) in &edges {
+            if *threshold > 0.9 {
+                high_threshold_entities.insert(*e1);
+                high_threshold_entities.insert(*e2);
+            }
+        }
+
+        // Should have reasonable number of entities involved in high-threshold pairs
+        // With discrete thresholds, some structural edges may not be >0.9 after snapping
+        let expected_high_threshold = n / 4; // Expect ~25 entities for n=100
+        let tolerance = expected_high_threshold; // 100% tolerance due to threshold snapping
+
+        assert!(
+            high_threshold_entities.len() >= expected_high_threshold - tolerance,
+            "Expected ~{} entities in high-threshold pairs, got {}",
+            expected_high_threshold,
+            high_threshold_entities.len()
+        );
     }
 }

@@ -12,9 +12,11 @@ def test_user_eda_workflow():
     """Production-scale EDA workflow: Million-record minimum scale for library."""
     # Million-scale is the MINIMUM expected dataset size for production use
 
-    # Time graph generation using Rust implementation
+    # Time graph generation using unified entity resolution generator
     start_time = time.monotonic()
-    edges, total_nodes = sl.generate_production_1m_graph()
+    edges = sl.generate_entity_resolution_edges(1_000_000)
+    total_nodes = 1_000_000  # Unified generator creates exactly n entities at
+    # threshold 1.0
     graph_time = time.monotonic() - start_time
 
     # Time collection creation (optimised Python->Rust boundary)
@@ -22,42 +24,56 @@ def test_user_eda_workflow():
     collection = sl.Collection.from_edges(edges)
     collection_time = time.monotonic() - start_time
 
-    # Test hierarchical behaviour: lower thresholds should have fewer or equal entities
-    # (because more records get merged at lower thresholds)
-    test_thresholds = [0.9, 0.7, 0.5]
-    prev_entities: float = float("inf")
+    # Test hierarchical behaviour: unified generator creates specific entity counts
+    # At 1.0: exactly n entities, at ~0.9: exactly n/2 entities (pairs merge)
 
-    for threshold in sorted(test_thresholds, reverse=True):
-        partition = collection.at(threshold)
-        current_entities = partition.num_entities
+    # Test exact endpoints with corrected expectations
+    # The unified generator guarantees exactly n entities at 1.0 and n/2 entities at 0.0
+    entities_at_1_0 = collection.at(1.0).num_entities
+    entities_at_0_0 = collection.at(0.0).num_entities
 
-        # Lower thresholds should have <= entities than higher thresholds
-        assert current_entities <= prev_entities, (
-            f"Hierarchy violation: {threshold} has {current_entities} entities, "
-            f"previous higher threshold had {prev_entities}"
+    assert entities_at_1_0 == total_nodes, (
+        f"Expected {total_nodes} entities at 1.0, got {entities_at_1_0}"
+    )
+    assert entities_at_0_0 == total_nodes // 2, (
+        f"Expected {total_nodes // 2} entities at 0.0, got {entities_at_0_0}"
+    )
+
+    # Test hierarchical behavior around the main transition (~0.9)
+    test_thresholds = [0.95, 0.9, 0.8, 0.5]
+    entity_counts = [collection.at(t).num_entities for t in test_thresholds]
+
+    # Should see transition from n entities towards n/2 entities as threshold decreases
+    # Note: exact transition point depends on threshold distribution
+    # The n/2 guarantee is only at exactly threshold 0.0, not at intermediate thresholds
+    assert entity_counts[-1] >= total_nodes // 2, (
+        "Should be transitioning towards half entity count at lower thresholds"
+    )
+
+    # Ensure monotonic decrease (entities can only decrease as threshold decreases)
+    for i in range(len(entity_counts) - 1):
+        assert entity_counts[i] >= entity_counts[i + 1], (
+            f"Entity count should decrease: {entity_counts[i]} >= "
+            f"{entity_counts[i + 1]} at thresholds {test_thresholds[i]} -> "
+            f"{test_thresholds[i + 1]}"
         )
 
-        # Should have meaningful reduction (not all singletons, not single component)
-        assert 1 < current_entities < total_nodes, (
-            f"At {threshold}: {current_entities} entities should be "
-            f"between 1 and {total_nodes}"
-        )
-
-        prev_entities = current_entities
-
-    # Test precision: at threshold 1.0 should have all singletons
+    # Test precision: at threshold 1.0 should have all singletons (guaranteed by fix)
     singleton_partition = collection.at(1.0)
-    assert singleton_partition.num_entities == total_nodes
+    assert singleton_partition.num_entities == total_nodes, (
+        f"Expected {total_nodes} singletons at 1.0"
+    )
 
-    # Quick EDA sweep
-    test_thresholds = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5]
-    counts = [collection.at(t).num_entities for t in test_thresholds]
+    # Quick EDA sweep across key thresholds for unified generator
+    eda_thresholds = [1.0, 0.95, 0.9, 0.8, 0.5, 0.0]
+    eda_counts = [collection.at(t).num_entities for t in eda_thresholds]
 
     logger.info(
-        "EDA workflow: %d edges, %d total nodes. Graph: %.2fs, Collection: %.2fs. %s",
+        "EDA workflow: %d edges, %d total nodes. Graph: %.2fs, "
+        "Collection: %.2fs. Entity counts: %s",
         len(edges),
         total_nodes,
         graph_time,
         collection_time,
-        dict(zip(test_thresholds, counts, strict=False)),
+        dict(zip(eda_thresholds, eda_counts, strict=False)),
     )

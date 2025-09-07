@@ -5,7 +5,6 @@ pub mod test_utils;
 // Re-export commonly used types for easier access
 pub use core::{DataContext, Key};
 pub use hierarchy::{MergeEvent, PartitionHierarchy, PartitionLevel};
-pub use test_utils::{GraphConfig, GraphData, ThresholdConfig};
 
 #[cfg(test)]
 mod tests {

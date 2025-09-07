@@ -12,7 +12,9 @@ nav:
   - Rust engine: design/engine.md
   - Python API: design/interface.md
   - Roadmap: design/roadmap.md
-- API reference: api/index.md
+- API reference: 
+  - Core: api/index.md
+  - Generators: api/generators.md
 - Contributing: contributing.md
 
 theme:

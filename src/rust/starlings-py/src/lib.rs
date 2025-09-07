@@ -2,10 +2,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
-use starlings_core::test_utils::{GraphConfig, ThresholdConfig};
+use starlings_core::test_utils;
 use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel};
-
-type GraphResult = PyResult<(Vec<(i64, i64, f64)>, usize)>;
 
 /// A partition of records into entities at a specific threshold.
 #[pyclass(name = "Partition")]
@@ -281,197 +279,43 @@ impl PyCollection {
     }
 }
 
-/// Configuration for generating realistic entity resolution graphs.
+/// Generate entity resolution edges using the unified constructive algorithm.
 ///
-/// This mirrors production entity resolution patterns with hierarchical threshold structures
-/// and realistic component distributions for benchmarking and testing.
-#[pyclass(name = "GraphConfig")]
-#[derive(Clone)]
-pub struct PyGraphConfig {
-    config: GraphConfig,
-}
-
-#[pymethods]
-impl PyGraphConfig {
-    /// Create a new graph configuration.
-    ///
-    /// Args:
-    ///     n_left (int): Number of left-side records (e.g., customers)
-    ///     n_right (int): Number of right-side records (e.g., transactions)
-    ///     n_isolates (int): Number of isolated records (no edges)
-    ///     thresholds (List[Tuple[float, int]]): List of (threshold, target_entities) pairs
-    ///
-    /// Returns:
-    ///     GraphConfig: New graph configuration
-    ///
-    /// Example:
-    ///     ```python
-    ///     config = GraphConfig(1000, 1000, 0, [(0.9, 500), (0.7, 300)])
-    ///     ```
-    #[new]
-    fn new(
-        n_left: usize,
-        n_right: usize,
-        n_isolates: usize,
-        thresholds: Vec<(f64, usize)>,
-    ) -> Self {
-        let threshold_configs: Vec<ThresholdConfig> = thresholds
-            .into_iter()
-            .map(|(threshold, target_entities)| ThresholdConfig {
-                threshold,
-                target_entities,
-            })
-            .collect();
-
-        Self {
-            config: GraphConfig {
-                n_left,
-                n_right,
-                n_isolates,
-                thresholds: threshold_configs,
-            },
-        }
-    }
-
-    /// Create a production-scale configuration for million-record testing.
-    ///
-    /// Returns a pre-configured GraphConfig suitable for production-scale testing
-    /// with 1.1M records and hierarchical thresholds.
-    ///
-    /// Returns:
-    ///     GraphConfig: Production-scale configuration
-    ///
-    /// Example:
-    ///     ```python
-    ///     config = GraphConfig.production_1m()
-    ///     # 550k left + 550k right records
-    ///     # Thresholds: 0.9 -> 200k entities, 0.7 -> 100k entities, 0.5 -> 50k entities
-    ///     ```
-    #[classmethod]
-    fn production_1m(_cls: &Bound<'_, PyType>) -> Self {
-        Self {
-            config: GraphConfig::production_1m(),
-        }
-    }
-
-    /// Create a large-scale configuration for 10M+ record testing.
-    ///
-    /// Returns a pre-configured GraphConfig suitable for very large-scale testing
-    /// with 11M records and hierarchical thresholds.
-    ///
-    /// Returns:
-    ///     GraphConfig: Large-scale configuration  
-    ///
-    /// Example:
-    ///     ```python
-    ///     config = GraphConfig.production_10m()
-    ///     # 5.5M left + 5.5M right records
-    ///     ```
-    #[classmethod]
-    fn production_10m(_cls: &Bound<'_, PyType>) -> Self {
-        Self {
-            config: GraphConfig::production_10m(),
-        }
-    }
-
-    /// Create a randomised production-scale configuration for PGO training.
-    ///
-    /// Adds controlled noise to prevent PGO overfitting whilst maintaining
-    /// realistic test scenarios.
-    ///
-    /// Example:
-    ///     ```python
-    ///     config = GraphConfig.production_1m_randomized(None, 10.0)
-    ///     # 550k left + 550k right records with randomised thresholds
-    ///     ```
-    #[classmethod]
-    fn production_1m_randomized(
-        _cls: &Bound<'_, PyType>,
-        seed: Option<u64>,
-        jitter_percent: f64,
-    ) -> Self {
-        Self {
-            config: GraphConfig::production_1m_randomized(seed, jitter_percent),
-        }
-    }
-
-    /// String representation for debugging.
-    fn __repr__(&self) -> String {
-        format!(
-            "GraphConfig(n_left={}, n_right={}, n_isolates={}, thresholds={})",
-            self.config.n_left,
-            self.config.n_right,
-            self.config.n_isolates,
-            self.config.thresholds.len()
-        )
-    }
-}
-
-/// Generate a hierarchical graph with realistic entity resolution patterns.
-///
-/// Creates a bipartite graph with exact component counts at specified thresholds,
-/// using the hierarchical block construction method to ensure correct component
-/// distributions that mirror production entity resolution patterns.
+/// Creates exactly n*5 edges that produce n entities at threshold 1.0 and n/2 entities
+/// at threshold 0.0, following realistic entity resolution patterns.
 ///
 /// Args:
-///     config (GraphConfig): Configuration specifying graph structure and thresholds
+///     n (int): Number of entities at threshold 1.0
+///     num_thresholds (Optional[int]): If provided, snap to discrete thresholds;
+///         if None, add jitter for PGO training
 ///
 /// Returns:
-///     Tuple[List[Tuple[Any, Any, float]], int]: (edges, total_nodes)
-///         edges: List of (left_id, right_id, similarity) tuples
-///         total_nodes: Total number of nodes in the graph
-///
-/// Complexity:
-///     O(n + m) where n = nodes, m = edges
+///     List[Tuple[int, int, float]]: List of (entity1, entity2, threshold) tuples
 ///
 /// Example:
 ///     ```python
-///     config = GraphConfig.production_1m()
-///     edges, total_nodes = generate_hierarchical_graph(config)
+///     # Generate 1M entity dataset with jitter for PGO
+///     edges = generate_entity_resolution_edges(1_000_000, None)
 ///     
-///     collection = Collection.from_edges(edges)
-///     partition = collection.at(0.9)
-///     print(f"Entities at 0.9: {len(partition.entities)}")
+///     # Generate dataset with 10 discrete thresholds
+///     edges = generate_entity_resolution_edges(100_000, 10)
+///     
+///     collection = Collection.from_edges([(i, j, t) for i, j, t in edges])
 ///     ```
 #[pyfunction]
-fn generate_hierarchical_graph(config: PyGraphConfig, _py: Python<'_>) -> GraphResult {
-    let graph_data = starlings_core::test_utils::generate_hierarchical_graph(config.config);
-
-    let python_edges: Vec<(i64, i64, f64)> = graph_data
-        .edges
-        .into_iter()
-        .map(|(id1, id2, weight)| (id1 as i64, id2 as i64, weight))
-        .collect();
-
-    Ok((python_edges, graph_data.total_nodes))
-}
-
-/// Generate a randomised hierarchical bipartite graph for PGO training.
-///
-/// Creates randomised variants to prevent PGO overfitting by varying
-/// probability values around standard production configurations.
-///
-/// Example:
-///     ```python
-///     edges, total_nodes = generate_production_1m_randomized(None, 10.0)
-///     collection = Collection.from_edges(edges)
-///     ```
-#[pyfunction]
-fn generate_production_1m_randomized(
-    seed: Option<u64>,
-    jitter_percent: f64,
+fn generate_entity_resolution_edges(
+    n: usize,
+    num_thresholds: Option<usize>,
     _py: Python<'_>,
-) -> GraphResult {
-    let graph_data =
-        starlings_core::test_utils::generate_production_1m_randomized(seed, jitter_percent);
+) -> PyResult<Vec<(i64, i64, f64)>> {
+    let edges = test_utils::generate_entity_resolution_edges(n, num_thresholds);
 
-    let python_edges: Vec<(i64, i64, f64)> = graph_data
-        .edges
+    let python_edges: Vec<(i64, i64, f64)> = edges
         .into_iter()
         .map(|(id1, id2, weight)| (id1 as i64, id2 as i64, weight))
         .collect();
 
-    Ok((python_edges, graph_data.total_nodes))
+    Ok(python_edges)
 }
 
 /// Convert Python object to Rust Key (optimised for performance)
@@ -503,8 +347,6 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
 fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCollection>()?;
     m.add_class::<PyPartition>()?;
-    m.add_class::<PyGraphConfig>()?;
-    m.add_function(wrap_pyfunction!(generate_hierarchical_graph, m)?)?;
-    m.add_function(wrap_pyfunction!(generate_production_1m_randomized, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_entity_resolution_edges, m)?)?;
     Ok(())
 }

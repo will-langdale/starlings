@@ -48,11 +48,9 @@ from typing import Any, cast
 
 from .debug import DebugTimer, get_memory_mb
 from .starlings import Collection as PyCollection
-from .starlings import GraphConfig as PyGraphConfig
 from .starlings import Partition as PyPartition
-from .starlings import generate_hierarchical_graph as _generate_hierarchical_graph
 from .starlings import (
-    generate_production_1m_randomized as _generate_production_1m_randomized,
+    generate_entity_resolution_edges as _generate_entity_resolution_edges,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,104 +59,48 @@ logger = logging.getLogger(__name__)
 _DEBUG_ENABLED = os.getenv("STARLINGS_DEBUG", "").lower() in ("1", "true", "on")
 
 
-def generate_hierarchical_graph(
-    n_left: int,
-    n_right: int,
-    n_isolates: int,
-    thresholds: list[tuple[float, int]],
-) -> tuple[list[tuple[int, int, float]], int]:
-    """Generate a hierarchical graph with realistic entity resolution patterns.
+def generate_entity_resolution_edges(
+    n: int, num_thresholds: int | None = None
+) -> list[tuple[int, int, float]]:
+    """Generate entity resolution edges using the unified constructive algorithm.
 
-    Creates a bipartite graph with exact component counts at specified thresholds,
-    using the hierarchical block construction method to ensure correct component
-    distributions that mirror production entity resolution patterns.
+    Creates realistic entity resolution test data following a constructive approach
+    that produces exactly n/2 entities at threshold 0.0 through systematic pair
+    construction, with realistic hierarchical patterns for benchmarking.
 
     Args:
-        n_left: Number of left-side records (e.g., customers)
-        n_right: Number of right-side records (e.g., transactions)
-        n_isolates: Number of isolated records (no edges)
-        thresholds: List of (threshold, target_entities) pairs
+        n: Target number of entities for sizing (algorithm uses effective_n where
+            effective_n = n if n is even, n-1 if n is odd)
+        num_thresholds: If provided, snap thresholds to discrete values;
+            if None, add continuous jitter for PGO training diversity
 
     Returns:
-        Tuple of (edges, total_nodes) where:
-        - edges: List of (left_id, right_id, similarity) tuples
-        - total_nodes: Total number of nodes in the graph
+        List of (entity_id1, entity_id2, threshold) tuples with entity IDs as integers
+        and thresholds between 0.0 and 1.0
 
-    Complexity:
-        O(n + m) where n = nodes, m = edges
+    Algorithm:
+        Implements the 5-step constructive approach:
+        1. Create n/2 pairs of entities with high thresholds (>0.9) for merging
+        2. Add noise edges within pairs for density and realistic patterns
+        3. Apply jitter (continuous) or discrete threshold snapping
+        4. Remove duplicate edges and shuffle for randomization
 
-    Example:
-        ```python
-        # Custom graph generation
-        edges, total_nodes = generate_hierarchical_graph(
-            n_left=1000, n_right=1000, n_isolates=0, thresholds=[(0.9, 500), (0.7, 300)]
-        )
-
-        collection = Collection.from_edges(edges)
-        partition = collection.at(0.9)
-        print(f"Entities at 0.9: {len(partition.entities)}")
-        ```
-    """
-    config = PyGraphConfig(n_left, n_right, n_isolates, thresholds)
-    result = _generate_hierarchical_graph(config)
-    return result  # type: ignore[no-any-return]
-
-
-def generate_production_1m_graph() -> tuple[list[tuple[int, int, float]], int]:
-    """Generate a production-scale 1M record graph with hierarchical thresholds.
-
-    Convenience function that creates a realistic production-scale dataset
-    with 1.1M records and multiple threshold levels.
-
-    Returns:
-        Tuple of (edges, total_nodes) with production-scale data
+        Guarantees: exactly effective_n/2 entities at threshold 0.0
 
     Example:
         ```python
-        edges, total_nodes = generate_production_1m_graph()
+        # Generate dataset with PGO jitter for training
+        edges = generate_entity_resolution_edges(100_000)
         collection = Collection.from_edges(edges)
+
+        # Key guarantee: exactly n/2 entities at threshold 0.0
+        assert collection.at(0.0).num_entities == 50_000
+
+        # Generate dataset with discrete thresholds for testing
+        edges = generate_entity_resolution_edges(100_000, num_thresholds=10)
         ```
     """
-    config = PyGraphConfig.production_1m()
-    result = _generate_hierarchical_graph(config)
-    return result  # type: ignore[no-any-return]
-
-
-def generate_production_1m_graph_randomized(
-    seed: int | None = None, jitter_percent: float = 10.0
-) -> tuple[list[tuple[int, int, float]], int]:
-    """Generate a randomised production-scale 1M record graph for PGO training.
-
-    Creates production-scale datasets with controlled randomness to prevent
-    PGO overfitting whilst maintaining realistic test scenarios.
-
-    Example:
-        ```python
-        edges, total_nodes = generate_production_1m_graph_randomized(None, 10.0)
-        collection = Collection.from_edges(edges)
-        ```
-    """
-    result = _generate_production_1m_randomized(seed, jitter_percent)
-    return result  # type: ignore[no-any-return]
-
-
-def generate_production_10m_graph() -> tuple[list[tuple[int, int, float]], int]:
-    """Generate a large-scale 10M record graph with hierarchical thresholds.
-
-    Convenience function that creates a very large production-scale dataset
-    with 11M records and multiple threshold levels.
-
-    Returns:
-        Tuple of (edges, total_nodes) with large-scale data
-
-    Example:
-        ```python
-        edges, total_nodes = generate_production_10m_graph()
-        collection = Collection.from_edges(edges)
-        ```
-    """
-    config = PyGraphConfig.production_10m()
-    result = _generate_hierarchical_graph(config)
+    result = _generate_entity_resolution_edges(n, num_thresholds)
     return result  # type: ignore[no-any-return]
 
 
@@ -376,93 +318,3 @@ class Collection:
     def __repr__(self) -> str:
         """String representation for debugging."""
         return "Collection"
-
-
-class GraphConfig:
-    """Configuration for generating realistic entity resolution graphs.
-
-    This mirrors production entity resolution patterns with hierarchical threshold
-    structures and realistic component distributions for benchmarking and testing.
-
-    Example:
-        ```python
-        # Custom configuration
-        config = GraphConfig(1000, 1000, 0, [(0.9, 500), (0.7, 300)])
-
-        # Production-scale configurations
-        config_1m = GraphConfig.production_1m()
-        config_10m = GraphConfig.production_10m()
-
-        # Generate graph
-        edges, total_nodes = generate_hierarchical_graph(config_1m)
-        collection = Collection.from_edges(edges)
-        ```
-    """
-
-    def __init__(
-        self,
-        n_left: int,
-        n_right: int,
-        n_isolates: int,
-        thresholds: list[tuple[float, int]],
-    ) -> None:
-        """Create a new graph configuration.
-
-        Args:
-            n_left: Number of left-side records (e.g., customers)
-            n_right: Number of right-side records (e.g., transactions)
-            n_isolates: Number of isolated records (no edges)
-            thresholds: List of (threshold, target_entities) pairs
-
-        Example:
-            ```python
-            config = GraphConfig(1000, 1000, 0, [(0.9, 500), (0.7, 300)])
-            ```
-        """
-        self._config = PyGraphConfig(n_left, n_right, n_isolates, thresholds)
-
-    @classmethod
-    def production_1m(cls) -> GraphConfig:
-        """Create a production-scale configuration for million-record testing.
-
-        Returns a pre-configured GraphConfig suitable for production-scale testing
-        with 1.1M records and hierarchical thresholds.
-
-        Returns:
-            Production-scale configuration with:
-            - 550k left + 550k right records
-            - Thresholds: 0.9->200k entities, 0.7->100k entities, 0.5->50k entities
-
-        Example:
-            ```python
-            config = GraphConfig.production_1m()
-            edges, total_nodes = generate_hierarchical_graph(config)
-            ```
-        """
-        instance = cls.__new__(cls)
-        instance._config = PyGraphConfig.production_1m()
-        return instance
-
-    @classmethod
-    def production_10m(cls) -> GraphConfig:
-        """Create a large-scale configuration for 10M+ record testing.
-
-        Returns a pre-configured GraphConfig suitable for very large-scale testing
-        with 11M records and hierarchical thresholds.
-
-        Returns:
-            Large-scale configuration with 5.5M left + 5.5M right records
-
-        Example:
-            ```python
-            config = GraphConfig.production_10m()
-            edges, total_nodes = generate_hierarchical_graph(config)
-            ```
-        """
-        instance = cls.__new__(cls)
-        instance._config = PyGraphConfig.production_10m()
-        return instance
-
-    def __repr__(self) -> str:
-        """String representation for debugging."""
-        return repr(self._config)

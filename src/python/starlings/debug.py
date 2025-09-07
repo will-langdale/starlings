@@ -34,7 +34,7 @@ class DebugTimer:
             self.start_memory = get_memory_mb()
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:  # noqa: ARG002
         """End timing and print debug information."""
         if self.debug_enabled:
             end_time = time.perf_counter()
