@@ -560,8 +560,9 @@ mod tests {
         assert!(limits.batch_size >= 50); // Minimum batch size (updated)
         assert!(limits.batch_size <= 100_000); // Should not exceed base
 
-        // Test that disk spilling logic exists
-        assert!(limits.should_spill_to_disk == true || limits.should_spill_to_disk == false);
+        // Test that disk spilling flag is set to a valid boolean value
+        // This is always true for bool type, but documents that the field exists
+        let _disk_spilling_configured = limits.should_spill_to_disk;
     }
 
     #[test]

@@ -265,7 +265,7 @@ class Collection:
 
         # Create progress callback if needed
         progress_bar = None
-
+        progress_callback = None
         if show_progress:
             progress_bar = tqdm(
                 total=len(edge_list),
@@ -279,19 +279,13 @@ class Collection:
                 progress_bar.n = int(progress * len(edge_list))
                 progress_bar.refresh()
 
-            rust_collection = PyCollection.from_edges(
-                edge_list,
-                source=source,
-                progress_callback=progress_callback,
-            )
-        else:
-            rust_collection = PyCollection.from_edges(
-                edge_list,
-                source=source,
-                progress_callback=None,
-            )
+        rust_collection = PyCollection.from_edges(
+            edge_list,
+            source=source,
+            progress_callback=progress_callback,
+        )
 
-        if progress_bar is not None:
+        if show_progress and progress_bar is not None:
             progress_bar.close()
 
         return cls(rust_collection)

@@ -430,7 +430,7 @@ mod tests {
         );
 
         // Test monotonic decrease
-        let test_thresholds = vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0];
+        let test_thresholds = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0];
         let entity_counts: Vec<usize> = test_thresholds
             .iter()
             .map(|&t| hierarchy.at_threshold(t).entities().len())

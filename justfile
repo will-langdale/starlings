@@ -29,7 +29,7 @@ format:
     uvx ruff format src/
     uvx --with pip mypy src/python/ --install-types --non-interactive
     cargo fmt
-    cargo clippy
+    cargo clippy --all-targets --all-features
 
 # Clean build artifacts
 clean:
