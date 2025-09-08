@@ -57,6 +57,7 @@ impl Hash for InternedRecord {
 }
 
 impl InternedRecord {
+    #[must_use]
     pub fn new(source_id: u32, key: Key) -> Self {
         InternedRecord {
             source_id,
@@ -66,6 +67,7 @@ impl InternedRecord {
         }
     }
 
+    #[must_use]
     pub fn with_attributes(source_id: u32, key: Key, attributes: HashMap<u32, u32>) -> Self {
         InternedRecord {
             source_id,

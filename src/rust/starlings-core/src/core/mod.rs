@@ -1,4 +1,5 @@
 pub mod data_context;
+pub mod debug;
 pub mod key;
 pub mod record;
 pub mod resource_monitor;

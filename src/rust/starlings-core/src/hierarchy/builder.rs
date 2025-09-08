@@ -12,7 +12,8 @@ use super::partition::PartitionLevel;
 use super::storage::{DiskStorage, HierarchyStorage, HybridStorage, InMemoryStorage};
 use super::union_find::UnionFind;
 use crate::core::resource_monitor::ProcessingStrategy;
-use crate::core::{DataContext, ResourceMonitor};
+use crate::core::DataContext;
+use crate::debug_println;
 
 /// Debug statistics collection for hierarchy construction
 #[cfg(debug_assertions)]
@@ -34,9 +35,10 @@ impl DebugStats {
 
     fn report(&self, total_edges: usize) {
         if total_edges >= 100_000 {
-            eprintln!(
+            debug_println!(
                 "      Union-find stats: {} merges, {} bitmap allocations",
-                self.merge_count, self.bitmap_allocations
+                self.merge_count,
+                self.bitmap_allocations
             );
         }
     }
@@ -113,7 +115,6 @@ impl PartitionHierarchy {
         context: Arc<DataContext>,
         quantise: u32,
         progress_callback: Option<ProgressCallback>,
-        resource_monitor: Option<&ResourceMonitor>,
     ) -> Result<Self, String> {
         // Validate quantise is between 1 and 6
         assert!(
@@ -134,32 +135,30 @@ impl PartitionHierarchy {
 
         let num_records = context.len();
 
-        // Determine storage strategy based on ResourceMonitor if available
-        let storage: Box<dyn HierarchyStorage + Send + Sync> =
-            if let Some(monitor) = resource_monitor {
-                match monitor.determine_processing_strategy(num_records) {
-                    ProcessingStrategy::InMemory { .. } => Box::new(InMemoryStorage::new()),
-                    ProcessingStrategy::MemoryAware {
-                        spill_threshold_mb, ..
-                    } => Box::new(HybridStorage::new(spill_threshold_mb * 1024 * 1024)),
-                    ProcessingStrategy::Streaming { max_memory_mb, .. } => {
-                        // Use hybrid storage with very low threshold for streaming
-                        Box::new(HybridStorage::new(max_memory_mb * 1024 * 1024))
-                    }
-                    ProcessingStrategy::Insufficient { .. } => {
-                        // This should have been caught earlier, but fallback to disk storage
-                        #[cfg(debug_assertions)]
-                        eprintln!("   ⚠️  Insufficient resources detected, using disk storage");
-                        Box::new(
-                            DiskStorage::new()
-                                .map_err(|e| format!("Failed to create disk storage: {}", e))?,
-                        )
-                    }
+        // Determine storage strategy based on ResourceMonitor from DataContext
+        let storage: Box<dyn HierarchyStorage + Send + Sync> = {
+            match context
+                .resource_monitor
+                .determine_processing_strategy(num_records)
+            {
+                ProcessingStrategy::InMemory { .. } => Box::new(InMemoryStorage::new()),
+                ProcessingStrategy::MemoryAware {
+                    spill_threshold_mb, ..
+                } => Box::new(HybridStorage::new(spill_threshold_mb * 1024 * 1024)),
+                ProcessingStrategy::Streaming { max_memory_mb, .. } => {
+                    // Use hybrid storage with very low threshold for streaming
+                    Box::new(HybridStorage::new(max_memory_mb * 1024 * 1024))
                 }
-            } else {
-                // Fallback: use in-memory storage when no resource monitor is provided
-                Box::new(InMemoryStorage::new())
-            };
+                ProcessingStrategy::Insufficient { .. } => {
+                    // This should have been caught earlier, but fallback to disk storage
+                    debug_println!("   ⚠️  Insufficient resources detected, using disk storage");
+                    Box::new(
+                        DiskStorage::new()
+                            .map_err(|e| format!("Failed to create disk storage: {}", e))?,
+                    )
+                }
+            }
+        };
 
         // Report initial hierarchy construction progress
         if let Some(ref callback) = progress_callback {
@@ -226,13 +225,11 @@ impl PartitionHierarchy {
         let union_find_time = union_find_start.elapsed();
 
         // Reuse the bitmap pool from temporary instance for efficiency
-        // Calculate adaptive cache size based on available memory
-        let cache_size = if let Some(monitor) = resource_monitor {
-            let usage = monitor.get_usage();
+        // Calculate adaptive cache size based on available memory from DataContext
+        let cache_size = {
+            let usage = context.resource_monitor.get_usage();
             // 1 cache entry per 100MB available memory, bounded between 5 and 100
             (usage.memory_available_mb / 100).clamp(5, 100) as usize
-        } else {
-            Self::CACHE_SIZE // Fallback to default
         };
 
         let result = Self {
@@ -243,14 +240,13 @@ impl PartitionHierarchy {
         };
 
         // Debug output for hierarchy construction breakdown
-        #[cfg(debug_assertions)]
         if num_edges >= 100_000 {
-            eprintln!("   🔧 Hierarchy construction breakdown:");
-            eprintln!("      Quantisation: {:?}", quantise_time);
-            eprintln!("      Sorting {} edges: {:?}", num_edges, sort_time);
-            eprintln!("      Edge grouping: {:?}", group_time);
-            eprintln!("      Union-find & merges: {:?}", union_find_time);
-            eprintln!(
+            debug_println!("   🔧 Hierarchy construction breakdown:");
+            debug_println!("      Quantisation: {:?}", quantise_time);
+            debug_println!("      Sorting {} edges: {:?}", num_edges, sort_time);
+            debug_println!("      Edge grouping: {:?}", group_time);
+            debug_println!("      Union-find & merges: {:?}", union_find_time);
+            debug_println!(
                 "      Total hierarchy: {:?}",
                 quantise_time + sort_time + group_time + union_find_time
             );
@@ -510,21 +506,53 @@ impl PartitionHierarchy {
             }
         }
 
-        // Convert union-find to partition with entities
+        // Convert union-find to partition with entities using batched processing
         let mut entities_map: HashMap<usize, RoaringBitmap> = HashMap::new();
 
-        // Include ALL records from the context (handles isolates)
-        for record_idx in 0..num_records {
-            let root = uf.find(record_idx);
-            entities_map.entry(root).or_insert_with(|| {
-                let estimated_size = (num_records / 100).max(10) as u32;
-                let (bitmap, _) = self.bitmap_pool.get(estimated_size);
-                bitmap
-            });
-            entities_map
-                .get_mut(&root)
-                .unwrap()
-                .insert(record_idx as u32);
+        // Determine batch size based on available resources
+        let base_batch_size = if num_records > 1_000_000 {
+            100_000
+        } else if num_records > 100_000 {
+            50_000
+        } else {
+            num_records // Process small datasets in one go
+        };
+
+        let batch_size = self.context.get_adaptive_batch_size(base_batch_size);
+
+        // Process records in batches to avoid memory exhaustion
+        for batch_start in (0..num_records).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(num_records);
+
+            // Check resource availability before processing each batch
+            if batch_start > 0 {
+                self.context.wait_for_resources();
+            }
+
+            // Process this batch of records
+            for record_idx in batch_start..batch_end {
+                let root = uf.find(record_idx);
+                entities_map.entry(root).or_insert_with(|| {
+                    let estimated_size = (batch_size / 100).max(10) as u32;
+                    let (bitmap, _) = self.bitmap_pool.get(estimated_size);
+                    bitmap
+                });
+                entities_map
+                    .get_mut(&root)
+                    .unwrap()
+                    .insert(record_idx as u32);
+            }
+
+            // Report progress for large datasets
+            if num_records > 1_000_000 && batch_end % 500_000 == 0 {
+                let progress = batch_end as f64 / num_records as f64;
+                eprintln!(
+                    "      🔄 Reconstructing partition: {:.1}% ({:.1}M/{:.1}M records)",
+                    progress * 100.0,
+                    batch_end as f64 / 1_000_000.0,
+                    num_records as f64 / 1_000_000.0
+                );
+            }
         }
 
         // Convert HashMap to Vec of entities
@@ -550,7 +578,7 @@ mod tests {
     #[test]
     fn test_empty_edges() {
         let ctx = create_test_context();
-        let hierarchy = PartitionHierarchy::from_edges(vec![], ctx.clone(), 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(vec![], ctx.clone(), 2, None).unwrap();
 
         assert_eq!(hierarchy.merge_events_count(), 0);
         assert_eq!(hierarchy.num_records(), 3);
@@ -566,7 +594,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should have two merge events: one at 0.8 and one at 0.6
         assert_eq!(hierarchy.merge_events_count(), 2);
@@ -599,7 +627,7 @@ mod tests {
             (2, 3, 0.7), // C-D
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should have two independent merge events
         assert_eq!(hierarchy.merge_events_count(), 2);
@@ -630,7 +658,7 @@ mod tests {
             (2, 3, 0.5), // C-D
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should create merge events as the union-find processes the edges
         // The exact number depends on the order of processing, but all should be at 0.5
@@ -649,7 +677,7 @@ mod tests {
             (0, 1, 0.123456789), // Should be quantised to 0.12 with quantise=2
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         assert_eq!(hierarchy.merge_events_count(), 1);
         let merges: Vec<_> = hierarchy.storage.iter().unwrap().collect();
@@ -667,7 +695,7 @@ mod tests {
             (0, 2, 0.7), // A-C (redundant but creates interesting merging)
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Test different batch sizes produce same results
         let threshold = 0.8;
@@ -716,7 +744,7 @@ mod tests {
             (1, 2, 0.8), // B-C
         ];
 
-        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Test memory-mapped reconstruction vs streaming
         let threshold = 0.8;
@@ -756,7 +784,7 @@ mod tests {
         let edges = vec![(0, 1, 0.5)];
 
         // Should panic with quantise=0
-        PartitionHierarchy::from_edges(edges, ctx, 0, None, None).unwrap();
+        PartitionHierarchy::from_edges(edges, ctx, 0, None).unwrap();
     }
 
     #[test]
@@ -769,7 +797,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.0, all records should be in one entity
         let partition = hierarchy.at_threshold(0.0);
@@ -795,7 +823,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 1.0, each record should be a singleton
         let partition = hierarchy.at_threshold(1.0);
@@ -820,7 +848,7 @@ mod tests {
             (1, 2, 0.4), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.5, A-B should be merged but C separate
         let partition = hierarchy.at_threshold(0.5);
@@ -855,7 +883,7 @@ mod tests {
             (1, 2, 0.6), // Connect 1-2
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.5, should have:
         // - One entity with {0, 1, 2}
@@ -880,7 +908,7 @@ mod tests {
 
         let edges = vec![(0, 1, 0.8), (1, 2, 0.6)];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // First access - should reconstruct
         let partition1 = hierarchy.at_threshold(0.7);
@@ -908,7 +936,7 @@ mod tests {
     fn test_invalid_threshold_negative() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should panic with negative threshold
         hierarchy.at_threshold(-0.1);
@@ -919,7 +947,7 @@ mod tests {
     fn test_invalid_threshold_too_large() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should panic with threshold > 1.0
         hierarchy.at_threshold(1.1);
@@ -942,7 +970,7 @@ mod tests {
             (4, 5, 0.9), // E-F
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.9, should have 3 components (3 pairs)
         let partition = hierarchy.at_threshold(0.9);
@@ -990,7 +1018,7 @@ mod tests {
             (6, 7, 0.7), // Pair 4 (lowest threshold)
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None, None).unwrap();
+        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Test hierarchical behaviour
         let partition_high = hierarchy.at_threshold(0.95);
@@ -1046,7 +1074,7 @@ mod tests {
 
         // Test with quantise=2 (2 decimal places)
         let mut hierarchy =
-            PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 2, None, None).unwrap();
+            PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 2, None).unwrap();
 
         let partition_high = hierarchy.at_threshold(0.9);
         assert_eq!(

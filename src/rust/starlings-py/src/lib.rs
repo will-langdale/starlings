@@ -3,8 +3,9 @@ use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
 use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy};
+use starlings_core::debug_println;
 use starlings_core::test_utils;
-use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel, ResourceMonitor};
+use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel};
 
 /// Progress callback type for Rust-level progress reporting
 type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
@@ -20,24 +21,24 @@ fn create_progress_wrapper(callback: Py<pyo3::PyAny>) -> ProgressCallback {
     })
 }
 
-/// Helper function to get strategy message
-fn get_strategy_message(strategy: &ProcessingStrategy) -> &'static str {
-    match strategy {
-        ProcessingStrategy::InMemory { .. } => "Starting in-memory processing",
+/// Helper function to get strategy message with thread information
+fn get_strategy_message(strategy: &ProcessingStrategy) -> String {
+    let thread_count = rayon::current_num_threads();
+    let base_msg = match strategy {
+        ProcessingStrategy::InMemory { .. } => "In-memory processing",
         ProcessingStrategy::MemoryAware { should_spill, .. } => {
             if *should_spill {
-                "Starting memory-aware processing with disk spilling enabled"
+                "Memory-aware processing with disk spilling"
             } else {
-                "Starting memory-aware processing"
+                "Memory-aware processing"
             }
         }
-        ProcessingStrategy::Streaming { .. } => {
-            "Starting streaming processing with aggressive disk spilling"
-        }
+        ProcessingStrategy::Streaming { .. } => "Streaming with aggressive disk spilling",
         ProcessingStrategy::Insufficient { .. } => {
             unreachable!("Should have been caught earlier")
         }
-    }
+    };
+    format!("{} ({} threads)", base_msg, thread_count)
 }
 
 /// Helper function to map storage errors to Python exceptions
@@ -199,12 +200,14 @@ impl PyCollection {
 
         let source_name = source.unwrap_or_else(|| "default".to_string());
 
-        // Initialize resource monitor for automatic resource management
-        let resource_monitor = ResourceMonitor::new();
+        // Pre-calculate capacity based on edge count (assume ~70% unique records)
+        let estimated_records = (edges.len() * 14) / 10; // 1.4x edges for safety
+        let context = DataContext::with_capacity(estimated_records);
 
         // Automatically determine the best processing strategy based on dataset size and system resources
         let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
-        let strategy = resource_monitor
+        let strategy = context
+            .resource_monitor
             .check_operation_safety(num_entities)
             .map_err(map_safety_error)?;
 
@@ -215,12 +218,8 @@ impl PyCollection {
         // Report initial progress with processing strategy info
         if let Some(ref callback) = progress_callback {
             let strategy_message = get_strategy_message(&strategy);
-            callback(0.0, strategy_message);
+            callback(0.0, &strategy_message);
         }
-
-        // Pre-calculate capacity based on edge count (assume ~70% unique records)
-        let estimated_records = (edges.len() * 14) / 10; // 1.4x edges for safety
-        let context = DataContext::with_capacity(estimated_records);
 
         // Efficiently convert all Python keys to Rust edges with optimised bulk processing
         #[cfg(debug_assertions)]
@@ -274,7 +273,7 @@ impl PyCollection {
         let batch_size = extract_batch_size(&strategy);
 
         // Get adaptive limits for current conditions
-        let adaptive_limits = resource_monitor.get_adaptive_limits(batch_size);
+        let adaptive_limits = context.resource_monitor.get_adaptive_limits(batch_size);
 
         // Show resource warnings if present
         report_resource_warnings(&adaptive_limits, &progress_callback);
@@ -298,6 +297,15 @@ impl PyCollection {
 
         if should_use_streaming {
             // Sequential streaming processing with memory management
+            let delay_msg = if adaptive_limits.delay_between_batches_ms > 0 {
+                format!(
+                    " ({}ms delay between batches)",
+                    adaptive_limits.delay_between_batches_ms
+                )
+            } else {
+                String::new()
+            };
+
             for batch in unique_keys.chunks(adaptive_limits.batch_size) {
                 process_batch(batch);
 
@@ -310,17 +318,23 @@ impl PyCollection {
             }
 
             if let Some(ref callback) = progress_callback {
-                callback(
-                    0.35,
-                    "Used streaming processing due to resource constraints",
+                let msg = format!(
+                    "Streaming mode: batch size {}, resource throttling active{}",
+                    adaptive_limits.batch_size, delay_msg
                 );
+                callback(0.35, &msg);
             }
         } else {
             // Normal parallel processing when resources are abundant
             unique_keys.par_chunks(batch_size).for_each(process_batch);
 
             if let Some(ref callback) = progress_callback {
-                callback(0.35, "Used parallel processing");
+                let msg = format!(
+                    "Parallel processing: batch size {}, {} threads active",
+                    batch_size,
+                    rayon::current_num_threads()
+                );
+                callback(0.35, &msg);
             }
         }
 
@@ -370,7 +384,6 @@ impl PyCollection {
             Arc::new(context),
             6,
             progress_callback.clone(),
-            Some(&resource_monitor),
         )
         .map_err(map_storage_error)?;
         #[cfg(debug_assertions)]
@@ -384,32 +397,32 @@ impl PyCollection {
             callback(1.0, "Collection created successfully");
         }
 
-        // Production-scale performance metrics (debug builds and large datasets only)
-        #[cfg(debug_assertions)]
+        // Production-scale performance metrics (when STARLINGS_DEBUG=1 and large datasets)
         if edge_count >= 100_000 {
-            eprintln!("🏭 Production-scale Collection.from_edges performance:");
-            eprintln!(
+            debug_println!("🏭 Production-scale Collection.from_edges performance:");
+            debug_println!(
                 "   📊 Scale: {} edges, {} unique records",
-                edge_count, record_count
+                edge_count,
+                record_count
             );
-            eprintln!("   ⚡ Python->Rust conversion breakdown:");
-            eprintln!("      Phase 1 (Python extraction): {:?}", phase1_time);
-            eprintln!("      Phase 2 (Key interning): {:?}", phase2_time);
-            eprintln!("      Phase 3 (ID mapping): {:?}", phase3_time);
-            eprintln!("      Total conversion: {:?}", conversion_time);
-            eprintln!("   🏗️  Hierarchy construction: {:?}", hierarchy_time);
-            eprintln!("   📈 Total time: {:?}", total_time);
-            eprintln!(
+            debug_println!("   ⚡ Python->Rust conversion breakdown:");
+            debug_println!("      Phase 1 (Python extraction): {:?}", phase1_time);
+            debug_println!("      Phase 2 (Key interning): {:?}", phase2_time);
+            debug_println!("      Phase 3 (ID mapping): {:?}", phase3_time);
+            debug_println!("      Total conversion: {:?}", conversion_time);
+            debug_println!("   🏗️  Hierarchy construction: {:?}", hierarchy_time);
+            debug_println!("   📈 Total time: {:?}", total_time);
+            debug_println!(
                 "   🎯 Edges per second: {:.0}",
                 edge_count as f64 / total_time.as_secs_f64()
             );
-            eprintln!(
+            debug_println!(
                 "   📍 Time breakdown: {:.1}% conversion, {:.1}% hierarchy",
                 (conversion_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0,
                 (hierarchy_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0
             );
             if edge_count >= 1_000_000 {
-                eprintln!(
+                debug_println!(
                     "   🏆 1M edges <10s target: {}",
                     if total_time.as_secs_f64() < 10.0 {
                         "✅ ACHIEVED"
@@ -535,6 +548,37 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
 /// Python module definition
 #[pymodule]
 fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Configure rayon thread pool to be a better system neighbor
+    // Leave 2 cores free for system tasks (or 1 on small systems)
+    let num_cpus = num_cpus::get();
+    let thread_count = if num_cpus <= 4 {
+        // For small systems (≤4 cores), leave 1 core free
+        (num_cpus - 1).max(1)
+    } else {
+        // For larger systems, leave 2 cores free
+        (num_cpus - 2).max(1)
+    };
+
+    // Initialize the global thread pool once at module import
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .thread_name(|i| format!("starlings-{}", i))
+        .build_global()
+        .unwrap_or_else(|e| {
+            // If we can't set the global pool (e.g., already set), just log and continue
+            debug_println!(
+                "Note: Could not configure thread pool ({}), using defaults",
+                e
+            );
+        });
+
+    // Log the configuration for transparency (only when STARLINGS_DEBUG=1)
+    debug_println!(
+        "🔧 Starlings: Using {} threads (of {} CPUs available)",
+        thread_count,
+        num_cpus
+    );
+
     m.add_class::<PyCollection>()?;
     m.add_class::<PyPartition>()?;
     m.add_class::<EdgeGenerator>()?;

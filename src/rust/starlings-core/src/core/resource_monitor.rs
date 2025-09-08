@@ -67,8 +67,90 @@ pub enum ProcessingStrategy {
     },
 }
 
+/// Memory pressure levels for cleaner conditional logic
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MemoryPressure {
+    None,     // < 75%
+    Low,      // 75-85%
+    Medium,   // 85-90%
+    High,     // 90-95%
+    Critical, // > 95%
+}
+
+/// CPU pressure levels for cleaner conditional logic
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CpuPressure {
+    None,    // < 70%
+    Low,     // 70-80%
+    Medium,  // 80-90%
+    High,    // 90-95%
+    Extreme, // > 95%
+}
+
 impl ResourceMonitor {
+    /// Helper function to categorise memory pressure levels
+    fn memory_pressure_level(memory_percent: f32) -> MemoryPressure {
+        match memory_percent {
+            p if p > 95.0 => MemoryPressure::Critical,
+            p if p > 90.0 => MemoryPressure::High,
+            p if p > 85.0 => MemoryPressure::Medium,
+            p if p > 75.0 => MemoryPressure::Low,
+            _ => MemoryPressure::None,
+        }
+    }
+
+    /// Helper function to categorise CPU pressure levels
+    fn cpu_pressure_level(cpu_percent: f32) -> CpuPressure {
+        match cpu_percent {
+            p if p > 95.0 => CpuPressure::Extreme,
+            p if p > 90.0 => CpuPressure::High,
+            p if p > 80.0 => CpuPressure::Medium,
+            p if p > 70.0 => CpuPressure::Low,
+            _ => CpuPressure::None,
+        }
+    }
+
+    /// Get batch parameters based on memory pressure level
+    fn memory_batch_params(pressure: MemoryPressure) -> (usize, u64, Option<&'static str>) {
+        match pressure {
+            MemoryPressure::Critical => (200, 2000, Some("CRITICAL")),
+            MemoryPressure::High => (50, 1000, Some("HIGH")),
+            MemoryPressure::Medium => (10, 500, Some("MEDIUM")),
+            MemoryPressure::Low => (4, 100, None),
+            MemoryPressure::None => (1, 0, None),
+        }
+    }
+
+    /// Get CPU delay based on CPU pressure level
+    fn cpu_delay_ms(pressure: CpuPressure) -> u64 {
+        match pressure {
+            CpuPressure::Extreme => 1000,
+            CpuPressure::High => 500,
+            CpuPressure::Medium => 200,
+            CpuPressure::Low => 0,
+            CpuPressure::None => 0,
+        }
+    }
+
+    /// Get batch multiplier factor based on resource pressure
+    fn batch_multiplier_factor(memory_percent: f32, cpu_percent: f32) -> f64 {
+        let memory_factor = match Self::memory_pressure_level(memory_percent) {
+            MemoryPressure::Critical | MemoryPressure::High => 0.5,
+            MemoryPressure::Medium => 0.75,
+            _ => 1.0,
+        };
+
+        let cpu_factor = match Self::cpu_pressure_level(cpu_percent) {
+            CpuPressure::Extreme | CpuPressure::High => 0.5,
+            CpuPressure::Medium | CpuPressure::Low => 0.75,
+            CpuPressure::None => 1.0,
+        };
+
+        memory_factor * cpu_factor
+    }
+
     /// Create a new resource monitor with automatic memory detection
+    #[must_use]
     pub fn new() -> Self {
         let refresh_kind = RefreshKind::new()
             .with_cpu(CpuRefreshKind::everything())
@@ -81,11 +163,12 @@ impl ResourceMonitor {
             last_refresh: Arc::new(Mutex::new(Instant::now())),
             refresh_interval: Duration::from_secs(1),
             memory_limit_mb: None,
-            cpu_limit_percent: 90.0,
+            cpu_limit_percent: 80.0, // Lowered to be a better neighbor
         }
     }
 
     /// Create with explicit memory limit (following Polars pattern)
+    #[must_use]
     pub fn with_memory_limit(memory_limit_mb: u64) -> Self {
         let mut monitor = Self::new();
         monitor.memory_limit_mb = Some(memory_limit_mb);
@@ -93,34 +176,38 @@ impl ResourceMonitor {
     }
 
     /// Get current system resource usage
+    ///
+    /// # Panics
+    /// Panics if the system monitor mutex is poisoned
+    #[must_use]
     pub fn get_usage(&self) -> ResourceUsage {
         self.refresh_if_needed();
 
         let system = self.system.lock().unwrap();
-        let total_memory_kb = system.total_memory();
-        let available_memory_kb = system.available_memory();
-        let used_memory_kb = total_memory_kb - available_memory_kb;
+        let total_kb = system.total_memory();
+        let available_kb = system.available_memory();
+        let used_kb = total_kb - available_kb;
 
-        let total_memory_mb = total_memory_kb / 1024;
-        let available_memory_mb = available_memory_kb / 1024;
-        let used_memory_mb = used_memory_kb / 1024;
+        let total_memory_mb = total_kb / 1024;
+        let available_memory_mb = available_kb / 1024;
+        let used_memory_mb = used_kb / 1024;
 
         let memory_percent = if total_memory_mb > 0 {
-            (used_memory_mb as f32 / total_memory_mb as f32) * 100.0
+            // Use f64 for better precision in percentage calculations
+            (used_memory_mb as f64 / total_memory_mb as f64 * 100.0) as f32
         } else {
             0.0
         };
 
         // Average CPU usage across all cores
-        let cpu_percent = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
-            / system.cpus().len() as f32;
+        let cpu_count = system.cpus().len().max(1); // Prevent division by zero
+        let cpu_percent =
+            system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / cpu_count as f32;
 
         // Get disk usage for current working directory
         let (disk_free_gb, disk_total_gb, disk_percent) = self.get_disk_usage();
 
-        let effective_memory_limit = self
-            .memory_limit_mb
-            .unwrap_or((total_memory_mb as f32 * 0.8) as u64); // 80% default like Polars
+        let effective_memory_limit = self.memory_limit_mb.unwrap_or((total_memory_mb * 80) / 100); // 80% default like Polars, using integer arithmetic
 
         let is_memory_pressure = used_memory_mb > effective_memory_limit;
         let is_cpu_pressure = cpu_percent > self.cpu_limit_percent;
@@ -142,6 +229,7 @@ impl ResourceMonitor {
     }
 
     /// Get adaptive processing limits based on current resource usage
+    #[must_use]
     pub fn get_adaptive_limits(&self, base_batch_size: usize) -> AdaptiveLimits {
         let usage = self.get_usage();
         let should_throttle = usage.is_memory_pressure || usage.is_cpu_pressure;
@@ -149,30 +237,23 @@ impl ResourceMonitor {
         // Determine if we should spill to disk based on memory pressure
         let should_spill_to_disk = usage.memory_percent > 75.0 && usage.disk_free_gb > 5; // Need at least 5GB free
 
-        // Determine memory-based adjustments - more aggressive with streaming approach
-        let (batch_divisor, base_delay, severity) = match usage.memory_percent {
-            p if p > 95.0 => (200, 200, Some("CRITICAL")), // Much smaller batches when critical
-            p if p > 90.0 => (50, 100, Some("HIGH")),
-            p if p > 85.0 => (10, 50, Some("MEDIUM")),
-            p if p > 75.0 => (4, 20, None), // Start adapting earlier
-            _ => (1, 0, None),
-        };
+        // Use helper methods for cleaner conditional logic
+        let memory_pressure = Self::memory_pressure_level(usage.memory_percent);
+        let cpu_pressure = Self::cpu_pressure_level(usage.cpu_percent);
+
+        let (batch_divisor, base_delay, severity) = Self::memory_batch_params(memory_pressure);
 
         // Calculate batch size - minimum of 50 for streaming efficiency
         let batch_size = (base_batch_size / batch_divisor).max(50);
 
-        // Calculate delay with CPU throttling
-        let cpu_delay = match usage.cpu_percent {
-            p if p > 95.0 => 200,
-            p if p > 90.0 => 100,
-            _ => 0,
-        };
+        // Get CPU delay and combine with memory delay
+        let cpu_delay = Self::cpu_delay_ms(cpu_pressure);
         let delay_ms = base_delay.max(cpu_delay);
 
         // Format warning messages
         let memory_warning = severity.map(|level| {
-            let gb_used = usage.memory_used_mb as f32 / 1024.0;
-            let gb_total = usage.memory_total_mb as f32 / 1024.0;
+            let gb_used = usage.memory_used_mb as f64 / 1024.0;
+            let gb_total = usage.memory_total_mb as f64 / 1024.0;
             let action = if should_spill_to_disk {
                 "Enabling disk spilling"
             } else {
@@ -183,16 +264,16 @@ impl ResourceMonitor {
                 }
             };
             format!(
-                "{}: Memory usage {}% ({:.1}GB/{:.1}GB) - {}",
-                level, usage.memory_percent as u32, gb_used, gb_total, action
+                "{}: Memory usage {:.0}% ({:.1}GB/{:.1}GB) - {}",
+                level, usage.memory_percent, gb_used, gb_total, action
             )
         });
 
         // Format disk warning if needed
         let disk_warning = if usage.is_disk_pressure {
             Some(format!(
-                "LOW DISK SPACE: {}% used ({:.1}GB free) - May affect spilling performance",
-                usage.disk_percent as u32, usage.disk_free_gb
+                "LOW DISK SPACE: {:.0}% used ({:.1}GB free) - May affect spilling performance",
+                usage.disk_percent, usage.disk_free_gb
             ))
         } else if should_spill_to_disk && usage.disk_free_gb < 10 {
             Some(format!(
@@ -222,8 +303,46 @@ impl ResourceMonitor {
         let num_edges = num_entities * 5;
         let estimated_mb = (num_edges * 150) / (1024 * 1024);
 
-        // Add 50% safety margin for intermediate data structures
-        (estimated_mb as f32 * 1.5) as u64
+        // Add 50% safety margin for intermediate data structures using integer arithmetic
+        (estimated_mb + (estimated_mb / 2)) as u64
+    }
+
+    /// Calculate optimal batch size based on system resources and memory requirements
+    fn calculate_optimal_batch_size(
+        &self,
+        base_batch_size: usize,
+        required_mb: u64,
+        usage: &ResourceUsage,
+    ) -> usize {
+        // Calculate memory headroom ratio using f64 for better precision
+        let memory_headroom = usage.memory_available_mb as f64 / required_mb.max(1) as f64;
+
+        // Base multiplier on memory headroom
+        let memory_multiplier = match memory_headroom {
+            ratio if ratio >= 8.0 => 8.0, // Abundant memory
+            ratio if ratio >= 4.0 => 4.0, // Plenty of memory
+            ratio if ratio >= 2.0 => 2.0, // Sufficient memory
+            _ => 1.0,                     // Limited memory
+        };
+
+        // Use helper method for pressure factor calculation
+        let pressure_factor =
+            Self::batch_multiplier_factor(usage.memory_percent, usage.cpu_percent);
+
+        // Calculate dynamic maximum based on total system memory
+        let dynamic_max = match usage.memory_total_mb {
+            mem if mem >= 32_000 => 2_000_000, // 32GB+ systems - large batches
+            mem if mem >= 16_000 => 1_000_000, // 16GB+ systems - medium batches
+            mem if mem >= 8_000 => 500_000,    // 8GB+ systems - smaller batches
+            _ => 100_000,                      // <8GB systems - conservative
+        };
+
+        // Combine all factors
+        let final_multiplier = memory_multiplier * pressure_factor;
+        let optimal_size = (base_batch_size as f64 * final_multiplier).round() as usize;
+
+        // Apply dynamic maximum and minimum bounds
+        optimal_size.max(1_000).min(dynamic_max)
     }
 
     /// Determine optimal processing strategy for a dataset size
@@ -235,28 +354,38 @@ impl ResourceMonitor {
         // Determine required disk space for spilling (estimate 2x memory for safety)
         let required_disk_gb = (required_mb * 2) / 1024;
 
-        if required_mb <= usage.memory_available_mb / 4 {
-            // Can fit comfortably in memory
+        if required_mb <= usage.memory_available_mb / 2 {
+            // Can fit comfortably in memory - use up to 50% of available memory
+            let optimal_batch_size =
+                self.calculate_optimal_batch_size(limits.batch_size, required_mb, &usage);
+
             ProcessingStrategy::InMemory {
-                batch_size: limits.batch_size,
-                total_batches: ((num_entities * 5) / limits.batch_size).max(1),
+                batch_size: optimal_batch_size,
+                total_batches: ((num_entities * 5) / optimal_batch_size).max(1),
             }
         } else if required_mb <= usage.memory_available_mb && usage.disk_free_gb > required_disk_gb
         {
             // Need memory-aware processing with potential spilling
+            let memory_aware_batch_size =
+                self.calculate_optimal_batch_size(limits.batch_size, required_mb, &usage);
+
             ProcessingStrategy::MemoryAware {
-                batch_size: limits.batch_size,
+                batch_size: memory_aware_batch_size,
                 should_spill: limits.should_spill_to_disk,
                 spill_threshold_mb: usage.memory_available_mb * 3 / 4, // Spill at 75% memory use
-                total_batches: ((num_entities * 5) / limits.batch_size).max(1),
+                total_batches: ((num_entities * 5) / memory_aware_batch_size).max(1),
             }
         } else if usage.disk_free_gb > required_disk_gb {
             // Must use streaming with aggressive disk spilling
+            let streaming_batch_size = self
+                .calculate_optimal_batch_size(limits.batch_size, required_mb, &usage)
+                .min(10_000); // Cap streaming batches at 10K for memory safety
+
             ProcessingStrategy::Streaming {
-                batch_size: limits.batch_size.min(10_000), // Smaller batches for streaming
+                batch_size: streaming_batch_size,
                 aggressive_spilling: true,
                 max_memory_mb: usage.memory_available_mb / 2, // Use only half available memory
-                total_batches: ((num_entities * 5) / limits.batch_size.min(10_000)).max(1),
+                total_batches: ((num_entities * 5) / streaming_batch_size).max(1),
             }
         } else {
             // Not enough resources
@@ -314,7 +443,7 @@ impl ResourceMonitor {
                 let total_gb = total_bytes / (1024 * 1024 * 1024);
                 let free_gb = free_bytes / (1024 * 1024 * 1024);
                 let used_percent = if total_bytes > 0 {
-                    (used_bytes as f32 / total_bytes as f32) * 100.0
+                    ((used_bytes as f64 / total_bytes as f64) * 100.0) as f32
                 } else {
                     0.0
                 };
@@ -335,6 +464,71 @@ impl ResourceMonitor {
             system.refresh_cpu_all();
             *last_refresh = Instant::now();
         }
+    }
+
+    /// Check if system is under resource pressure and should throttle operations
+    pub fn should_throttle(&self) -> bool {
+        let usage = self.get_usage();
+        usage.is_memory_pressure || usage.is_cpu_pressure
+    }
+
+    /// Wait for resources with exponential backoff if under pressure
+    pub fn wait_for_resources_with_backoff(&self, base_delay_ms: u64) -> u64 {
+        if !self.should_throttle() {
+            return 0;
+        }
+
+        let usage = self.get_usage();
+        let mut delay_ms = base_delay_ms;
+
+        // Exponential backoff based on pressure level
+        if usage.memory_percent > 90.0 {
+            delay_ms *= 4; // Severe memory pressure
+        } else if usage.memory_percent > 80.0 {
+            delay_ms *= 2; // High memory pressure
+        }
+
+        if usage.cpu_percent > 90.0 {
+            delay_ms *= 2; // High CPU usage
+        }
+
+        // Cap maximum delay at 5 seconds
+        delay_ms = delay_ms.min(5000);
+
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+
+        delay_ms
+    }
+
+    /// Get recommended throttling delay based on current system state
+    pub fn get_throttling_delay(&self) -> u64 {
+        if !self.should_throttle() {
+            return 0;
+        }
+
+        let usage = self.get_usage();
+        let base_delay = if usage.is_memory_pressure && usage.is_cpu_pressure {
+            500 // Both memory and CPU pressure
+        } else if usage.is_memory_pressure {
+            200 // Memory pressure only
+        } else if usage.is_cpu_pressure {
+            100 // CPU pressure only
+        } else {
+            0
+        };
+
+        // Scale by severity
+        let memory_factor = if usage.memory_percent > 95.0 {
+            3.0
+        } else if usage.memory_percent > 85.0 {
+            2.0
+        } else {
+            1.0
+        };
+
+        (base_delay as f64 * memory_factor).round() as u64
     }
 }
 

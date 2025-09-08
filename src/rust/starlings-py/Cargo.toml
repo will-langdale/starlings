@@ -12,6 +12,7 @@ starlings-core = { path = "../starlings-core" }
 pyo3 = { version = "0.26", features = ["extension-module"] }
 rustc-hash = "2.0"
 rayon = "1.10"
+num_cpus = "1.16"
 
 [features]
 # Extension module is always enabled for this crate

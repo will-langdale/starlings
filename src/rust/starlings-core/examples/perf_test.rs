@@ -131,7 +131,7 @@ fn test_entity_resolution_vs_random_construction(num_entities: usize) {
 
     println!("Starting entity resolution hierarchy construction...");
     let start = Instant::now();
-    let mut er_hierarchy = PartitionHierarchy::from_edges(er_edges, er_ctx, 6, None, None).unwrap();
+    let mut er_hierarchy = PartitionHierarchy::from_edges(er_edges, er_ctx, 6, None).unwrap();
     let er_construction_time = start.elapsed();
 
     println!(
@@ -171,7 +171,7 @@ fn test_entity_resolution_vs_random_construction(num_entities: usize) {
 
     println!("Starting random hierarchy construction...");
     let start = Instant::now();
-    let mut r_hierarchy = PartitionHierarchy::from_edges(r_edges, r_ctx, 6, None, None).unwrap();
+    let mut r_hierarchy = PartitionHierarchy::from_edges(r_edges, r_ctx, 6, None).unwrap();
     let r_construction_time = start.elapsed();
 
     println!(
@@ -235,7 +235,7 @@ fn test_exact_production_scale() {
 
     println!("Starting hierarchy construction...");
     let start = Instant::now();
-    let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 6, None, None).unwrap();
+    let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 6, None).unwrap();
     let construction_time = start.elapsed();
 
     println!(

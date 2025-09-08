@@ -1,5 +1,6 @@
 use crate::core::key::Key;
 use crate::core::record::InternedRecord;
+use crate::core::resource_monitor::ResourceMonitor;
 use boxcar::Vec as BoxcarVec;
 use dashmap::DashMap;
 use lasso::{Capacity, Key as LassoKey, ThreadedRodeo};
@@ -18,65 +19,91 @@ pub struct DataContext {
     pub source_interner: Arc<ThreadedRodeo>,
     pub identity_map: FxDashMap<InternedRecord, u32>,
     pub source_index: FxDashMap<u32, RoaringBitmap>,
+    pub resource_monitor: Arc<ResourceMonitor>,
     next_record_id: AtomicU32,
 }
 
 impl DataContext {
+    /// Convert LassoKey to u32 safely, panicking only on systems with massive string interners
+    #[inline]
+    fn lasso_key_to_u32(key: lasso::Spur) -> u32 {
+        LassoKey::into_usize(key)
+            .try_into()
+            .expect("String interner exceeded u32 capacity - consider using u64 identifiers")
+    }
+
+    #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
 
     /// Create DataContext with pre-allocated capacity for better performance
+    #[must_use]
     pub fn with_capacity(estimated_records: usize) -> Self {
         let hasher = BuildHasherDefault::<FxHasher>::default();
 
+        // Use appropriate capacity for large datasets - don't cap at 10k
+        let interner_capacity = if estimated_records > 100_000 {
+            // For large datasets, use proportional capacity
+            Capacity::for_strings(estimated_records / 100) // 1% of records as unique strings
+        } else {
+            Capacity::for_strings(estimated_records.max(1000))
+        };
+
         DataContext {
             records: BoxcarVec::new(),
-            source_interner: Arc::new(ThreadedRodeo::with_capacity(Capacity::for_strings(
-                estimated_records.min(10000),
-            ))),
+            source_interner: Arc::new(ThreadedRodeo::with_capacity(interner_capacity)),
             identity_map: DashMap::with_capacity_and_hasher(estimated_records, hasher.clone()),
             source_index: DashMap::with_hasher(hasher),
+            resource_monitor: Arc::new(ResourceMonitor::new()),
             next_record_id: AtomicU32::new(0),
         }
     }
 
     /// Batch ensure records for improved performance
     pub fn ensure_records_batch(&self, source: &str, keys: &[Key]) -> Vec<u32> {
-        let source_id = LassoKey::into_usize(self.source_interner.get_or_intern(source)) as u32;
+        let source_id = Self::lasso_key_to_u32(self.source_interner.get_or_intern(source));
+        let mut result = Vec::with_capacity(keys.len());
 
-        keys.iter()
-            .map(|key| {
-                let record = InternedRecord::new(source_id, key.clone());
+        for key in keys {
+            let record = InternedRecord::new(source_id, key.clone());
 
-                if let Some(existing_id) = self.identity_map.get(&record) {
-                    return *existing_id;
+            // Fast path: check if record already exists
+            if let Some(existing_id) = self.identity_map.get(&record) {
+                result.push(*existing_id);
+                continue;
+            }
+
+            // Slow path: need to insert new record
+            let record_id = self.next_record_id.fetch_add(1, Ordering::Relaxed);
+
+            match self.identity_map.entry(record) {
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    // Another thread inserted it while we were working
+                    result.push(*entry.get());
                 }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    let record = entry.key().clone(); // Only clone when inserting
+                    entry.insert(record_id);
 
-                let record_id = self.next_record_id.fetch_add(1, Ordering::Relaxed);
+                    self.records.push(record);
 
-                match self.identity_map.entry(record.clone()) {
-                    dashmap::mapref::entry::Entry::Occupied(entry) => *entry.get(),
-                    dashmap::mapref::entry::Entry::Vacant(entry) => {
-                        entry.insert(record_id);
+                    self.source_index
+                        .entry(source_id)
+                        .or_default()
+                        .insert(record_id);
 
-                        self.records.push(record);
-
-                        self.source_index
-                            .entry(source_id)
-                            .or_default()
-                            .insert(record_id);
-
-                        record_id
-                    }
+                    result.push(record_id);
                 }
-            })
-            .collect()
+            }
+        }
+
+        result
     }
 
     /// Thread-safe record interning with lock-free operations
     pub fn ensure_record(&self, source: &str, key: Key) -> u32 {
-        let source_id = LassoKey::into_usize(self.source_interner.get_or_intern(source)) as u32;
+        let source_id = Self::lasso_key_to_u32(self.source_interner.get_or_intern(source));
 
         let record = InternedRecord::new(source_id, key);
 
@@ -110,12 +137,12 @@ impl DataContext {
         key: Key,
         attributes: HashMap<String, String>,
     ) -> u32 {
-        let source_id = LassoKey::into_usize(self.source_interner.get_or_intern(source)) as u32;
+        let source_id = Self::lasso_key_to_u32(self.source_interner.get_or_intern(source));
 
         let mut interned_attrs = HashMap::new();
         for (k, v) in attributes {
-            let key_id = LassoKey::into_usize(self.source_interner.get_or_intern(k)) as u32;
-            let val_id = LassoKey::into_usize(self.source_interner.get_or_intern(v)) as u32;
+            let key_id = Self::lasso_key_to_u32(self.source_interner.get_or_intern(k));
+            let val_id = Self::lasso_key_to_u32(self.source_interner.get_or_intern(v));
             interned_attrs.insert(key_id, val_id);
         }
 
@@ -156,6 +183,40 @@ impl DataContext {
         self.len() == 0
     }
 
+    /// Check if it's safe to perform an operation with the given memory requirements
+    ///
+    /// # Errors
+    /// Returns an error if the operation would exceed available system resources
+    pub fn check_operation_safety(&self, estimated_records: usize) -> Result<(), String> {
+        self.resource_monitor
+            .check_operation_safety(estimated_records)
+            .map(|_| ())
+    }
+
+    /// Check current memory pressure and return true if we should throttle
+    pub fn should_throttle(&self) -> bool {
+        let usage = self.resource_monitor.get_usage();
+        usage.is_memory_pressure || usage.is_cpu_pressure
+    }
+
+    /// Wait for resources if under pressure, with exponential backoff
+    pub fn wait_for_resources(&self) {
+        if self.should_throttle() {
+            let limits = self.resource_monitor.get_adaptive_limits(1000);
+            if limits.delay_between_batches_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    limits.delay_between_batches_ms,
+                ));
+            }
+        }
+    }
+
+    /// Get adaptive batch size for current resource conditions
+    pub fn get_adaptive_batch_size(&self, default_size: usize) -> usize {
+        let limits = self.resource_monitor.get_adaptive_limits(default_size);
+        limits.batch_size
+    }
+
     pub fn get_source_name(&self, source_id: u32) -> Option<String> {
         let spur = LassoKey::try_from_usize(source_id as usize)?;
         self.source_interner
@@ -164,7 +225,7 @@ impl DataContext {
     }
 
     pub fn get_records_by_source(&self, source_name: &str) -> Option<Vec<u32>> {
-        let source_id = LassoKey::into_usize(self.source_interner.get(source_name)?) as u32;
+        let source_id = Self::lasso_key_to_u32(self.source_interner.get(source_name)?);
         self.source_index
             .get(&source_id)
             .map(|bitmap| bitmap.iter().collect())

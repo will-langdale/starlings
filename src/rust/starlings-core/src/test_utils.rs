@@ -405,7 +405,7 @@ mod tests {
 
         println!("Generated {} edges for {} entities", edges.len(), n);
         let mut hierarchy =
-            PartitionHierarchy::from_edges(edges, Arc::new(context), 6, None, None).unwrap();
+            PartitionHierarchy::from_edges(edges, Arc::new(context), 6, None).unwrap();
 
         // Test entity counts at key thresholds
         let entities_at_1_0 = hierarchy.at_threshold(1.0).entities().len();
