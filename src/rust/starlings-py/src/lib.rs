@@ -442,6 +442,7 @@ impl PyCollection {
         }
 
         // Production-scale performance metrics (when STARLINGS_DEBUG=1 and large datasets)
+        #[cfg(debug_assertions)]
         if edge_count >= 100_000 {
             debug_println!("🏭 Production-scale Collection.from_edges performance:");
             debug_println!(

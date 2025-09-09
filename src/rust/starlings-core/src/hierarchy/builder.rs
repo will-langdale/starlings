@@ -239,6 +239,7 @@ impl PartitionHierarchy {
         };
 
         // Debug output for hierarchy construction breakdown
+        #[cfg(debug_assertions)]
         if num_edges >= 100_000 {
             debug_println!("   🔧 Hierarchy construction breakdown:");
             debug_println!("      Quantisation: {:?}", quantise_time);

@@ -547,9 +547,9 @@ impl ResourceMonitor {
 
             let result = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
             if result == 0 {
-                let block_size = stat.f_bsize;
-                let total_blocks = stat.f_blocks;
-                let free_blocks = stat.f_bavail;
+                let block_size: u64 = stat.f_bsize;
+                let total_blocks: u64 = stat.f_blocks;
+                let free_blocks: u64 = stat.f_bavail;
 
                 let total_bytes = total_blocks * block_size;
                 let free_bytes = free_blocks * block_size;
