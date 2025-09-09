@@ -548,7 +548,15 @@ impl ResourceMonitor {
             let result = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
             if result == 0 {
                 let block_size: u64 = stat.f_bsize;
+                // Handle platform differences: macOS has u32, Linux has u64
+                #[cfg(target_os = "macos")]
+                let total_blocks: u64 = stat.f_blocks.into();
+                #[cfg(not(target_os = "macos"))]
                 let total_blocks: u64 = stat.f_blocks;
+
+                #[cfg(target_os = "macos")]
+                let free_blocks: u64 = stat.f_bavail.into();
+                #[cfg(not(target_os = "macos"))]
                 let free_blocks: u64 = stat.f_bavail;
 
                 let total_bytes = total_blocks * block_size;
