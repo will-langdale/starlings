@@ -67,6 +67,8 @@ jobs:
 
     - name: Run Python tests
       run: just test python
+      env:
+        STARLINGS_SAFETY_LEVEL: performance
     
     - name: Run Rust tests
       run: just test rust
