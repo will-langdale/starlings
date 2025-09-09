@@ -22,11 +22,13 @@ Starlings revolutionises entity resolution by storing **merge events** rather th
 - Threshold query: O(m) first time, O(1) cached
 - Metric updates: O(k) incremental between thresholds
 - Memory: ~60-115MB for 1M edges
+- **Production performance**: 1M edges processed in <1.6s (PGO build), 645k edges/second throughput
 
 **Implementation Stack**:
-- **Rust core**: Performance-critical operations using RoaringBitmaps, Rayon parallelisation
+- **Rust core**: Performance-critical operations using lock-free data structures (boxcar::Vec), parking_lot, FxHasher, Rayon parallelisation
 - **Python interface**: Polars-inspired wrapper pattern via PyO3
 - **Arrow integration**: Efficient serialisation with dictionary encoding
+- **Key optimisations**: Lock-free DataContext, cached hashing, parallel key interning, PGO support
 
 ## Architecture
 
@@ -53,41 +55,70 @@ src/
 
 ## Development commands
 
-This project uses `just` as a command runner and `uv` for Python dependency management:
+This project uses `just` as a command runner with a modular structure and `uv` for Python dependency management:
 
+### Core commands
 - `just install`: Install development dependencies
-- `just build`: Build the Rust extension
-- `just test`: Run comprehensive test suite (Python integration + Rust core)
-- `just bench`: Run benchmarks
 - `just format`: Format and lint all code (Python + Rust)
 - `just clean`: Clean build artifacts
 - `just docs`: Run a local documentation development server
 
+### Modular command structure
+- `just build`: Build the Rust extension (see `just build list` for options)
+  - `just build`: Standard development build
+  - `just build pgo`: Profile-Guided Optimisation build for maximum performance
+- `just test`: Run test suite (see `just test list` for options)
+  - `just test`: Run all tests (Python integration + Rust core)
+  - `just test python`: Run Python integration tests only
+  - `just test rust`: Run Rust core tests only
+- `just bench`: Run benchmarks (see `just bench list` for options)
+  - `just bench rust`: Rust core benchmarks for performance validation
+  - `just bench collection`: End-to-end processing benchmarks (accepts scale parameter)
+    - `just bench collection`: Default N=1 (1M entities)
+    - `just bench collection 2`: N=2 (2M entities)
+    - `just bench collection 0.5`: N=0.5 (500k entities)
+    - N parameter scales all benchmark sizes proportionally
+
 ## Testing strategy
 
-The project uses a **two-layer testing approach** that achieves comprehensive coverage without PyO3 linking complications:
+The project uses a **three-layer testing approach** that achieves comprehensive coverage whilst maintaining system safety:
 
-**Layer 1: Pure Rust core tests** (33 tests)
+**Layer 1: Pure Rust core tests** (69 tests)
 - All business logic tested in `starlings-core` crate
 - Zero PyO3 dependencies, no linking issues
 - Full coverage of data structures, algorithms, and edge cases
 - Run via: `cargo test -p starlings-core`
 
-**Layer 2: Python integration tests** (17 tests)
-- End-to-end testing of Python → Rust → Python data flow
+**Layer 2: Python integration tests** (19 tests)
+- Unit tests with small datasets (< 1000 entities) for basic functionality 
+- E2E tests with production-scale datasets (100k-1M entities) for safety validation
 - Tests PyO3 wrapper functionality, type conversions, error handling
-- Validates real-world usage patterns and API contracts
-- Run via: `uv run pytest`
+- **SAFE**: All tests run with `STARLINGS_SAFETY_LEVEL=conservative`
+- Run via: `just test` (safe by default with production validation)
+
+**Layer 3: Stress testing** (12+ tests)  
+- Memory pressure simulation, resource exhaustion scenarios
+- Circuit breaker validation under artificial system stress
+- **DANGEROUS**: Artificially consumes system resources to test limits
+- Run via: `just test dangerous` (explicit opt-in required)
 
 This **"Rust Core with Python Bindings"** pattern ensures complete test coverage whilst avoiding complex PyO3 test configuration. The Rust core handles all business logic testing, whilst Python tests validate the integration boundary.
 
-### Benchmarking
+**Safety by Default**: The default `just test` command runs safe tests including production-scale validation that demonstrate the safety system working correctly. The safety system automatically prevents system crashes during large-scale operations. Only stress tests that artificially exhaust system resources require explicit opt-in via `just test dangerous`.
 
-Use `just bench` to run Rust core benchmarks for performance validation:
-- Hierarchy construction performance (1k-10k edges) 
-- Scaling tests across different dataset sizes
+### Benchmarking and performance
+
+Use `just bench` to run benchmarks for performance validation:
+- `just bench rust`: Rust core benchmarks (hierarchy construction, 1k-10k edges) 
+- `just bench collection`: End-to-end processing benchmarks (scaling tests, 1M+ edge datasets)
 - Quantisation effect measurement
-- All benchmarks run against `starlings-core` for consistent results
+- Production-scale performance testing with PGO builds
+
+**Performance achievements**:
+- **5.4x improvement** over original implementation through key interning optimisations
+- **Lock-free DataContext** using boxcar::Vec eliminates RwLock contention
+- **Parallel processing** with rayon for multi-core scaling
+- **PGO builds** achieve 645k edges/second throughput (1M edges in 1.6s)
 
 There is a house style for parameterising Python unit tests:
 
@@ -103,13 +134,27 @@ def test_something(foo: bool, bar: int):
     """Tests that something does something."""
 ```
 
+**Code Quality Standards**:
+- All code follows British English spelling and conventions
+- Comprehensive type annotations and docstrings following Google style
+- DRY principles with extracted helper methods for common patterns
+- Context managers for resource management (environment variables, etc.)
+- Consistent error handling and validation patterns
+
 ## Development workflow
 
 1. Install dependencies: `just install`
-2. Build the project: `just build`
+2. Build the project: `just build` (or `just build pgo` for production performance)
 3. Run tests: `just test`
 4. Check formatting/linting: `just format`
-5. Run benchmarks: `just bench`
+5. Run benchmarks: `just bench collection` (for full performance testing)
+
+### Performance builds
+
+For production or performance testing, use Profile-Guided Optimisation:
+- `just build pgo`: Builds with instrumentation, runs benchmarks, rebuilds optimised binary
+- Achieves 25x performance improvement over original implementation
+- Automatically cleans up profile data after build
 
 ## Project structure notes
 

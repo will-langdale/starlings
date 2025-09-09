@@ -117,6 +117,7 @@
 - [ ] PyEntityFrame with __getitem__ for ef["name"] syntax
 - [ ] Test: multiple collections share memory
 - [ ] Test: view immutability
+- [ ] Update E2E test: Extend `test_user_eda_workflow()` to use EntityFrame with multiple collections, test memory sharing
 
 **Reference**: `algorithms.md` - Adding collections to frames section
 
@@ -136,6 +137,7 @@
 - [ ] Return type always List[Dict[str, float]]
 - [ ] Test: sl.col("a").at(0.8), sl.col("b").at(1.0) comparison
 - [ ] Test: sl.col("a").sweep(0.5, 0.9, 0.1) output format
+- [ ] Update E2E test: Replace manual `.at()` calls with expression API, add sweep testing
 
 **Reference**: `interface.md` - Expression API section
 
@@ -154,6 +156,7 @@
 - [ ] Metric computation in analyse() method
 - [ ] Test: known partitions with expected precision/recall
 - [ ] Benchmark: metric computation for 1k entities
+- [ ] Update E2E test: Add precision/recall/F1 computation against ground truth in workflow
 
 **Reference**: `principles.md` - Pairwise classification metrics
 
@@ -173,6 +176,7 @@
 - [ ] O(k) update logic where k = affected entities
 - [ ] Test: incremental result equals full recomputation
 - [ ] Benchmark: 1000-threshold sweep time reduction
+- [ ] Update E2E test: Add timing comparison between incremental vs full recomputation metrics
 
 **Reference**: `principles.md` - Incremental metric computation
 
@@ -205,6 +209,7 @@
 - [ ] RoaringBitmap serialisation as nested lists
 - [ ] Test: round-trip preservation of all data
 - [ ] Benchmark: serialisation of 100k records
+- [ ] Update E2E test: Extend workflow to include EntityFrame.to_arrow() and round-trip testing
 
 **Dependencies**: arrow  
 **Reference**: `engine.md` - Arrow integration
@@ -277,6 +282,7 @@
 - [ ] All pairs within entity get weight 1.0
 - [ ] Collection::from_entities() constructor
 - [ ] Test: two-stage resolution workflow
+- [ ] Update E2E test: Add Collection.from_entities() workflow testing alongside from_edges()
 
 **Reference**: `interface.md` - Hierarchical resolution workflow
 

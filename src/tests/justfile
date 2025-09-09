@@ -1,20 +1,52 @@
 set working-directory := "../.."
 
-# Run all tests (Python + Rust)
-default: python rust
-    @echo "✅ Ran tests (Python + Rust)."
+# Environment variables
+set export
+STARLINGS_DEBUG := "1"
 
-# Run Python tests
+# Run all tests (Python + Rust) - SAFE BY DEFAULT with safety validation
+default: python rust
+    @echo "✅ Ran safe tests with production-scale safety validation (Python + Rust). Use 'just test dangerous' for stress tests."
+
+# List all commands
+list:
+    just -f ./src/tests/justfile --list
+
+# Run Python tests (safe tests + e2e safety validation)
 python:
-    @echo "Running Python tests..."
-    uv run pytest
+    @echo "Running Python tests (unit tests + e2e safety validation)..."
+    STARLINGS_DEBUG=1 STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest -m "not stress and not safety and not benchmark and not integration and not performance"
 
 # Run only Rust tests
 rust:
     @echo "Running Rust core tests..."
     cargo test -p starlings-core
 
-# Internal benchmark runner
-_bench:
-    @echo "Running Rust core benchmarks..."
-    cargo bench -p starlings-core
+# Run safety tests (circuit breaker, resource limits)
+safety:
+    @echo "Running safety mechanism tests..."
+    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/test_safety.py -v -m safety
+
+# Run stress tests (resource pressure, concurrent operations)  
+stress:
+    @echo "Running stress tests..."
+    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/test_stress.py -v -m stress
+
+# Run all safety-related tests
+safety-all: safety stress
+    @echo "✅ All safety tests completed"
+
+# Run performance impact tests
+performance:
+    @echo "Running performance impact tests..."
+    uv run pytest src/tests/test_safety.py::TestPerformanceImpact -v
+
+# Run end-to-end tests (large datasets, use with caution)
+e2e:
+    @echo "Running end-to-end tests (large datasets)..."
+    @echo "⚠️  WARNING: These tests use large datasets and may consume significant resources"
+    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/e2e/ -v -m e2e
+
+# Run all dangerous tests (stress, safety, e2e)
+dangerous: safety stress e2e
+    @echo "✅ All dangerous tests completed"

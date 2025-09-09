@@ -35,22 +35,27 @@ impl Hash for Key {
 }
 
 impl Key {
+    #[must_use]
     pub fn from_u32(v: u32) -> Self {
         Key::U32(v)
     }
 
+    #[must_use]
     pub fn from_u64(v: u64) -> Self {
         Key::U64(v)
     }
 
+    #[must_use]
     pub fn from_string(v: String) -> Self {
         Key::String(v)
     }
 
+    #[must_use]
     pub fn from_str_value(v: &str) -> Self {
         Key::String(v.to_string())
     }
 
+    #[must_use]
     pub fn from_bytes(v: Vec<u8>) -> Self {
         Key::Bytes(v)
     }

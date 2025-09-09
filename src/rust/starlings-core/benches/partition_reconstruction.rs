@@ -1,114 +1,49 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use starlings_core::core::{DataContext, Key};
 use starlings_core::hierarchy::PartitionHierarchy;
+use starlings_core::test_utils::generate_entity_resolution_edges;
 use std::sync::Arc;
 
-fn generate_test_hierarchy(num_edges: usize) -> PartitionHierarchy {
-    let mut ctx = DataContext::new();
-    let mut edges = Vec::with_capacity(num_edges);
+fn generate_test_hierarchy(entity_count: usize) -> PartitionHierarchy {
+    let ctx = DataContext::new();
 
-    // Create enough nodes for the requested edges
-    let num_nodes = ((num_edges as f64).sqrt() * 2.0).ceil() as usize;
-
-    // Add nodes to context
-    for i in 0..num_nodes {
-        ctx.ensure_record("test", Key::U32(i as u32));
+    // Create mixed record types for realistic benchmarking
+    for i in 0..entity_count {
+        match i % 4 {
+            0 => ctx.ensure_record("customers", Key::String(format!("cust_{}", i))),
+            1 => ctx.ensure_record("transactions", Key::U64(1000000 + i as u64)),
+            2 => ctx.ensure_record("products", Key::U32(i as u32)),
+            3 => ctx.ensure_record("addresses", Key::Bytes(format!("addr_{}", i).into_bytes())),
+            _ => unreachable!(),
+        };
     }
 
     let ctx = Arc::new(ctx);
 
-    // Generate random edges with varying weights
-    use std::collections::HashSet;
-    let mut used_edges = HashSet::new();
+    // Use unified entity resolution generator for realistic patterns
+    let edges = generate_entity_resolution_edges(entity_count, Some(10)); // Discrete thresholds for consistent timing
 
-    for _ in 0..num_edges {
-        loop {
-            let src = fastrand::usize(0..num_nodes) as u32;
-            let dst = fastrand::usize(0..num_nodes) as u32;
-
-            if src != dst && !used_edges.contains(&(src.min(dst), src.max(dst))) {
-                used_edges.insert((src.min(dst), src.max(dst)));
-                let weight = fastrand::f64();
-                edges.push((src, dst, weight));
-                break;
-            }
-        }
-    }
-
-    PartitionHierarchy::from_edges(edges, ctx, 6)
+    println!(
+        "Built hierarchy with {} edges and {} records using unified generator",
+        edges.len(),
+        ctx.len()
+    );
+    PartitionHierarchy::from_edges(edges, ctx, 6, None).unwrap()
 }
 
-fn bench_uncached_at_threshold(c: &mut Criterion) {
-    let mut group = c.benchmark_group("uncached_at_threshold");
+fn bench_partition_reconstruction_1m(c: &mut Criterion) {
+    // Use 200k entities which produces ~1M edges for realistic benchmarking
+    let mut hierarchy = generate_test_hierarchy(200_000);
 
-    for size in [100, 1000, 10000].iter() {
-        let mut hierarchy = generate_test_hierarchy(*size);
+    let mut group = c.benchmark_group("partition_reconstruction_production");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_edges", size)),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    // Clear cache by accessing many different thresholds
-                    for i in 0..12 {
-                        let threshold = i as f64 * 0.08;
-                        hierarchy.at_threshold(threshold);
-                    }
-                    // Now access a new threshold (uncached)
-                    black_box(hierarchy.at_threshold(0.95));
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_cached_at_threshold(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cached_at_threshold");
-
-    for size in [100, 1000, 10000].iter() {
-        let mut hierarchy = generate_test_hierarchy(*size);
-
-        // Pre-warm the cache with threshold 0.5
-        hierarchy.at_threshold(0.5);
-
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_edges", size)),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    // Access the cached threshold
-                    black_box(hierarchy.at_threshold(0.5));
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_cache_impact(c: &mut Criterion) {
-    let mut hierarchy = generate_test_hierarchy(1000);
-    let mut group = c.benchmark_group("cache_impact");
-
-    // Benchmark first access (uncached)
-    group.bench_function("first_access", |b| {
-        let mut counter = 0.0;
+    group.bench_function("200k_entities_threshold_access", |b| {
         b.iter(|| {
-            // Use a different threshold each time to avoid cache
-            counter += 0.001;
-            let threshold = (counter % 0.9) + 0.05;
-            black_box(hierarchy.at_threshold(threshold));
-        })
-    });
-
-    // Pre-warm cache for a specific threshold
-    hierarchy.at_threshold(0.75);
-
-    // Benchmark repeated access (cached)
-    group.bench_function("cached_access", |b| {
-        b.iter(|| {
+            // Test uncached access to different thresholds for realistic entity resolution patterns
+            black_box(hierarchy.at_threshold(0.95));
+            black_box(hierarchy.at_threshold(0.85));
             black_box(hierarchy.at_threshold(0.75));
         })
     });
@@ -116,25 +51,5 @@ fn bench_cache_impact(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_multiple_threshold_sweep(c: &mut Criterion) {
-    let mut hierarchy = generate_test_hierarchy(5000);
-
-    c.bench_function("threshold_sweep_20_points", |b| {
-        b.iter(|| {
-            // Sweep through 20 threshold points
-            for i in 0..20 {
-                let threshold = i as f64 * 0.05;
-                black_box(hierarchy.at_threshold(threshold));
-            }
-        })
-    });
-}
-
-criterion_group!(
-    benches,
-    bench_uncached_at_threshold,
-    bench_cached_at_threshold,
-    bench_cache_impact,
-    bench_multiple_threshold_sweep
-);
+criterion_group!(benches, bench_partition_reconstruction_1m);
 criterion_main!(benches);

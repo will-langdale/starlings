@@ -1,0 +1,75 @@
+set working-directory := ".."
+
+# Environment variables
+set export
+STARLINGS_DEBUG := "0"
+
+# Build Starlings
+default:
+    @echo "🔧 Building Rust extension..."
+    uv run maturin develop
+    @echo "✅ Build complete!"
+
+# List all commands
+list:
+    just -f ./src/justfile --list
+
+# Build with PGO
+pgo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "🔥 Building with Profile-Guided Optimisation..."
+
+    # Step 1: Clean previous builds and PGO data
+    cargo clean
+    rm -rf /tmp/pgo-data
+    mkdir -p /tmp/pgo-data
+
+    # Step 2: Build with instrumentation
+    echo "📊 Step 1/3: Building with instrumentation..."
+    RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
+        uv run maturin develop --release
+
+    # Step 3: Run representative workloads with randomisation to prevent overfitting
+    echo "🏃 Step 2/3: Running randomised profiling workloads..."
+    timeout 300s just bench pgo || echo "⚠️  PGO benchmarks timed out or failed, falling back to deterministic benchmark"
+    timeout 120s just bench collection || echo "⚠️  Backup benchmarks also failed, continuing with available profile data"
+
+    # Check if profile data was generated
+    if ls /tmp/pgo-data/*.profraw 1> /dev/null 2>&1; then
+        echo "✓ Profile data generated successfully"
+    else
+        echo "❌ No profile data found, falling back to standard build"
+        uv run maturin develop --release
+        exit 0
+    fi
+
+    # Step 4: Process profile data and rebuild
+    echo "⚡ Step 3/3: Processing profile data and building optimised binary..."
+    
+    # Try different approaches to use profile data
+    if command -v llvm-profdata >/dev/null 2>&1; then
+        # Preferred: Use llvm-profdata to merge raw files
+        echo "🔧 Merging profile data with llvm-profdata..."
+        llvm-profdata merge -output=/tmp/pgo-data/merged.profdata /tmp/pgo-data/*.profraw
+        RUSTFLAGS="-Cprofile-use=/tmp/pgo-data/merged.profdata" \
+            uv run maturin develop --release
+    elif ls /tmp/pgo-data/*.profraw | wc -l | grep -q "^1$"; then
+        # Single raw file: use it directly
+        raw_file=$(ls /tmp/pgo-data/*.profraw | head -n1)
+        echo "🔧 Using single profile file: $(basename "$raw_file")"
+        RUSTFLAGS="-Cprofile-use=$raw_file" \
+            uv run maturin develop --release
+    else
+        # Multiple raw files: suppress warnings and use directory
+        echo "🔧 Using raw profile directory (warnings suppressed)..."
+        RUSTFLAGS="-Cprofile-use=/tmp/pgo-data -Cllvm-args=-pgo-warn-missing-function=false" \
+            uv run maturin develop --release 2>/dev/null || \
+        RUSTFLAGS="-Cprofile-use=/tmp/pgo-data" \
+            uv run maturin develop --release
+    fi
+
+    # Clean up profile data
+    rm -rf /tmp/pgo-data
+
+    echo "✅ PGO build complete!"

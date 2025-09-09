@@ -12,7 +12,9 @@ nav:
   - Rust engine: design/engine.md
   - Python API: design/interface.md
   - Roadmap: design/roadmap.md
-- API reference: api/index.md
+- API reference: 
+  - Core: api/index.md
+  - Generators: api/generators.md
 - Contributing: contributing.md
 
 theme:
@@ -82,9 +84,6 @@ plugins:
       default_handler: python
       handlers:
         python:
-          inventories:
-          - https://docs.python.org/3/objects.inv
-          - https://typing-extensions.readthedocs.io/en/latest/objects.inv
           paths: [src]
           options:
             docstring_style: google

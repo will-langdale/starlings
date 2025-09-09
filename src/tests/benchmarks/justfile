@@ -1,0 +1,21 @@
+set working-directory := "../../.."
+
+# Environment variables
+set export
+STARLINGS_DEBUG := "1"
+
+# List all commands
+list:
+    just -f ./src/tests/benchmarks/justfile --list
+
+# Benchmarks for Rust
+rust:
+    cargo bench -p starlings-core
+
+# Benchmarks for end-to-end processing
+collection N="1":
+    uv run python src/tests/benchmarks/test_bench_collections.py {{N}}
+
+# Randomised benchmarks for PGO training (prevents overfitting)
+pgo:
+    uv run python src/tests/benchmarks/test_pgo_training.py

@@ -34,6 +34,8 @@ jobs:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     needs: update-version
+    env:
+      STARLINGS_SAFETY_LEVEL: performance
     strategy:
       fail-fast: false
       matrix:
@@ -64,8 +66,8 @@ jobs:
     - name: Install dependencies
       run: just install
     
-    - name: Build project
-      run: just build
+    - name: Build project with PGO
+      run: just build pgo
     
     - name: Install cibuildwheel
       run: uv tool install cibuildwheel
@@ -89,6 +91,8 @@ jobs:
     name: Build source distribution
     runs-on: ubuntu-latest
     needs: update-version
+    env:
+      STARLINGS_SAFETY_LEVEL: performance
     
     steps:
     - uses: actions/checkout@v5
@@ -115,8 +119,8 @@ jobs:
     - name: Install dependencies
       run: just install
     
-    - name: Build project
-      run: just build
+    - name: Build project with PGO
+      run: just build pgo
     
     - name: Install maturin
       run: uv tool install maturin
@@ -133,6 +137,8 @@ jobs:
   build-docs:
     name: Build documentation
     runs-on: ubuntu-latest
+    env:
+      STARLINGS_SAFETY_LEVEL: performance
     steps:
       - uses: actions/checkout@v5
         with:
@@ -149,8 +155,8 @@ jobs:
       - name: Install dependencies
         run: just install
       
-      - name: Build project
-        run: just build
+      - name: Build project with PGO
+        run: just build pgo
       
       - name: Build with MkDocs
         run: uv run mkdocs build
