@@ -15,7 +15,7 @@ list:
 # Run Python tests (safe tests + e2e safety validation)
 python:
     @echo "Running Python tests (unit tests + e2e safety validation)..."
-    STARLINGS_DEBUG=1 STARLINGS_SAFETY_LEVEL=conservative uv run pytest -m "not stress and not safety and not benchmark and not integration and not performance"
+    STARLINGS_DEBUG=1 STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest -m "not stress and not safety and not benchmark and not integration and not performance"
 
 # Run only Rust tests
 rust:
@@ -25,12 +25,12 @@ rust:
 # Run safety tests (circuit breaker, resource limits)
 safety:
     @echo "Running safety mechanism tests..."
-    STARLINGS_SAFETY_LEVEL=conservative uv run pytest src/tests/test_safety.py -v -m safety
+    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/test_safety.py -v -m safety
 
 # Run stress tests (resource pressure, concurrent operations)  
 stress:
     @echo "Running stress tests..."
-    STARLINGS_SAFETY_LEVEL=conservative uv run pytest src/tests/test_stress.py -v -m stress
+    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/test_stress.py -v -m stress
 
 # Run all safety-related tests
 safety-all: safety stress
@@ -45,7 +45,7 @@ performance:
 e2e:
     @echo "Running end-to-end tests (large datasets)..."
     @echo "⚠️  WARNING: These tests use large datasets and may consume significant resources"
-    STARLINGS_SAFETY_LEVEL=conservative uv run pytest src/tests/e2e/ -v -m e2e
+    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/e2e/ -v -m e2e
 
 # Run all dangerous tests (stress, safety, e2e)
 dangerous: safety stress e2e
