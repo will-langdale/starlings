@@ -135,12 +135,10 @@ impl PartitionHierarchy {
 
         let num_records = context.len();
 
-        // Determine storage strategy based on ResourceMonitor from DataContext
+        // Determine storage strategy based on global ResourceMonitor
         let storage: Box<dyn HierarchyStorage + Send + Sync> = {
-            match context
-                .resource_monitor
-                .determine_processing_strategy(num_records)
-            {
+            use crate::core::safety::global_resource_monitor;
+            match global_resource_monitor().determine_processing_strategy(num_records) {
                 ProcessingStrategy::InMemory { .. } => Box::new(InMemoryStorage::new()),
                 ProcessingStrategy::MemoryAware {
                     spill_threshold_mb, ..
@@ -225,9 +223,10 @@ impl PartitionHierarchy {
         let union_find_time = union_find_start.elapsed();
 
         // Reuse the bitmap pool from temporary instance for efficiency
-        // Calculate adaptive cache size based on available memory from DataContext
+        // Calculate adaptive cache size based on available memory from global monitor
         let cache_size = {
-            let usage = context.resource_monitor.get_usage();
+            use crate::core::safety::global_resource_monitor;
+            let usage = global_resource_monitor().get_usage();
             // 1 cache entry per 100MB available memory, bounded between 5 and 100
             (usage.memory_available_mb / 100).clamp(5, 100) as usize
         };

@@ -34,7 +34,7 @@ Example:
 
     # Get partition at specific threshold
     partition = collection.at(0.8)
-    print(f"Entities: {len(partition.entities)}")
+    # partition.entities contains the entity IDs at this threshold
     ```
 """
 
@@ -65,19 +65,32 @@ def generate_entity_resolution_edges(
 ) -> list[tuple[int, int, float]]:
     """Generate entity resolution edges using the unified constructive algorithm.
 
+    ⚠️  **Memory Warning**: This function pre-allocates ~n*5 edges in memory
+    (approximately n*750 bytes). Large values of n may be rejected by the
+    safety system to prevent system crashes.
+
     Creates realistic entity resolution test data following a constructive approach
     that produces exactly n/2 entities at threshold 0.0 through systematic pair
     construction, with realistic hierarchical patterns for benchmarking.
 
+    **Safety**: Respects STARLINGS_SAFETY_LEVEL environment variable:
+    - Conservative (default): Max 50% RAM usage
+    - Performance: Max 85% RAM usage
+
     Args:
-        n: Target number of entities for sizing (algorithm uses effective_n where
-            effective_n = n if n is even, n-1 if n is odd)
+        n: Target number of entities for sizing. Large values (>1M) may require
+           STARLINGS_SAFETY_LEVEL=performance or more system memory.
+           Algorithm uses effective_n where effective_n = n if n is even, n-1 if
+           n is odd.
         num_thresholds: If provided, snap thresholds to discrete values;
             if None, add continuous jitter for PGO training diversity
 
     Returns:
         List of (entity_id1, entity_id2, threshold) tuples with entity IDs as integers
         and thresholds between 0.0 and 1.0
+
+    Raises:
+        MemoryError: If estimated memory usage exceeds safety limits
 
     Algorithm:
         Implements the 5-step constructive approach:
@@ -99,6 +112,12 @@ def generate_entity_resolution_edges(
 
         # Generate dataset with discrete thresholds for testing
         edges = generate_entity_resolution_edges(100_000, num_thresholds=10)
+
+        # For large datasets, you may need performance mode
+        import os
+
+        os.environ["STARLINGS_SAFETY_LEVEL"] = "performance"
+        edges = generate_entity_resolution_edges(5_000_000)  # 5M entities
         ```
     """
     result = _generate_entity_resolution_edges(n, num_thresholds)
@@ -125,12 +144,12 @@ class Partition:
         partition = collection.at(0.8)
         entities = partition.entities
         # [[0, 1, 2], [3, 4], [5]]  # 3 entities
-        print(f"Found {partition.num_entities} entities")
+        # Access entity count: partition.num_entities
         ```
     """
 
     def __init__(self, _partition: PyPartition) -> None:
-        """Initialize Partition wrapper."""
+        """Initialise Partition wrapper."""
         self._partition = _partition
 
     @property
@@ -162,7 +181,7 @@ class Partition:
         Example:
             ```python
             partition = collection.at(0.8)
-            print(f"Found {partition.num_entities} entities")
+            # Access entity count: partition.num_entities
             ```
         """
         return cast(int, self._partition.num_entities)
@@ -206,12 +225,12 @@ class Collection:
 
         # Get partition at specific threshold
         partition = collection.at(0.8)
-        print(f"Entities: {len(partition.entities)}")
+        # Access entities: len(partition.entities)
         ```
     """
 
     def __init__(self, _collection: PyCollection) -> None:
-        """Initialize Collection wrapper."""
+        """Initialise Collection wrapper."""
         self._collection = _collection
 
     @classmethod
@@ -354,8 +373,9 @@ class Collection:
             partition_low = collection.at(0.5)  # More, smaller entities
             partition_high = collection.at(0.9)  # Fewer, larger entities
 
-            print(f"At 0.5: {len(partition_low.entities)} entities")
-            print(f"At 0.9: {len(partition_high.entities)} entities")
+            # Compare entity counts at different thresholds:
+            # partition_low.entities at threshold 0.5
+            # partition_high.entities at threshold 0.9
             ```
         """
         rust_partition = self._collection.at(threshold)

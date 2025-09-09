@@ -34,7 +34,7 @@ def validate_entity_resolution_data(
 
         edges = starlings.generate_entity_resolution_edges(n=100_000)
         if validate_entity_resolution_data(edges, 100_000):
-            print("✅ Structure correct, scaling up...")
+            logging.info("✅ Structure correct, scaling up...")
         ```
     """
     try:

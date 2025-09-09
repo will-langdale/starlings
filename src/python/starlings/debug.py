@@ -21,7 +21,7 @@ class DebugTimer:
     """Context manager for timing and memory tracking."""
 
     def __init__(self, phase_name: str, debug_enabled: bool = False):
-        """Initialize the debug timer."""
+        """Initialise the debug timer."""
         self.phase_name = phase_name
         self.debug_enabled = debug_enabled
         self.start_time = 0.0

@@ -2,7 +2,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
-use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy};
+use starlings_core::core::ensure_memory_safety;
+use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
 use starlings_core::debug_println;
 use starlings_core::test_utils;
 use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel};
@@ -47,8 +48,21 @@ fn map_storage_error(error: String) -> PyErr {
 }
 
 /// Helper function to map safety errors to Python exceptions
-fn map_safety_error(error: String) -> PyErr {
-    PyErr::new::<pyo3::exceptions::PyMemoryError, _>(error)
+fn map_safety_error(error: SafetyError) -> PyErr {
+    match error {
+        SafetyError::CircuitOpen(msg) => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Circuit breaker tripped: {}", msg),
+        ),
+        SafetyError::InsufficientResources(msg) => {
+            PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
+                "Insufficient resources: {}",
+                msg
+            ))
+        }
+        SafetyError::OperationTooLarge(msg) => {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Operation too large: {}", msg))
+        }
+    }
 }
 
 /// Extract batch size from any processing strategy
@@ -200,16 +214,34 @@ impl PyCollection {
 
         let source_name = source.unwrap_or_else(|| "default".to_string());
 
+        // Pre-flight safety check using global safety system
+        let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
+        let estimated_mb = (edges.len() * 750) / (1024 * 1024); // 750 bytes per edge estimate
+
+        // Global safety check replaces context.resource_monitor
+        ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
+
         // Pre-calculate capacity based on edge count (assume ~70% unique records)
         let estimated_records = (edges.len() * 14) / 10; // 1.4x edges for safety
         let context = DataContext::with_capacity(estimated_records);
 
-        // Automatically determine the best processing strategy based on dataset size and system resources
-        let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
-        let strategy = context
-            .resource_monitor
-            .check_operation_safety(num_entities)
-            .map_err(map_safety_error)?;
+        // Determine processing strategy based on dataset size and system resources
+        use starlings_core::core::safety::global_resource_monitor;
+        let strategy = global_resource_monitor().determine_processing_strategy(num_entities);
+
+        // Handle insufficient resources case
+        if let ProcessingStrategy::Insufficient {
+            required_memory_mb,
+            available_memory_mb,
+            ..
+        } = &strategy
+        {
+            return Err(PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
+                "Insufficient system resources for {} entities. Need ~{}MB memory, have {}MB available. \
+                 Try: 1) Smaller dataset, 2) Free system memory, 3) Set STARLINGS_SAFETY_LEVEL=performance",
+                num_entities, required_memory_mb, available_memory_mb
+            )));
+        }
 
         // Create progress callback wrapper for Rust use
         let progress_callback: Option<ProgressCallback> =
@@ -273,15 +305,27 @@ impl PyCollection {
         let batch_size = extract_batch_size(&strategy);
 
         // Get adaptive limits for current conditions
-        let adaptive_limits = context.resource_monitor.get_adaptive_limits(batch_size);
+        let adaptive_limits = global_resource_monitor().get_adaptive_limits(batch_size);
 
         // Show resource warnings if present
         report_resource_warnings(&adaptive_limits, &progress_callback);
 
         let key_to_id_mutex = Mutex::new(key_to_id);
 
-        // Helper closure for batch processing
+        // Helper closure for batch processing with safety checks
         let process_batch = |batch: &[Key]| {
+            // Check circuit breaker before each batch
+            if global_resource_monitor().is_circuit_open() {
+                eprintln!("⚠️  Circuit breaker open - aborting batch processing");
+                return;
+            }
+
+            // Apply throttling if needed
+            let throttle_delay = global_resource_monitor().throttle_if_needed();
+            if throttle_delay.as_millis() > 0 {
+                std::thread::sleep(throttle_delay);
+            }
+
             let ids = context.ensure_records_batch(&source_name, batch);
             let mut local_map = FxHashMap::default();
             for (key, id) in batch.iter().zip(ids.iter()) {
@@ -507,6 +551,10 @@ fn generate_entity_resolution_edges(
     batch_size: usize,
     _py: Python<'_>,
 ) -> PyResult<EdgeGenerator> {
+    // CRITICAL FIX: Add pre-flight safety check BEFORE generating edges
+    let estimated_mb = (n * 5 * 150) / (1024 * 1024); // n entities * 5 edges * 150 bytes per edge
+    ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
+
     let edges = test_utils::generate_entity_resolution_edges(n, num_thresholds);
 
     let python_edges: Vec<(i64, i64, f64)> = edges
@@ -548,7 +596,7 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
 /// Python module definition
 #[pymodule]
 fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Configure rayon thread pool to be a better system neighbor
+    // Configure rayon thread pool to be a better system neighbour
     // Leave 2 cores free for system tasks (or 1 on small systems)
     let num_cpus = num_cpus::get();
     let thread_count = if num_cpus <= 4 {
@@ -559,7 +607,7 @@ fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
         (num_cpus - 2).max(1)
     };
 
-    // Initialize the global thread pool once at module import
+    // Initialise the global thread pool once at module import
     rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .thread_name(|i| format!("starlings-{}", i))

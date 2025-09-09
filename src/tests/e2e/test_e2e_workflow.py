@@ -3,11 +3,13 @@
 import logging
 import time
 
+import pytest
 import starlings as sl
 
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.e2e
 def test_user_eda_workflow():
     """Production-scale EDA workflow: Million-record minimum scale for library."""
     # Million-scale is the MINIMUM expected dataset size for production use

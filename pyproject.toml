@@ -65,8 +65,13 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
+    "safety: marks tests as safety mechanism tests",
+    "stress: marks tests as stress/load tests", 
+    "performance: marks tests as performance impact tests",
+    "integration: marks tests as integration tests",
+    "e2e: marks tests as end-to-end validation tests",
+    "slow: marks tests as slow-running tests",
 ]
 addopts = "-m 'not benchmark'"
 log_cli = true

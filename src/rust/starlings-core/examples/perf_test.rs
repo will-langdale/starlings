@@ -42,7 +42,7 @@ fn generate_entity_resolution_test_edges(
         generation_time
     );
 
-    // Analyze threshold distribution
+    // Analyse threshold distribution
     let mut unique_thresholds = std::collections::BTreeSet::new();
     for (_, _, threshold) in &edges {
         unique_thresholds.insert((*threshold * 1000000.0) as i64);

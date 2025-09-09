@@ -76,7 +76,7 @@ impl MmapBackend {
         // Memory map the file
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
 
-        // Initialize each element as its own parent with rank 0
+        // Initialise each element as its own parent with rank 0
         for i in 0..size {
             let offset = i * 5;
             // Write parent (u32, little endian)

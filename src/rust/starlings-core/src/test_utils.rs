@@ -527,7 +527,7 @@ mod tests {
         let n = 100;
         let edges = generate_entity_resolution_edges(n, Some(10));
 
-        // Analyze which entities have high-threshold connections (>0.9)
+        // Analyse which entities have high-threshold connections (>0.9)
         let mut high_threshold_entities = HashSet::new();
         for (e1, e2, threshold) in &edges {
             if *threshold > 0.9 {

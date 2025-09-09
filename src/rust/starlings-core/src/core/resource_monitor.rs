@@ -1,8 +1,85 @@
+use std::env;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
-/// Resource monitoring and adaptive processing limits
+/// Circuit breaker states for resource safety
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CircuitState {
+    Closed,   // Normal operation
+    Open,     // System unhealthy, reject operations
+    HalfOpen, // Testing if system recovered
+}
+
+/// Safety levels for resource usage
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SafetyLevel {
+    /// Conservative: Use max 50% of available resources
+    Conservative,
+    /// Balanced: Use max 70% of available resources  
+    Balanced,
+    /// Performance: Use max 85% of available resources
+    Performance,
+    /// Unsafe: Use max 95% (requires STARLINGS_UNSAFE=1)
+    Unsafe,
+}
+
+impl SafetyLevel {
+    fn memory_threshold(&self) -> f64 {
+        match self {
+            SafetyLevel::Conservative => 0.50,
+            SafetyLevel::Balanced => 0.70,
+            SafetyLevel::Performance => 0.85,
+            SafetyLevel::Unsafe => 0.95,
+        }
+    }
+
+    fn max_operation_fraction(&self) -> f64 {
+        match self {
+            SafetyLevel::Conservative => 0.20, // Max 20% for single op
+            SafetyLevel::Balanced => 0.35,
+            SafetyLevel::Performance => 0.50,
+            SafetyLevel::Unsafe => 0.80,
+        }
+    }
+}
+
+/// Errors that can occur during safety checks
+#[derive(Debug, Clone)]
+pub enum SafetyError {
+    CircuitOpen(String),
+    InsufficientResources(String),
+    OperationTooLarge(String),
+}
+
+impl std::fmt::Display for SafetyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SafetyError::CircuitOpen(msg) => write!(f, "Circuit breaker tripped: {}", msg),
+            SafetyError::InsufficientResources(msg) => write!(f, "Insufficient resources: {}", msg),
+            SafetyError::OperationTooLarge(msg) => write!(f, "Operation too large: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for SafetyError {}
+
+/// Permit for resource-intensive operations
+#[derive(Debug)]
+pub struct OperationPermit {
+    _permit_id: u64,
+}
+
+impl OperationPermit {
+    fn new(permit_id: u64) -> Self {
+        Self {
+            _permit_id: permit_id,
+        }
+    }
+}
+
+/// Resource monitoring and adaptive processing limits with circuit breaker
 #[derive(Debug, Clone)]
 pub struct ResourceMonitor {
     system: Arc<Mutex<System>>,
@@ -10,6 +87,15 @@ pub struct ResourceMonitor {
     refresh_interval: Duration,
     memory_limit_mb: Option<u64>,
     cpu_limit_percent: f32,
+
+    // Circuit breaker state
+    circuit_state: Arc<Mutex<CircuitState>>,
+    last_healthy_time: Arc<Mutex<Instant>>,
+    consecutive_failures: Arc<AtomicU32>,
+    safety_level: SafetyLevel,
+
+    // Operation tracking
+    operation_counter: Arc<AtomicU32>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +238,12 @@ impl ResourceMonitor {
     /// Create a new resource monitor with automatic memory detection
     #[must_use]
     pub fn new() -> Self {
+        Self::with_safety_level(SafetyLevel::Conservative)
+    }
+
+    /// Create resource monitor with specific safety level
+    #[must_use]
+    pub fn with_safety_level(safety_level: SafetyLevel) -> Self {
         let refresh_kind = RefreshKind::new()
             .with_cpu(CpuRefreshKind::everything())
             .with_memory(MemoryRefreshKind::everything());
@@ -163,8 +255,31 @@ impl ResourceMonitor {
             last_refresh: Arc::new(Mutex::new(Instant::now())),
             refresh_interval: Duration::from_secs(1),
             memory_limit_mb: None,
-            cpu_limit_percent: 80.0, // Lowered to be a better neighbor
+            cpu_limit_percent: 80.0, // Lowered to be a better neighbour
+
+            // Circuit breaker state
+            circuit_state: Arc::new(Mutex::new(CircuitState::Closed)),
+            last_healthy_time: Arc::new(Mutex::new(Instant::now())),
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+            safety_level,
+
+            // Operation tracking
+            operation_counter: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Create resource monitor from environment variables
+    #[must_use]
+    pub fn from_env() -> Self {
+        let safety_level = match env::var("STARLINGS_SAFETY_LEVEL").as_deref() {
+            Ok("conservative") => SafetyLevel::Conservative,
+            Ok("balanced") => SafetyLevel::Balanced,
+            Ok("performance") => SafetyLevel::Performance,
+            Ok("unsafe") if env::var("STARLINGS_UNSAFE").is_ok() => SafetyLevel::Unsafe,
+            _ => SafetyLevel::Conservative, // Default to safe
+        };
+
+        Self::with_safety_level(safety_level)
     }
 
     /// Create with explicit memory limit (following Polars pattern)
@@ -184,13 +299,13 @@ impl ResourceMonitor {
         self.refresh_if_needed();
 
         let system = self.system.lock().unwrap();
-        let total_kb = system.total_memory();
-        let available_kb = system.available_memory();
-        let used_kb = total_kb - available_kb;
+        let total_bytes = system.total_memory();
+        let available_bytes = system.available_memory();
+        let used_bytes = total_bytes - available_bytes;
 
-        let total_memory_mb = total_kb / 1024;
-        let available_memory_mb = available_kb / 1024;
-        let used_memory_mb = used_kb / 1024;
+        let total_memory_mb = total_bytes / (1024 * 1024);
+        let available_memory_mb = available_bytes / (1024 * 1024);
+        let used_memory_mb = used_bytes / (1024 * 1024);
 
         let memory_percent = if total_memory_mb > 0 {
             // Use f64 for better precision in percentage calculations
@@ -529,6 +644,150 @@ impl ResourceMonitor {
         };
 
         (base_delay as f64 * memory_factor).round() as u64
+    }
+
+    // === Circuit Breaker Methods ===
+
+    /// Pre-flight check - MUST be called before any large operation
+    pub fn can_proceed(&self, estimated_mb: u64) -> Result<OperationPermit, SafetyError> {
+        // Check circuit state
+        if self.is_circuit_open() {
+            return Err(SafetyError::CircuitOpen("System under stress".to_string()));
+        }
+
+        // Check system health - PROPORTIONAL thresholds
+        let usage = self.get_usage();
+        let safety_threshold = self.safety_level.memory_threshold() * 100.0;
+
+        if usage.memory_percent > safety_threshold as f32 {
+            self.trip_circuit(&format!(
+                "Memory pressure too high: {:.1}%",
+                usage.memory_percent
+            ));
+            return Err(SafetyError::InsufficientResources(format!(
+                "Memory usage {:.1}% exceeds safety threshold {:.1}%",
+                usage.memory_percent, safety_threshold
+            )));
+        }
+
+        // Check if operation would exceed safety margins (PROPORTIONAL)
+        let max_operation_fraction = self.safety_level.max_operation_fraction();
+        let max_allowed_mb = (usage.memory_available_mb as f64 * max_operation_fraction) as u64;
+
+        if estimated_mb > max_allowed_mb {
+            return Err(SafetyError::OperationTooLarge(format!(
+                "Operation requires ~{}MB but safety limit is {}MB ({}% of available {}MB). \
+                 Try: 1) Smaller dataset, 2) Free memory, 3) Set STARLINGS_SAFETY_LEVEL=performance",
+                estimated_mb, max_allowed_mb,
+                (max_operation_fraction * 100.0) as u32,
+                usage.memory_available_mb
+            )));
+        }
+
+        // Generate permit ID and return permit
+        let permit_id = self.operation_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        Ok(OperationPermit::new(permit_id))
+    }
+
+    /// Rate limiting proportional to system pressure
+    pub fn throttle_if_needed(&self) -> Duration {
+        let usage = self.get_usage();
+        // Proportional delays based on pressure
+        let memory_pressure = usage.memory_percent / 100.0;
+        let cpu_pressure = usage.cpu_percent / 100.0;
+
+        let max_pressure = memory_pressure.max(cpu_pressure);
+
+        // Exponential backoff based on pressure
+        let delay_ms = match max_pressure {
+            p if p > 0.95 => 2000,
+            p if p > 0.90 => 1000,
+            p if p > 0.85 => 500,
+            p if p > 0.80 => 200,
+            p if p > 0.75 => 100,
+            p if p > 0.70 => 50,
+            _ => 0,
+        };
+
+        Duration::from_millis(delay_ms)
+    }
+
+    /// Get safe parallelism based on system state
+    pub fn get_safe_parallelism(&self) -> usize {
+        let usage = self.get_usage();
+        let total_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        // Proportional reduction based on memory pressure
+        let memory_factor = 1.0 - (usage.memory_percent as f64 / 100.0).powf(2.0);
+        (total_cores as f64 * memory_factor).max(1.0) as usize
+    }
+
+    /// Get max batch size based on available memory
+    pub fn get_max_batch_size(&self) -> usize {
+        let usage = self.get_usage();
+
+        // Base calculation: 1% of available memory worth of entities
+        // Assuming ~150 bytes per edge, 5 edges per entity
+        let bytes_per_entity = 750;
+        let one_percent_entities = (usage.memory_available_mb * 1024 * 10) / bytes_per_entity;
+
+        // Apply safety factor based on current pressure
+        let pressure_factor = (1.0 - usage.memory_percent as f64 / 100.0).max(0.1);
+
+        ((one_percent_entities as f64) * pressure_factor).max(100.0) as usize
+    }
+
+    /// Check if circuit is open (system under stress)
+    pub fn is_circuit_open(&self) -> bool {
+        matches!(*self.circuit_state.lock().unwrap(), CircuitState::Open)
+    }
+
+    /// Trip the circuit breaker
+    fn trip_circuit(&self, reason: &str) {
+        *self.circuit_state.lock().unwrap() = CircuitState::Open;
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        eprintln!("🚨 Circuit breaker tripped: {}", reason);
+    }
+
+    /// Reset circuit if system has recovered
+    pub fn reset_circuit_if_healthy(&self) {
+        let usage = self.get_usage();
+        let threshold = self.safety_level.memory_threshold() * 100.0;
+
+        if usage.memory_percent < (threshold * 0.8) as f32 {
+            // 80% of threshold for hysteresis
+            let mut state = self.circuit_state.lock().unwrap();
+            match *state {
+                CircuitState::Open => {
+                    *state = CircuitState::HalfOpen;
+                    eprintln!("🔄 Circuit breaker half-open - testing recovery");
+                }
+                CircuitState::HalfOpen => {
+                    *state = CircuitState::Closed;
+                    self.consecutive_failures.store(0, Ordering::Relaxed);
+                    *self.last_healthy_time.lock().unwrap() = Instant::now();
+                    eprintln!("✅ Circuit breaker closed - system recovered");
+                }
+                CircuitState::Closed => {} // Already healthy
+            }
+        }
+    }
+
+    /// Get current safety level
+    pub fn safety_level(&self) -> SafetyLevel {
+        self.safety_level
+    }
+
+    /// Get safety threshold for memory usage
+    pub fn get_safety_threshold(&self) -> f64 {
+        self.safety_level.memory_threshold()
+    }
+
+    /// Get maximum fraction of memory allowed for single operation
+    pub fn max_operation_fraction(&self) -> f64 {
+        self.safety_level.max_operation_fraction()
     }
 }
 

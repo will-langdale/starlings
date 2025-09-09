@@ -1,6 +1,5 @@
 use crate::core::key::Key;
 use crate::core::record::InternedRecord;
-use crate::core::resource_monitor::ResourceMonitor;
 use boxcar::Vec as BoxcarVec;
 use dashmap::DashMap;
 use lasso::{Capacity, Key as LassoKey, ThreadedRodeo};
@@ -19,7 +18,6 @@ pub struct DataContext {
     pub source_interner: Arc<ThreadedRodeo>,
     pub identity_map: FxDashMap<InternedRecord, u32>,
     pub source_index: FxDashMap<u32, RoaringBitmap>,
-    pub resource_monitor: Arc<ResourceMonitor>,
     next_record_id: AtomicU32,
 }
 
@@ -55,7 +53,6 @@ impl DataContext {
             source_interner: Arc::new(ThreadedRodeo::with_capacity(interner_capacity)),
             identity_map: DashMap::with_capacity_and_hasher(estimated_records, hasher.clone()),
             source_index: DashMap::with_hasher(hasher),
-            resource_monitor: Arc::new(ResourceMonitor::new()),
             next_record_id: AtomicU32::new(0),
         }
     }
@@ -188,21 +185,24 @@ impl DataContext {
     /// # Errors
     /// Returns an error if the operation would exceed available system resources
     pub fn check_operation_safety(&self, estimated_records: usize) -> Result<(), String> {
-        self.resource_monitor
+        use crate::core::safety::global_resource_monitor;
+        global_resource_monitor()
             .check_operation_safety(estimated_records)
             .map(|_| ())
     }
 
     /// Check current memory pressure and return true if we should throttle
     pub fn should_throttle(&self) -> bool {
-        let usage = self.resource_monitor.get_usage();
+        use crate::core::safety::global_resource_monitor;
+        let usage = global_resource_monitor().get_usage();
         usage.is_memory_pressure || usage.is_cpu_pressure
     }
 
     /// Wait for resources if under pressure, with exponential backoff
     pub fn wait_for_resources(&self) {
         if self.should_throttle() {
-            let limits = self.resource_monitor.get_adaptive_limits(1000);
+            use crate::core::safety::global_resource_monitor;
+            let limits = global_resource_monitor().get_adaptive_limits(1000);
             if limits.delay_between_batches_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(
                     limits.delay_between_batches_ms,
@@ -213,7 +213,8 @@ impl DataContext {
 
     /// Get adaptive batch size for current resource conditions
     pub fn get_adaptive_batch_size(&self, default_size: usize) -> usize {
-        let limits = self.resource_monitor.get_adaptive_limits(default_size);
+        use crate::core::safety::global_resource_monitor;
+        let limits = global_resource_monitor().get_adaptive_limits(default_size);
         limits.batch_size
     }
 

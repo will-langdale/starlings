@@ -81,21 +81,30 @@ This project uses `just` as a command runner with a modular structure and `uv` f
 
 ## Testing strategy
 
-The project uses a **two-layer testing approach** that achieves comprehensive coverage without PyO3 linking complications:
+The project uses a **three-layer testing approach** that achieves comprehensive coverage whilst maintaining system safety:
 
-**Layer 1: Pure Rust core tests** (33 tests)
+**Layer 1: Pure Rust core tests** (69 tests)
 - All business logic tested in `starlings-core` crate
 - Zero PyO3 dependencies, no linking issues
 - Full coverage of data structures, algorithms, and edge cases
 - Run via: `cargo test -p starlings-core`
 
-**Layer 2: Python integration tests** (17 tests)
-- End-to-end testing of Python → Rust → Python data flow
+**Layer 2: Python integration tests** (19 tests)
+- Unit tests with small datasets (< 1000 entities) for basic functionality 
+- E2E tests with production-scale datasets (100k-1M entities) for safety validation
 - Tests PyO3 wrapper functionality, type conversions, error handling
-- Validates real-world usage patterns and API contracts
-- Run via: `uv run pytest`
+- **SAFE**: All tests run with `STARLINGS_SAFETY_LEVEL=conservative`
+- Run via: `just test` (safe by default with production validation)
+
+**Layer 3: Stress testing** (12+ tests)  
+- Memory pressure simulation, resource exhaustion scenarios
+- Circuit breaker validation under artificial system stress
+- **DANGEROUS**: Artificially consumes system resources to test limits
+- Run via: `just test dangerous` (explicit opt-in required)
 
 This **"Rust Core with Python Bindings"** pattern ensures complete test coverage whilst avoiding complex PyO3 test configuration. The Rust core handles all business logic testing, whilst Python tests validate the integration boundary.
+
+**Safety by Default**: The default `just test` command runs safe tests including production-scale validation that demonstrate the safety system working correctly. The safety system automatically prevents system crashes during large-scale operations. Only stress tests that artificially exhaust system resources require explicit opt-in via `just test dangerous`.
 
 ### Benchmarking and performance
 
@@ -124,6 +133,13 @@ There is a house style for parameterising Python unit tests:
 def test_something(foo: bool, bar: int):
     """Tests that something does something."""
 ```
+
+**Code Quality Standards**:
+- All code follows British English spelling and conventions
+- Comprehensive type annotations and docstrings following Google style
+- DRY principles with extracted helper methods for common patterns
+- Context managers for resource management (environment variables, etc.)
+- Consistent error handling and validation patterns
 
 ## Development workflow
 

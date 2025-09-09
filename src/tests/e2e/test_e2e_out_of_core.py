@@ -6,11 +6,13 @@ automatic resource management, disk spilling, and memory-bounded reconstruction.
 
 import logging
 
+import pytest
 import starlings as sl
 
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.e2e
 class TestEndToEndOutOfCore:
     """End-to-end validation of complete out-of-core processing system."""
 
