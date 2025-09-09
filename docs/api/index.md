@@ -14,3 +14,4 @@
             - "!^[A-Z]$"  # Excludes single-letter uppercase variables (like T, P, R)
             - "!^_"       # Excludes private attributes
             - "!^starlings$"  # Excludes the PyO3 module function
+            - "!^generators$"  # Has its own dedicated page

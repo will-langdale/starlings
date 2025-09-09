@@ -41,13 +41,13 @@ Example:
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 from importlib.metadata import version  # noqa: PLC0415
 from typing import Any, cast
 
 from tqdm import tqdm
 
+from .config import DEBUG_ENABLED
 from .starlings import Collection as PyCollection
 from .starlings import Partition as PyPartition
 from .starlings import (
@@ -57,7 +57,7 @@ from .starlings import (
 logger = logging.getLogger(__name__)
 
 # Load debug flag once at module import time
-_DEBUG_ENABLED = os.getenv("STARLINGS_DEBUG", "").lower() in ("1", "true", "on")
+_DEBUG_ENABLED = DEBUG_ENABLED
 
 
 def generate_entity_resolution_edges(
@@ -79,9 +79,9 @@ def generate_entity_resolution_edges(
 
     Args:
         n: Target number of entities for sizing. Large values (>1M) may require
-           STARLINGS_SAFETY_LEVEL=performance or more system memory.
-           Algorithm uses effective_n where effective_n = n if n is even, n-1 if
-           n is odd.
+            STARLINGS_SAFETY_LEVEL=performance or more system memory.
+            Algorithm uses effective_n where effective_n = n if n is even, n-1 if
+            n is odd.
         num_thresholds: If provided, snap thresholds to discrete values;
             if None, add continuous jitter for PGO training diversity
 
