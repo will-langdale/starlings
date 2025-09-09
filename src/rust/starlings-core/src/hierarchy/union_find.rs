@@ -371,7 +371,7 @@ mod tests {
 
         // Should have approximately N/2 components
         let components = uf.get_all_components();
-        assert_eq!(components.len(), (N + 1) / 2);
+        assert_eq!(components.len(), N.div_ceil(2));
     }
 
     #[test]
