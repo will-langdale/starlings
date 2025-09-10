@@ -38,6 +38,16 @@ impl MergeEvent {
             .iter()
             .any(|group| group.contains(record_id))
     }
+
+    /// Get the threshold of this merge event
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// Get the merging groups
+    pub fn merging_groups(&self) -> &[RoaringBitmap] {
+        &self.merging_groups
+    }
 }
 
 #[cfg(test)]

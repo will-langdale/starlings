@@ -49,6 +49,7 @@ from tqdm import tqdm
 
 from .config import DEBUG_ENABLED
 from .starlings import Collection as PyCollection
+from .starlings import EntityFrame as PyEntityFrame
 from .starlings import Partition as PyPartition
 from .starlings import (
     generate_entity_resolution_edges as _generate_entity_resolution_edges,
@@ -381,6 +382,181 @@ class Collection:
         rust_partition = self._collection.at(threshold)
         return Partition(rust_partition)
 
+    def copy(self) -> Collection:
+        """Create a deep copy of this collection with independent context.
+
+        Creates a new collection that is completely independent of the original,
+        allowing modifications without affecting the original collection.
+
+        Returns:
+            Collection: A new independent collection with the same data.
+
+        Example:
+            ```python
+            original = Collection.from_edges(edges)
+            independent_copy = original.copy()
+            # independent_copy can be modified without affecting original
+            ```
+        """
+        # Both views and regular collections use the same copy mechanism
+        rust_copy = self._collection.copy()
+        return Collection(rust_copy)
+
+    def is_view(self) -> bool:
+        """Check if this collection is an immutable view from a frame.
+
+        Collections retrieved from EntityFrame are views and cannot be modified.
+        Use copy() to create a mutable independent collection.
+
+        Returns:
+            bool: True if this is a view, False if it's an owned collection.
+
+        Example:
+            ```python
+            frame = EntityFrame()
+            frame.add_collection("test", collection)
+            view = frame["test"]  # This is a view
+            assert view.is_view() == True
+            independent = view.copy()
+            assert independent.is_view() == False
+            ```
+        """
+        return bool(self._collection.is_view())
+
     def __repr__(self) -> str:
         """String representation for debugging."""
         return "Collection"
+
+
+class EntityFrame:
+    """Multi-collection container for managing multiple hierarchies with shared memory.
+
+    An EntityFrame allows you to store and manage multiple Collections in a single
+    container. Collections that share the same underlying data can share memory
+    efficiently.
+
+    Collections that share the same underlying data context will automatically
+    share memory for efficient storage and processing.
+
+    Example:
+        ```python
+        # Create an empty frame
+        frame = EntityFrame()
+
+        # Check collection names
+        assert frame.collection_names() == []
+        assert len(frame) == 0
+
+        # Add collections to frame
+        edges = [("a", "b", 0.9), ("b", "c", 0.8)]
+        collection = Collection.from_edges(edges)
+        frame.add_collection("dataset", collection)
+
+        # Access collections as views
+        view = frame["dataset"]
+        assert view.is_view()
+        ```
+    """
+
+    def __init__(self) -> None:
+        """Create a new empty EntityFrame."""
+        self._frame = PyEntityFrame()
+
+    def add_collection(self, name: str, collection: Collection) -> None:
+        """Add a collection to the frame.
+
+        The collection will be cloned and integrated into the frame's shared
+        memory context. Collections with the same underlying data context
+        will share memory efficiently.
+
+        Args:
+            name: Name for the collection
+            collection: Collection to add to the frame
+
+        Raises:
+            RuntimeError: If the collection cannot be added
+
+        Example:
+            ```python
+            frame = EntityFrame()
+            collection = Collection.from_edges(edges)
+            frame.add_collection("my_collection", collection)
+
+            # Access the collection as a view
+            view = frame["my_collection"]
+            assert view.is_view() == True
+            ```
+        """
+        self._frame.add_collection(name, collection._collection)
+
+    def has_collection(self, name: str) -> bool:
+        """Check if a collection exists in the frame.
+
+        Args:
+            name: Name of the collection
+
+        Returns:
+            True if the collection exists, False otherwise
+        """
+        return bool(self._frame.has_collection(name))
+
+    def collection_names(self) -> list[str]:
+        """Get list of all collection names in the frame.
+
+        Returns:
+            List of collection names
+        """
+        return cast(list[str], self._frame.collection_names())
+
+    def remove_collection(self, name: str) -> bool:
+        """Remove a collection from the frame.
+
+        Args:
+            name: Name of the collection to remove
+
+        Returns:
+            True if collection was removed, False if it didn't exist
+        """
+        return bool(self._frame.remove_collection(name))
+
+    def __len__(self) -> int:
+        """Get number of collections in the frame."""
+        return len(self._frame)
+
+    def __contains__(self, name: str) -> bool:
+        """Check if a collection exists using 'in' operator."""
+        return name in self._frame
+
+    def __getitem__(self, name: str) -> Collection:
+        """Get a collection by name using dictionary-style access.
+
+        Returns collections as immutable views. Use copy() to create
+        a mutable independent collection.
+
+        Args:
+            name: Name of the collection
+
+        Returns:
+            Collection: The collection as a view (immutable)
+
+        Raises:
+            KeyError: If collection doesn't exist
+
+        Example:
+            ```python
+            frame = EntityFrame()
+            frame.add_collection("test", collection)
+
+            view = frame["test"]  # Dictionary-style access
+            assert view.is_view() == True
+
+            independent = view.copy()
+            assert independent.is_view() == False
+            ```
+        """
+        rust_collection = self._frame.__getitem__(name)
+        return Collection(rust_collection)
+
+    def __repr__(self) -> str:
+        """String representation for debugging."""
+        return repr(self._frame)

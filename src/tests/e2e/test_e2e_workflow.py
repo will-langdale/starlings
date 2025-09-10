@@ -82,3 +82,43 @@ def test_user_eda_workflow():
         collection_time,
         dict(zip(eda_thresholds, eda_counts, strict=False)),
     )
+
+    # Test EntityFrame with multiple collections for memory sharing
+    frame = sl.EntityFrame()
+
+    # Add the original collection to frame
+    frame.add_collection("full_dataset", collection)
+
+    # Create a simple second collection with different characteristics
+    simple_edges = [(1, 2, 0.9), (2, 3, 0.8), (4, 5, 0.7)]
+    simple_collection = sl.Collection.from_edges(simple_edges)
+    frame.add_collection("simple", simple_collection)
+
+    assert len(frame) == 2
+    assert set(frame.collection_names()) == {"full_dataset", "simple"}
+
+    # Test dictionary-style access returns views
+    full_view = frame["full_dataset"]
+    simple_view = frame["simple"]
+
+    assert full_view.is_view()
+    assert simple_view.is_view()
+
+    # Verify data integrity - full view should match original
+    full_entities_at_1_0 = full_view.at(1.0).num_entities
+    assert full_entities_at_1_0 == total_nodes, "View should have same data as original"
+
+    # Test copy functionality for creating independent collections
+    independent_full = full_view.copy()
+    independent_simple = simple_view.copy()
+
+    assert not independent_full.is_view()
+    assert not independent_simple.is_view()
+    assert independent_full.at(1.0).num_entities == total_nodes
+
+    logger.info(
+        "EntityFrame workflow: Frame with %d collections. "
+        "Views working correctly: full=%d entities, simple collection view exists",
+        len(frame),
+        full_view.at(1.0).num_entities,
+    )

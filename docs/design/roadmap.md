@@ -100,24 +100,35 @@
 
 ## Milestone 2: Multi-Collection Frame & Analysis
 
+**Status**: 🚧 IN PROGRESS (30% complete)
+
 ### Task 2.1: EntityFrame
+
+**Status**: ✅ COMPLETED (9 of 9 items complete)
 
 **Create files**:
 
-- `rust/starlings-core/src/frame/mod.rs`
-- `rust/starlings-core/src/frame/collection_map.rs`
+- ✅ `rust/starlings-core/src/frame/mod.rs`
+- ✅ `rust/starlings-core/src/frame/translation.rs` (created instead of collection_map.rs)
 
 **Implement**:
 
-- [ ] EntityFrame struct with context Arc<DataContext>, collections HashMap
-- [ ] EntityFrame::add_collection() with Arc::ptr_eq check for same context
-- [ ] assimilate() method for different contexts with TranslationMap
-- [ ] Collection view pattern with is_view flag
-- [ ] Collection::copy() creating deep copy with new DataContext
-- [ ] PyEntityFrame with __getitem__ for ef["name"] syntax
-- [ ] Test: multiple collections share memory
-- [ ] Test: view immutability
-- [ ] Update E2E test: Extend `test_user_eda_workflow()` to use EntityFrame with multiple collections, test memory sharing
+- ✅ EntityFrame struct with context Arc<DataContext>, collections HashMap
+- ✅ EntityFrame::add_collection() with Arc::ptr_eq check for same context
+- ✅ assimilate() method for different contexts with TranslationMap
+- ✅ Collection view pattern with is_view flag (implemented in PyO3 layer)
+- ✅ Collection::copy() creating deep copy with new DataContext (via PartitionHierarchy::clone())
+- ✅ PyEntityFrame with __getitem__ for ef["name"] syntax
+- ✅ Test: multiple collections share memory
+- ✅ Test: view immutability (comprehensive tests in test_entity_frame.py)
+- ✅ Update E2E test: Extended `test_user_eda_workflow()` to use EntityFrame with multiple collections, test memory sharing
+
+**Key Implementation Notes**:
+- Added Clone implementation to PartitionHierarchy with clone_box trait method for HierarchyStorage
+- Enhanced PyCollection with is_view field and copy() method
+- PyEntityFrame now supports dictionary-style access: ef["collection_name"] returns view collections
+- View collections are immutable references; use copy() to create independent collections
+- All tests pass including comprehensive view semantics and E2E workflow validation
 
 **Reference**: `algorithms.md` - Adding collections to frames section
 

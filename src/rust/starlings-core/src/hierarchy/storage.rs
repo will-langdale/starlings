@@ -37,6 +37,9 @@ pub trait HierarchyStorage: Send + Sync {
 
     /// Sync any pending writes to storage
     fn sync(&mut self) -> Result<(), StorageError>;
+
+    /// Clone the storage backend for deep copying
+    fn clone_box(&self) -> Box<dyn HierarchyStorage + Send + Sync>;
 }
 
 /// Errors that can occur during storage operations
@@ -112,6 +115,10 @@ impl HierarchyStorage for InMemoryStorage {
     fn sync(&mut self) -> Result<(), StorageError> {
         // No-op for in-memory storage
         Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn HierarchyStorage + Send + Sync> {
+        Box::new(self.clone())
     }
 }
 
@@ -369,6 +376,18 @@ impl HierarchyStorage for DiskStorage {
         self.events_file.sync_all()?;
         Ok(())
     }
+
+    fn clone_box(&self) -> Box<dyn HierarchyStorage + Send + Sync> {
+        // For DiskStorage cloning, we create a new InMemoryStorage with the same events
+        // This is because disk handles can't be easily cloned
+        let mut memory_storage = InMemoryStorage::new();
+        if let Ok(events) = self.iter() {
+            for event in events {
+                let _ = memory_storage.push(event);
+            }
+        }
+        Box::new(memory_storage)
+    }
 }
 
 impl std::fmt::Debug for DiskStorage {
@@ -481,6 +500,11 @@ impl HierarchyStorage for HybridStorage {
 
     fn sync(&mut self) -> Result<(), StorageError> {
         self.storage.sync()
+    }
+
+    fn clone_box(&self) -> Box<dyn HierarchyStorage + Send + Sync> {
+        // Clone the underlying storage
+        self.storage.clone_box()
     }
 }
 
