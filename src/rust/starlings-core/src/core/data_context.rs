@@ -211,6 +211,55 @@ impl DataContext {
         }
     }
 
+    /// Create a deep copy of this DataContext
+    ///
+    /// This is used when creating an owned copy of a collection with its own context.
+    pub fn deep_copy(&self) -> Self {
+        use lasso::Key as LassoKey;
+
+        // Create new interner with same capacity
+        let new_interner = Arc::new(ThreadedRodeo::with_capacity(Capacity::for_strings(
+            self.source_interner.len(),
+        )));
+
+        // Clone all strings from old interner to new
+        // Note: This preserves the same IDs if done in order
+        for i in 0..self.source_interner.len() {
+            let spur = lasso::Spur::try_from_usize(i).unwrap();
+            if let Some(string) = self.source_interner.try_resolve(&spur) {
+                new_interner.get_or_intern(string);
+            }
+        }
+
+        // Create new DataContext with cloned data
+        let record_count = self.len();
+        let mut new_context = DataContext::with_capacity(record_count);
+        new_context.source_interner = new_interner;
+
+        // Copy all records
+        for (_idx, record) in self.records.iter() {
+            new_context.records.push(record.clone());
+        }
+
+        // Rebuild identity map and source index
+        for (idx, record) in new_context.records.iter() {
+            let idx = idx as u32;
+            new_context.identity_map.insert(record.clone(), idx);
+            new_context
+                .source_index
+                .entry(record.source_id())
+                .or_default()
+                .insert(idx);
+        }
+
+        // Set the correct next_record_id
+        new_context
+            .next_record_id
+            .store(self.len() as u32, Ordering::Relaxed);
+
+        new_context
+    }
+
     /// Get adaptive batch size for current resource conditions
     pub fn get_adaptive_batch_size(&self, default_size: usize) -> usize {
         use crate::core::safety::global_resource_monitor;

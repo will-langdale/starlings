@@ -86,10 +86,22 @@ impl ComponentManager<'_> {
 
 /// Hierarchy of merge events that can generate partitions at any threshold
 pub struct PartitionHierarchy {
-    context: Arc<DataContext>,
+    pub context: Arc<DataContext>,
     storage: Box<dyn HierarchyStorage + Send + Sync>,
     partition_cache: LruCache<u32, PartitionLevel>,
     bitmap_pool: BitmapPool,
+}
+
+impl Clone for PartitionHierarchy {
+    fn clone(&self) -> Self {
+        use std::num::NonZeroUsize;
+        PartitionHierarchy {
+            context: self.context.clone(),
+            storage: self.storage.clone_box(),
+            partition_cache: LruCache::new(NonZeroUsize::new(Self::CACHE_SIZE).unwrap()), // Fresh cache for cloned hierarchy
+            bitmap_pool: BitmapPool::new(),
+        }
+    }
 }
 
 impl PartitionHierarchy {
@@ -399,6 +411,31 @@ impl PartitionHierarchy {
     /// Get number of merge events (for testing)
     pub fn merge_events_count(&self) -> usize {
         self.storage.len()
+    }
+
+    /// Get all merge events (for translation/assimilation)
+    pub fn get_merge_events(&self) -> Vec<MergeEvent> {
+        self.storage
+            .iter()
+            .unwrap_or_else(|_| Box::new(std::iter::empty()))
+            .collect()
+    }
+
+    /// Create a hierarchy from pre-existing merge events
+    pub fn from_merge_events(merge_events: Vec<MergeEvent>, context: Arc<DataContext>) -> Self {
+        let mut storage: Box<dyn HierarchyStorage + Send + Sync> = Box::new(InMemoryStorage::new());
+
+        // Add all merge events to storage
+        for event in merge_events {
+            storage.push(event).unwrap();
+        }
+
+        Self {
+            context,
+            storage,
+            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            bitmap_pool: BitmapPool::new(),
+        }
     }
 
     /// Get a partition at a specific threshold

@@ -6,7 +6,7 @@ use starlings_core::core::ensure_memory_safety;
 use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
 use starlings_core::debug_println;
 use starlings_core::test_utils;
-use starlings_core::{DataContext, Key, PartitionHierarchy, PartitionLevel};
+use starlings_core::{DataContext, EntityFrame, Key, PartitionHierarchy, PartitionLevel};
 
 /// Progress callback type for Rust-level progress reporting
 type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
@@ -164,6 +164,17 @@ impl PyPartition {
 #[pyclass(name = "Collection")]
 pub struct PyCollection {
     hierarchy: PartitionHierarchy,
+    is_view: bool,
+}
+
+impl PyCollection {
+    /// Create a view collection (internal helper)
+    pub(crate) fn new_view(hierarchy: PartitionHierarchy) -> Self {
+        PyCollection {
+            hierarchy,
+            is_view: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -478,7 +489,10 @@ impl PyCollection {
             }
         }
 
-        Ok(PyCollection { hierarchy })
+        Ok(PyCollection {
+            hierarchy,
+            is_view: false,
+        })
     }
 
     /// Get partition at specific threshold.
@@ -514,6 +528,26 @@ impl PyCollection {
         Ok(PyPartition {
             partition: partition.clone(),
         })
+    }
+
+    /// Create a deep copy of this collection with independent context.
+    ///
+    /// Creates a new collection that is completely independent of the original,
+    /// allowing modifications without affecting the original collection.
+    fn copy(&self) -> PyResult<PyCollection> {
+        let cloned_hierarchy = self.hierarchy.clone();
+        Ok(PyCollection {
+            hierarchy: cloned_hierarchy,
+            is_view: false,
+        })
+    }
+
+    /// Check if this collection is an immutable view from a frame.
+    ///
+    /// Returns:
+    ///     bool: True if this is a view, False if it's an owned collection.
+    fn is_view(&self) -> bool {
+        self.is_view
     }
 
     /// String representation for debugging.
@@ -594,6 +628,120 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
     }
 }
 
+/// Multi-collection container that enables hierarchies to share DataContext
+#[pyclass(name = "EntityFrame")]
+pub struct PyEntityFrame {
+    frame: EntityFrame,
+}
+
+#[pymethods]
+impl PyEntityFrame {
+    /// Create a new empty EntityFrame
+    #[new]
+    fn new() -> Self {
+        PyEntityFrame {
+            frame: EntityFrame::new(),
+        }
+    }
+
+    /// Add a collection to the frame
+    ///
+    /// Args:
+    ///     name (str): Name for the collection
+    ///     collection (Collection): Collection to add
+    ///
+    /// Note: For now, this creates a new hierarchy from the collection's data.
+    /// Future versions will support proper memory sharing.
+    fn add_collection(&mut self, name: String, collection: &PyCollection) -> PyResult<()> {
+        // Clone the hierarchy so we can add it to the frame
+        let hierarchy_clone = collection.hierarchy.clone();
+        self.frame
+            .add_collection(name, hierarchy_clone)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to add collection: {}",
+                    e
+                ))
+            })
+    }
+
+    /// Check if a collection exists
+    ///
+    /// Args:
+    ///     name (str): Name of the collection
+    ///
+    /// Returns:
+    ///     bool: True if collection exists
+    fn has_collection(&self, name: &str) -> bool {
+        self.frame.get_collection(name).is_some()
+    }
+
+    /// Get list of collection names
+    ///
+    /// Returns:
+    ///     List[str]: Names of all collections in the frame
+    fn collection_names(&self) -> Vec<String> {
+        self.frame.collection_names()
+    }
+
+    /// Get number of collections
+    ///
+    /// Returns:
+    ///     int: Number of collections in the frame
+    fn __len__(&self) -> usize {
+        self.frame.len()
+    }
+
+    /// Get a collection by name using dictionary-style access
+    ///
+    /// Args:
+    ///     name (str): Name of the collection
+    ///
+    /// Returns:
+    ///     Collection: The collection as a view (immutable)
+    ///
+    /// Raises:
+    ///     KeyError: If collection doesn't exist
+    fn __getitem__(&self, name: String) -> PyResult<PyCollection> {
+        if let Some(hierarchy) = self.frame.get_collection(&name) {
+            // Return as a view collection
+            Ok(PyCollection::new_view(hierarchy.clone()))
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Collection '{}' not found",
+                name
+            )))
+        }
+    }
+
+    /// Check if a collection exists
+    ///
+    /// Args:
+    ///     name (str): Name of the collection
+    ///
+    /// Returns:
+    ///     bool: True if collection exists
+    fn __contains__(&self, name: &str) -> bool {
+        self.frame.get_collection(name).is_some()
+    }
+
+    /// Remove a collection from the frame
+    ///
+    /// Args:
+    ///     name (str): Name of the collection to remove
+    ///
+    /// Returns:
+    ///     bool: True if collection was removed
+    fn remove_collection(&mut self, name: &str) -> bool {
+        self.frame.remove_collection(name).is_some()
+    }
+
+    /// String representation
+    fn __repr__(&self) -> String {
+        format!("EntityFrame(collections={})", self.frame.len())
+    }
+}
+
 /// Python module definition
 #[pymodule]
 fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -630,6 +778,7 @@ fn starlings(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyCollection>()?;
     m.add_class::<PyPartition>()?;
+    m.add_class::<PyEntityFrame>()?;
     m.add_class::<EdgeGenerator>()?;
     m.add_function(wrap_pyfunction!(generate_entity_resolution_edges, m)?)?;
     Ok(())

@@ -84,6 +84,14 @@ impl InternedRecord {
     pub fn get_attribute(&self, key: u32) -> Option<&u32> {
         self.attributes.get(&key)
     }
+
+    pub fn source_id(&self) -> u32 {
+        self.source_id
+    }
+
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
 }
 
 #[cfg(test)]
