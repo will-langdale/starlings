@@ -165,32 +165,26 @@ def test_user_eda_workflow():
     # Verify monotonic increase (higher thresholds should have more entities)
     assert sweep_counts[0] <= sweep_counts[1] <= sweep_counts[2]
 
-    # Demonstrate large-scale comparison using expression API
-    # Use two 100k collections for practical demonstration
+    # Demonstrate large-scale comparison using expression API at 1M scale
+    # With optimised record-based algorithm, we can handle 1M vs 1M comparisons
 
-    # Create second collection with 100k edges for comparison
-    logger.info("Creating 100k-edge collection for cross-collection comparison")
+    # Create a second 1M collection for cross-collection comparison
+    logger.info("Creating second 1M-edge collection for cross-collection comparison")
     start_time = time.monotonic()
-    edges_2 = sl.generate_entity_resolution_edges(100_000)
+    edges_2 = sl.generate_entity_resolution_edges(1_000_000)
     collection_2 = sl.Collection.from_edges(edges_2, show_progress=False)
-
-    # Also create a third 100k collection to replace the 1M for this comparison
-    edges_3 = sl.generate_entity_resolution_edges(100_000)
-    collection_3 = sl.Collection.from_edges(edges_3, show_progress=False)
-
-    frame.add_collection("compare_100k_a", collection_2)
-    frame.add_collection("compare_100k_b", collection_3)
+    frame.add_collection("compare_1m", collection_2)
     setup_time = time.monotonic() - start_time
-    logger.info("Two 100k collections created in %.2fs", setup_time)
+    logger.info("Second 1M collection created in %.2fs", setup_time)
 
-    # Test 100k vs 100k comparison at threshold 0.8
-    # At 0.8: each 100k collection has ~80k entities
-    # This demonstrates large-scale comparison using delta-based algorithm
-    logger.info("Starting 100k vs 100k cross-collection comparison at threshold 0.8")
+    # Test 1M vs 1M comparison at threshold 0.8
+    # At 0.8: each 1M collection has ~800k entities
+    # This demonstrates the record-based O(r) algorithm handling production scale
+    logger.info("Starting 1M vs 1M cross-collection comparison at threshold 0.8")
     start_time = time.monotonic()
     comparison_result = frame.analyse(
-        sl.col("compare_100k_a").at(0.8),
-        sl.col("compare_100k_b").at(0.8),
+        sl.col("full_dataset").at(0.8),
+        sl.col("compare_1m").at(0.8),
         metrics=[
             sl.Metrics.eval.f1,
             sl.Metrics.eval.precision,
@@ -203,8 +197,8 @@ def test_user_eda_workflow():
     result = comparison_result[0]
 
     # Check threshold values are preserved
-    assert abs(result["compare_100k_a_threshold"] - 0.8) < 1e-10
-    assert abs(result["compare_100k_b_threshold"] - 0.8) < 1e-10
+    assert abs(result["full_dataset_threshold"] - 0.8) < 1e-10
+    assert abs(result["compare_1m_threshold"] - 0.8) < 1e-10
 
     # Check comparison metrics are computed
     for metric in ["f1", "precision", "recall"]:
@@ -215,25 +209,103 @@ def test_user_eda_workflow():
 
     # Log performance results
     logger.info(
-        "100k vs 100k comparison in %.2fs (F1=%.3f, Prec=%.3f, Rec=%.3f)",
+        "1M vs 1M comparison in %.2fs (F1=%.3f, Prec=%.3f, Rec=%.3f)",
         comparison_time,
         result["f1"],
         result["precision"],
         result["recall"],
     )
 
-    # Performance assertion: delta-based algorithm for single point comparison
-    # Should complete within 10 seconds (no sampling, full computation)
-    assert comparison_time < 10.0, (
-        f"100k vs 100k comparison took {comparison_time:.2f}s, expected < 10s"
+    # Performance assertion: record-based algorithm for single point comparison
+    # Should complete within 15 seconds for 1M vs 1M (optimised O(r) algorithm)
+    assert comparison_time < 15.0, (
+        f"1M vs 1M comparison took {comparison_time:.2f}s, expected < 15s"
+    )
+
+    # Demonstrate sweep × point comparison at 1M scale
+    logger.info("Starting 1M sweep × point comparison (3 thresholds)")
+    start_time = time.monotonic()
+    sweep_point_result = frame.analyse(
+        sl.col("full_dataset").sweep(0.7, 0.9, 0.1),  # 3 thresholds
+        sl.col("compare_1m").at(0.8),  # Single point
+        metrics=[sl.Metrics.eval.f1],
+    )
+    sweep_point_time = time.monotonic() - start_time
+
+    # Should produce 3 results (3 × 1)
+    assert len(sweep_point_result) == 3
+    for r in sweep_point_result:
+        assert "full_dataset_threshold" in r
+        assert "compare_1m_threshold" in r
+        assert r["compare_1m_threshold"] == 0.8
+        assert "f1" in r
+
+    logger.info(
+        "1M sweep × point comparison completed in %.2fs (3 comparisons)",
+        sweep_point_time,
+    )
+
+    # Performance check - sweep should complete efficiently with record-based algorithm
+    assert sweep_point_time < 30.0, (
+        f"1M sweep × point took {sweep_point_time:.2f}s, expected < 30s"
+    )
+
+    # Demonstrate 1M-scale single collection sweep for entropy analysis
+    logger.info("Starting 1M collection sweep for entropy analysis")
+    start_time = time.monotonic()
+    entropy_sweep_result = frame.analyse(
+        sl.col("full_dataset").sweep(0.7, 0.95, 0.05),  # 6 thresholds
+        metrics=[sl.Metrics.stats.entity_count, sl.Metrics.stats.entropy],
+    )
+    entropy_sweep_time = time.monotonic() - start_time
+
+    assert len(entropy_sweep_result) == 6
+    # Verify monotonic increase in entity count
+    entity_counts_1m = [r["entity_count"] for r in entropy_sweep_result]
+    for i in range(len(entity_counts_1m) - 1):
+        assert entity_counts_1m[i] <= entity_counts_1m[i + 1]
+
+    logger.info(
+        "1M entropy sweep completed in %.2fs (6 thresholds, entity counts: %s)",
+        entropy_sweep_time,
+        entity_counts_1m,
+    )
+
+    # Demonstrate sweep × sweep comparison at scale (limited for test time)
+    logger.info("Starting sweep × sweep comparison (2×2 grid)")
+    start_time = time.monotonic()
+    sweep_sweep_result = frame.analyse(
+        sl.col("full_dataset").sweep(0.8, 0.9, 0.1),  # 2 thresholds
+        sl.col("compare_1m").sweep(0.8, 0.9, 0.1),  # 2 thresholds
+        metrics=[sl.Metrics.eval.f1],
+    )
+    sweep_sweep_time = time.monotonic() - start_time
+
+    # Should produce 4 results (2 × 2 grid)
+    assert len(sweep_sweep_result) == 4
+    for r in sweep_sweep_result:
+        assert "full_dataset_threshold" in r
+        assert "compare_1m_threshold" in r
+        assert "f1" in r
+
+    logger.info(
+        "Sweep × sweep comparison completed in %.2fs (2×2 grid = 4 comparisons)",
+        sweep_sweep_time,
+    )
+
+    # Performance check - sweep × sweep should complete efficiently with O(r) algorithm
+    assert sweep_sweep_time < 45.0, (
+        f"Sweep × sweep took {sweep_sweep_time:.2f}s, expected < 45s"
     )
 
     logger.info(
         "Expression API workflow: Direct access yielded %d entities at 0.8. "
         "Analysis API yielded %.0f entities. Sweep across [0.7, 0.8, 0.9] = %s. "
-        "100k vs 100k comparison completed successfully in %.2fs",
+        "1M vs 1M comparison in %.2fs, sweep × point in %.2fs, sweep × sweep in %.2fs",
         count_direct,
         count_from_analysis,
         [int(c) for c in sweep_counts],
         comparison_time,
+        sweep_point_time,
+        sweep_sweep_time,
     )
