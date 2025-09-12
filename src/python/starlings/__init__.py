@@ -48,6 +48,7 @@ from typing import Any, cast
 from tqdm import tqdm
 
 from .config import DEBUG_ENABLED
+from .expressions import Metrics, col
 from .starlings import Collection as PyCollection
 from .starlings import EntityFrame as PyEntityFrame
 from .starlings import Partition as PyPartition
@@ -126,6 +127,16 @@ def generate_entity_resolution_edges(
 
 
 __version__ = version("starlings")
+
+__all__ = [
+    "Collection",
+    "EntityFrame",
+    "Partition",
+    "Metrics",
+    "col",
+    "generate_entity_resolution_edges",
+    "Key",
+]
 
 Key = Any
 
@@ -556,6 +567,60 @@ class EntityFrame:
         """
         rust_collection = self._frame.__getitem__(name)
         return Collection(rust_collection)
+
+    def analyse(
+        self, *expressions: Any, metrics: list[Any] | None = None
+    ) -> list[dict[str, float]]:
+        """Universal analysis method using expressions.
+
+        Always returns List[Dict[str, float]] where each dict represents one
+        measurement.
+        This uniform format works seamlessly with DataFrame libraries.
+
+        Args:
+            *expressions: One or more sl.col() expressions
+            metrics: List of metrics to compute. If None, defaults are:
+                    - For comparisons (2+ collections): f1, precision, recall
+                    - For single collection: entity_count, entropy
+
+        Returns:
+            List[Dict[str, float]]: Uniform format regardless of operation:
+            - Point comparisons: Single dict in list
+            - Sweeps: One dict per threshold point
+            - Mixed operations: Cartesian product of sweep points
+
+            Dictionary keys:
+            - "{collection}_threshold" for all threshold values
+            - Direct metric names ("f1", "precision", "recall", etc.)
+
+        Example:
+            ```python
+            # Point comparison
+            >>> result = ef.analyse(
+            ...     sl.col("splink").at(0.85),
+            ...     sl.col("truth").at(1.0),
+            ...     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision]
+            ... )
+            [{"splink_threshold": 0.85, "truth_threshold": 1.0, "f1": 0.92, ...}]
+
+            # Single collection sweep
+            >>> result = ef.analyse(
+            ...     sl.col("splink").sweep(0.7, 0.9, 0.1),
+            ...     metrics=[sl.Metrics.stats.entity_count]
+            ... )
+            [{"splink_threshold": 0.7, "entity_count": 1250},
+             {"splink_threshold": 0.8, "entity_count": 980},
+             {"splink_threshold": 0.9, "entity_count": 750}]
+
+            # Easy DataFrame conversion
+            >>> import polars as pl
+            >>> df = pl.from_dicts(result)
+            ```
+        """
+        return self._frame.analyse(*expressions, metrics=metrics)  # type: ignore[no-any-return]
+
+    # American spelling alias
+    analyze = analyse
 
     def __repr__(self) -> str:
         """String representation for debugging."""

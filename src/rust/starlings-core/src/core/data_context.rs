@@ -7,7 +7,7 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHasher;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 type FxDashMap<K, V> = DashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -19,6 +19,9 @@ pub struct DataContext {
     pub identity_map: FxDashMap<InternedRecord, u32>,
     pub source_index: FxDashMap<u32, RoaringBitmap>,
     next_record_id: AtomicU32,
+    /// Generation counter for cache invalidation
+    /// Incremented on any structural change (compaction, record addition, etc.)
+    generation: AtomicU64,
 }
 
 impl DataContext {
@@ -33,6 +36,16 @@ impl DataContext {
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(0)
+    }
+
+    /// Get the current generation for cache validation
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Increment generation to invalidate caches
+    pub fn increment_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Create DataContext with pre-allocated capacity for better performance
@@ -54,6 +67,7 @@ impl DataContext {
             identity_map: DashMap::with_capacity_and_hasher(estimated_records, hasher.clone()),
             source_index: DashMap::with_hasher(hasher),
             next_record_id: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -256,6 +270,9 @@ impl DataContext {
         new_context
             .next_record_id
             .store(self.len() as u32, Ordering::Relaxed);
+
+        // Start with a fresh generation for the new context
+        new_context.generation.store(0, Ordering::Relaxed);
 
         new_context
     }

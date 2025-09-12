@@ -2,11 +2,41 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
+mod expressions;
+use expressions::{
+    build_all_sweep_tables, compute_comparison_metric, compute_single_metric,
+    generate_sweep_thresholds, parse_expression, parse_metric, ExpressionType, MetricType,
+    SparseContingencyTable,
+};
+
 use starlings_core::core::ensure_memory_safety;
 use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
 use starlings_core::debug_println;
 use starlings_core::test_utils;
 use starlings_core::{DataContext, EntityFrame, Key, PartitionHierarchy, PartitionLevel};
+
+/// Determines the optimal algorithm for cross-collection comparison
+fn should_use_record_based_algorithm(
+    expressions: &[ExpressionType],
+    collection_names: &[String],
+) -> bool {
+    // Use record-based for sweep × sweep comparisons
+    if expressions.len() == 2
+        && matches!(
+            (&expressions[0], &expressions[1]),
+            (ExpressionType::Sweep { .. }, ExpressionType::Sweep { .. })
+        )
+    {
+        return true;
+    }
+
+    // Use record-based for cross-collection comparisons (different collections)
+    if collection_names.len() >= 2 && collection_names[0] != collection_names[1] {
+        return true;
+    }
+
+    false
+}
 
 /// Progress callback type for Rust-level progress reporting
 type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
@@ -15,8 +45,8 @@ type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
 fn create_progress_wrapper(callback: Py<pyo3::PyAny>) -> ProgressCallback {
     Arc::new(move |progress: f64, message: &str| {
         Python::attach(|py| {
-            if let Err(e) = callback.call1(py, (progress, message)) {
-                eprintln!("Progress callback error: {}", e);
+            if let Err(_e) = callback.call1(py, (progress, message)) {
+                // Progress callback error - silently continue
             }
         });
     })
@@ -327,7 +357,7 @@ impl PyCollection {
         let process_batch = |batch: &[Key]| {
             // Check circuit breaker before each batch
             if global_resource_monitor().is_circuit_open() {
-                eprintln!("⚠️  Circuit breaker open - aborting batch processing");
+                // Circuit breaker open - aborting batch processing
                 return;
             }
 
@@ -628,6 +658,58 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
     }
 }
 
+/// Generate all combinations of thresholds for cartesian product analysis
+fn generate_threshold_combinations(
+    expressions: &[ExpressionType],
+) -> PyResult<Vec<Vec<(ExpressionType, f64)>>> {
+    let mut threshold_sets = Vec::new();
+
+    for expr in expressions {
+        let thresholds = match expr {
+            ExpressionType::Point { threshold, .. } => vec![*threshold],
+            ExpressionType::Sweep {
+                start, stop, step, ..
+            } => generate_sweep_thresholds(*start, *stop, *step),
+        };
+        threshold_sets.push(thresholds);
+    }
+
+    // Generate cartesian product of all threshold combinations
+    let mut combinations = vec![vec![]];
+
+    for (expr_idx, thresholds) in threshold_sets.iter().enumerate() {
+        let mut new_combinations = Vec::new();
+
+        for combination in &combinations {
+            for &threshold in thresholds {
+                let mut new_combination = combination.clone();
+                new_combination.push((expressions[expr_idx].clone(), threshold));
+                new_combinations.push(new_combination);
+            }
+        }
+
+        combinations = new_combinations;
+    }
+
+    Ok(combinations)
+}
+
+/// Get metric name as string
+fn metric_name(metric: &MetricType) -> &'static str {
+    match metric {
+        MetricType::F1 => "f1",
+        MetricType::Precision => "precision",
+        MetricType::Recall => "recall",
+        MetricType::ARI => "ari",
+        MetricType::NMI => "nmi",
+        MetricType::VMeasure => "v_measure",
+        MetricType::BCubedPrecision => "bcubed_precision",
+        MetricType::BCubedRecall => "bcubed_recall",
+        MetricType::EntityCount => "entity_count",
+        MetricType::Entropy => "entropy",
+    }
+}
+
 /// Multi-collection container that enables hierarchies to share DataContext
 #[pyclass(name = "EntityFrame")]
 pub struct PyEntityFrame {
@@ -734,6 +816,360 @@ impl PyEntityFrame {
     ///     bool: True if collection was removed
     fn remove_collection(&mut self, name: &str) -> bool {
         self.frame.remove_collection(name).is_some()
+    }
+
+    /// Universal analysis method using expressions.
+    ///
+    /// Always returns List[Dict[str, float]] where each dict represents one measurement.
+    /// This uniform format works seamlessly with DataFrame libraries.
+    ///
+    /// Args:
+    ///     expressions: Variable number of expression objects from sl.col()
+    ///     metrics: List of metric functions to compute
+    ///
+    /// Returns:
+    ///     List[Dict[str, float]]: Results where each dict contains:
+    ///     - "{collection}_threshold" for all threshold values
+    ///     - Direct metric names ("f1", "precision", "entity_count", etc.)
+    ///
+    /// Example:
+    ///     ```python
+    ///     # Point comparison
+    ///     result = ef.analyse(
+    ///         sl.col("splink").at(0.85),
+    ///         sl.col("truth").at(1.0),
+    ///         metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision]
+    ///     )
+    ///     # Returns: [{"splink_threshold": 0.85, "truth_threshold": 1.0, "f1": 0.92, ...}]
+    ///     ```
+    #[pyo3(signature = (*expressions, metrics=None))]
+    fn analyse(
+        &mut self,
+        expressions: &Bound<'_, pyo3::types::PyTuple>,
+        metrics: Option<Vec<Bound<'_, PyAny>>>,
+        _py: Python,
+    ) -> PyResult<Vec<std::collections::HashMap<String, f64>>> {
+        use std::collections::HashMap;
+
+        // Parse expressions from Python
+        let mut parsed_expressions = Vec::new();
+        for expr in expressions.iter() {
+            let parsed = parse_expression(&expr)?;
+            parsed_expressions.push(parsed);
+        }
+
+        // Parse metrics from Python, providing defaults if none specified
+        let parsed_metrics = if let Some(metric_objs) = metrics {
+            let mut metrics = Vec::new();
+            for metric_obj in metric_objs {
+                let parsed = parse_metric(&metric_obj)?;
+                metrics.push(parsed);
+            }
+            metrics
+        } else {
+            // Provide default metrics based on number of expressions
+            if parsed_expressions.len() >= 2 {
+                // Multiple collections - use comparison metrics
+                vec![MetricType::F1, MetricType::Precision, MetricType::Recall]
+            } else {
+                // Single collection - use statistics metrics
+                vec![MetricType::EntityCount, MetricType::Entropy]
+            }
+        };
+
+        // Generate all combinations of thresholds for cartesian product
+        let threshold_combinations = generate_threshold_combinations(&parsed_expressions)?;
+
+        let mut results = Vec::new();
+
+        // Cache for partitions to avoid redundant reconstruction
+        let mut partition_cache: HashMap<(String, u64), PartitionLevel> = HashMap::new();
+
+        // Cache for contingency tables to avoid redundant computation
+        let mut contingency_cache: HashMap<(String, u64, String, u64), SparseContingencyTable> =
+            HashMap::new();
+
+        // Extract collection names for algorithm selection
+        let expr_collection_names: Vec<String> = parsed_expressions
+            .iter()
+            .map(|expr| match expr {
+                ExpressionType::Point { collection, .. } => collection.clone(),
+                ExpressionType::Sweep { collection, .. } => collection.clone(),
+            })
+            .collect();
+
+        // Check if we should use the optimised record-based algorithm
+        if should_use_record_based_algorithm(&parsed_expressions, &expr_collection_names)
+            && parsed_expressions.len() == 2
+            && matches!(
+                (&parsed_expressions[0], &parsed_expressions[1]),
+                (ExpressionType::Sweep { .. }, ExpressionType::Sweep { .. })
+            )
+        {
+            // Using optimised record-based algorithm for sweep × sweep comparison
+
+            // Extract sweep parameters
+            let (col1, thresholds1) = match &parsed_expressions[0] {
+                ExpressionType::Sweep {
+                    collection,
+                    start,
+                    stop,
+                    step,
+                } => (
+                    collection.clone(),
+                    generate_sweep_thresholds(*start, *stop, *step),
+                ),
+                _ => unreachable!(),
+            };
+            let (col2, thresholds2) = match &parsed_expressions[1] {
+                ExpressionType::Sweep {
+                    collection,
+                    start,
+                    stop,
+                    step,
+                } => (
+                    collection.clone(),
+                    generate_sweep_thresholds(*start, *stop, *step),
+                ),
+                _ => unreachable!(),
+            };
+
+            // Build all partitions upfront
+            let mut partitions1 = Vec::new();
+            let mut partitions2 = Vec::new();
+
+            for threshold in &thresholds1 {
+                if let Some(hierarchy) = self.frame.get_collection(&col1) {
+                    let mut h = hierarchy.clone();
+                    partitions1.push(h.at_threshold(*threshold).clone());
+                }
+            }
+            for threshold in &thresholds2 {
+                if let Some(hierarchy) = self.frame.get_collection(&col2) {
+                    let mut h = hierarchy.clone();
+                    partitions2.push(h.at_threshold(*threshold).clone());
+                }
+            }
+
+            // Get shared context
+            let context = if let Some(hierarchy) = self.frame.get_collection(&col1) {
+                hierarchy.context.clone()
+            } else {
+                return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                    "Collection '{}' not found",
+                    col1
+                )));
+            };
+
+            // Build all contingency tables in one pass
+            let all_tables = build_all_sweep_tables(&partitions1, &partitions2, &context);
+
+            // Convert tables to results
+            for (i, threshold1) in thresholds1.iter().enumerate() {
+                for (j, threshold2) in thresholds2.iter().enumerate() {
+                    let mut result = HashMap::new();
+                    result.insert(format!("{}_threshold", col1), *threshold1);
+                    result.insert(format!("{}_threshold", col2), *threshold2);
+
+                    let table = &all_tables[i][j];
+                    for metric in &parsed_metrics {
+                        let value = match metric {
+                            MetricType::F1 => table.to_contingency_table().f1_score(),
+                            MetricType::Precision => table.to_contingency_table().precision(),
+                            MetricType::Recall => table.to_contingency_table().recall(),
+                            _ => 0.0, // Other metrics not yet implemented
+                        };
+                        let metric_name = format!("{:?}", metric).to_lowercase();
+                        result.insert(metric_name, value);
+                    }
+
+                    results.push(result);
+                }
+            }
+
+            return Ok(results);
+        }
+
+        // For all other cases, use appropriate algorithm based on collection comparison
+
+        for combination in threshold_combinations {
+            let mut result = HashMap::new();
+
+            // Add threshold values to result
+            for (expr, threshold) in &combination {
+                let collection_name = match expr {
+                    ExpressionType::Point { collection, .. } => collection,
+                    ExpressionType::Sweep { collection, .. } => collection,
+                };
+                result.insert(format!("{}_threshold", collection_name), *threshold);
+            }
+
+            // Get partitions for this combination, using cache when possible
+            let mut owned_partitions = Vec::new();
+            let mut collection_names = Vec::new();
+            for (expr, threshold) in &combination {
+                let collection_name = match expr {
+                    ExpressionType::Point { collection, .. } => collection,
+                    ExpressionType::Sweep { collection, .. } => collection,
+                };
+                collection_names.push(collection_name.clone());
+
+                // Create cache key using fixed-point representation
+                let threshold_key = (*threshold * 1_000_000.0).round() as u64;
+                let cache_key = (collection_name.clone(), threshold_key);
+
+                let partition = if let Some(cached) = partition_cache.get(&cache_key) {
+                    // Use cached partition
+                    cached.clone()
+                } else {
+                    // Reconstruct partition and cache it
+                    if let Some(hierarchy) = self.frame.get_collection(collection_name) {
+                        let mut hierarchy_clone = hierarchy.clone();
+                        let partition = hierarchy_clone.at_threshold(*threshold).clone();
+                        partition_cache.insert(cache_key, partition.clone());
+                        partition
+                    } else {
+                        return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                            "Collection '{}' not found",
+                            collection_name
+                        )));
+                    }
+                };
+                owned_partitions.push(partition);
+            }
+
+            // Compute metrics using owned partitions
+            for metric in &parsed_metrics {
+                let metric_value = if metric.requires_comparison() {
+                    if owned_partitions.len() < 2 {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Metric {} requires at least 2 collections",
+                            metric_name(metric)
+                        )));
+                    }
+
+                    // Check contingency table cache for comparison metrics
+                    let threshold_key1 = (combination[0].1 * 1_000_000.0).round() as u64;
+                    let threshold_key2 = (combination[1].1 * 1_000_000.0).round() as u64;
+                    let cont_cache_key = (
+                        collection_names[0].clone(),
+                        threshold_key1,
+                        collection_names[1].clone(),
+                        threshold_key2,
+                    );
+
+                    let sparse_table = if let Some(cached) = contingency_cache.get(&cont_cache_key)
+                    {
+                        cached
+                    } else {
+                        // Check if collections share a context (they always do in EntityFrame)
+                        // and if they're different collections
+                        let are_different_collections = collection_names[0] != collection_names[1];
+
+                        let table = if are_different_collections {
+                            // Use record-based algorithm for different collections sharing context
+                            // Get shared context from first collection
+                            let context = if let Some(hierarchy) =
+                                self.frame.get_collection(&collection_names[0])
+                            {
+                                hierarchy.context.clone()
+                            } else {
+                                return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(
+                                    format!("Collection '{}' not found", collection_names[0]),
+                                ));
+                            };
+
+                            // Using record-based algorithm for cross-collection comparison
+                            SparseContingencyTable::from_partitions_via_records(
+                                &owned_partitions[0],
+                                &owned_partitions[1],
+                                &context,
+                            )
+                        } else {
+                            // Use delta-based algorithm for same collection comparisons
+                            // Using delta-based algorithm for same-collection comparison
+                            SparseContingencyTable::from_partitions(
+                                &owned_partitions[0],
+                                &owned_partitions[1],
+                            )
+                        };
+
+                        contingency_cache.insert(cont_cache_key.clone(), table);
+                        contingency_cache.get(&cont_cache_key).unwrap()
+                    };
+
+                    // Compute metric from cached contingency table
+                    match metric {
+                        MetricType::F1 => {
+                            let table = sparse_table.to_contingency_table();
+                            table.f1_score()
+                        }
+                        MetricType::Precision => {
+                            let table = sparse_table.to_contingency_table();
+                            table.precision()
+                        }
+                        MetricType::Recall => {
+                            let table = sparse_table.to_contingency_table();
+                            table.recall()
+                        }
+                        _ => {
+                            // For unimplemented metrics, fall back to direct computation
+                            compute_comparison_metric(
+                                &owned_partitions[0],
+                                &owned_partitions[1],
+                                metric,
+                            )
+                        }
+                    }
+                } else {
+                    if owned_partitions.is_empty() {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "No collections specified for metric computation".to_string(),
+                        ));
+                    }
+                    // Use first partition for single-collection metrics
+                    compute_single_metric(&owned_partitions[0], metric)
+                };
+
+                result.insert(metric_name(metric).to_string(), metric_value);
+            }
+
+            results.push(result);
+
+            // Progressive cache management based on collection sizes
+            // Keep more cache for smaller collections, less for larger ones
+            let max_entities = owned_partitions
+                .iter()
+                .map(|p| p.entities().len())
+                .max()
+                .unwrap_or(0);
+
+            let (partition_limit, contingency_limit) = if max_entities > 100_000 {
+                // Very large collections: minimal cache
+                (10, 5)
+            } else if max_entities > 10_000 {
+                // Large collections: moderate cache
+                (20, 10)
+            } else if max_entities > 1_000 {
+                // Medium collections: good cache
+                (50, 25)
+            } else {
+                // Small collections: maximum cache
+                (100, 50)
+            };
+
+            // Clear caches if they exceed adaptive limits
+            if partition_cache.len() > partition_limit {
+                // Simple strategy: clear half the cache when limit exceeded
+                partition_cache.clear();
+            }
+            if contingency_cache.len() > contingency_limit {
+                // Simple strategy: clear half the cache when limit exceeded
+                contingency_cache.clear();
+            }
+        }
+
+        Ok(results)
     }
 
     /// String representation

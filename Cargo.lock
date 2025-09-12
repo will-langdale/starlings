@@ -992,6 +992,7 @@ dependencies = [
  "num_cpus",
  "pyo3",
  "rayon",
+ "roaring",
  "rustc-hash",
  "starlings-core",
 ]
