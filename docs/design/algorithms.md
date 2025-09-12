@@ -808,6 +808,89 @@ pub struct SparseEdgeList {
 }
 ```
 
+## Cross-collection comparison algorithms
+
+### Algorithm selection strategy
+
+When comparing collections, we have two distinct algorithms optimised for different scenarios:
+
+**Delta-based algorithm** (incremental updates)
+- **Complexity**: O(k) updates between adjacent thresholds where k = affected entities
+- **Best for**: Single collection operations and single-dimension changes
+- **Use cases**:
+  - Single collection sweep: Incremental updates between thresholds
+  - Sweep × point comparison: One collection fixed, one sweeping
+
+**Record-based algorithm** (full record iteration)
+- **Complexity**: O(r) where r = number of records
+- **Best for**: Cartesian product comparisons (sweep × sweep)
+- **Key insight**: Collections in an EntityFrame share the same underlying record space
+- **Performance**: 1000-10000× speedup for large-scale comparisons
+
+### The shared record space insight
+
+Collections in an EntityFrame partition the exact same set of records:
+- Each record appears in exactly one entity in collection A
+- The same record appears in exactly one entity in collection B
+- We're comparing different ways of partitioning the same space
+
+This enables building contingency tables by iterating records rather than comparing entity pairs.
+
+### Complexity analysis
+
+For cross-collection comparison at single thresholds:
+
+**Entity-based approach** (traditional):
+- Time: O(k₁ × k₂) entity comparisons
+- Example: 800k × 800k entities = 640 billion operations
+
+**Record-based approach** (optimised):
+- Time: O(r) record iterations + O(k₁ + k₂) marginals
+- Example: 1M records = 1 million operations
+- Speedup: 640,000× theoretical, 1000-10000× practical
+
+### Record-based algorithm structure
+
+```rust
+pub fn from_partitions_via_records(
+    partition1: &PartitionLevel,
+    partition2: &PartitionLevel,
+    context: &DataContext,
+) -> SparseContingencyTable {
+    // Build reverse indices: record → entity
+    let record_to_entity1 = build_reverse_index(partition1);
+    let record_to_entity2 = build_reverse_index(partition2);
+    
+    // Single pass over records (parallelisable)
+    let pairs: Vec<(EntityId, EntityId)> = (0..num_records)
+        .into_par_iter()
+        .filter_map(|record_idx| {
+            match (record_to_entity1[record_idx], record_to_entity2[record_idx]) {
+                (Some(e1), Some(e2)) => Some((e1, e2)),
+                _ => None,
+            }
+        })
+        .collect();
+    
+    // Aggregate into contingency table
+    build_contingency_table(pairs, partition1, partition2)
+}
+```
+
+### When to use each algorithm
+
+```
+if both expressions are sweeps:
+    use record-based  # O(r) beats O(k₁ × k₂ × n₁ × n₂)
+else:
+    use delta-based   # O(k) incremental updates sufficient
+```
+
+For a 5×5 sweep comparison (25 total comparisons):
+- Delta-based: 80k × 80k × 25 = 160 billion operations
+- Record-based: 1M records × 1 pass = 1 million operations
+- Speedup: 160,000×
+
 ## Dual processing for entity operations
 
 ### Built-in operations with parallel Rust execution
