@@ -162,22 +162,6 @@ class TestExpressionIntegration:
             assert "entity_count" in result_dict
             assert result_dict["entity_count"] >= 0
 
-    def test_american_spelling_alias(self, entity_frame_with_collections):
-        """Test that analyze() is an alias for analyse()."""
-        ef = entity_frame_with_collections
-
-        # Test both spellings work
-        result_uk = ef.analyse(
-            sl.col("a").at(0.8), metrics=[sl.Metrics.stats.entity_count]
-        )
-
-        result_us = ef.analyze(
-            sl.col("a").at(0.8), metrics=[sl.Metrics.stats.entity_count]
-        )
-
-        # Results should be identical
-        assert result_uk == result_us
-
     def test_default_metrics(self, entity_frame_with_collections):
         """Test that default metrics are applied when none specified."""
         ef = entity_frame_with_collections

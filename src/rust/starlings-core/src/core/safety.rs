@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 /// Global resource monitor singleton.
 ///
-/// This is initialized lazily on first access using ResourceMonitor::from_env(),
+/// This is initialised lazily on first access using ResourceMonitor::from_env(),
 /// which respects STARLINGS_SAFETY_LEVEL environment variable for configuration.
 static GLOBAL_RESOURCE_MONITOR: OnceLock<ResourceMonitor> = OnceLock::new();
 
@@ -60,7 +60,7 @@ pub fn ensure_memory_safety(estimated_mb: u64) -> Result<(), SafetyError> {
 ///
 /// Provides access to the global ResourceMonitor instance for operations
 /// that need more detailed resource information beyond simple safety checks.
-/// The monitor is initialized lazily on first access.
+/// The monitor is initialised lazily on first access.
 ///
 /// # Returns
 /// Reference to the global ResourceMonitor singleton

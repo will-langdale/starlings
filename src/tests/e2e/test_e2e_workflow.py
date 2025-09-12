@@ -228,15 +228,6 @@ def test_user_eda_workflow():
         f"100k vs 100k comparison took {comparison_time:.2f}s, expected < 10s"
     )
 
-    # Test American spelling alias
-    analysis_us = frame.analyze(
-        sl.col("simple").at(0.8), metrics=[sl.Metrics.stats.entity_count]
-    )
-    analysis_uk = frame.analyse(
-        sl.col("simple").at(0.8), metrics=[sl.Metrics.stats.entity_count]
-    )
-    assert analysis_us == analysis_uk
-
     logger.info(
         "Expression API workflow: Direct access yielded %d entities at 0.8. "
         "Analysis API yielded %.0f entities. Sweep across [0.7, 0.8, 0.9] = %s. "

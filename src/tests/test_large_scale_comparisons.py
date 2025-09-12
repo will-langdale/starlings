@@ -116,7 +116,7 @@ class TestRecordBasedOptimization:
     """
 
     def test_identical_results_small_dataset(self):
-        """Verify that optimized algorithm produces correct results."""
+        """Verify that optimised algorithm produces correct results."""
         # Create test data
         edges = generate_test_edges(100)
 
@@ -256,7 +256,7 @@ class TestRecordBasedOptimization:
         ef.add_collection("shared1", col1)
         ef.add_collection("shared2", col2)
 
-        # This should use optimized algorithm (both in same frame)
+        # This should use optimised algorithm (both in same frame)
         result = ef.analyse(
             sl.col("shared1").at(0.7),
             sl.col("shared2").at(0.7),

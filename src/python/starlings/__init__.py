@@ -619,9 +619,6 @@ class EntityFrame:
         """
         return self._frame.analyse(*expressions, metrics=metrics)  # type: ignore[no-any-return]
 
-    # American spelling alias
-    analyze = analyse
-
     def __repr__(self) -> str:
         """String representation for debugging."""
         return repr(self._frame)

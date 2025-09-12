@@ -15,6 +15,13 @@ use starlings_core::debug_println;
 use starlings_core::test_utils;
 use starlings_core::{DataContext, EntityFrame, Key, PartitionHierarchy, PartitionLevel};
 
+/// Convert threshold to cache key using fixed-point representation
+/// This ensures consistent cache keys for floating point thresholds
+#[inline]
+fn threshold_to_cache_key(threshold: f64) -> u64 {
+    (threshold * 1_000_000.0).round() as u64
+}
+
 /// Determines the optimal algorithm for cross-collection comparison
 fn should_use_record_based_algorithm(
     expressions: &[ExpressionType],
@@ -935,21 +942,8 @@ impl PyEntityFrame {
             };
 
             // Build all partitions upfront
-            let mut partitions1 = Vec::new();
-            let mut partitions2 = Vec::new();
-
-            for threshold in &thresholds1 {
-                if let Some(hierarchy) = self.frame.get_collection(&col1) {
-                    let mut h = hierarchy.clone();
-                    partitions1.push(h.at_threshold(*threshold).clone());
-                }
-            }
-            for threshold in &thresholds2 {
-                if let Some(hierarchy) = self.frame.get_collection(&col2) {
-                    let mut h = hierarchy.clone();
-                    partitions2.push(h.at_threshold(*threshold).clone());
-                }
-            }
+            let partitions1 = self.build_partitions_for_thresholds(&col1, &thresholds1)?;
+            let partitions2 = self.build_partitions_for_thresholds(&col2, &thresholds2)?;
 
             // Get shared context
             let context = if let Some(hierarchy) = self.frame.get_collection(&col1) {
@@ -1015,7 +1009,7 @@ impl PyEntityFrame {
                 collection_names.push(collection_name.clone());
 
                 // Create cache key using fixed-point representation
-                let threshold_key = (*threshold * 1_000_000.0).round() as u64;
+                let threshold_key = threshold_to_cache_key(*threshold);
                 let cache_key = (collection_name.clone(), threshold_key);
 
                 let partition = if let Some(cached) = partition_cache.get(&cache_key) {
@@ -1049,8 +1043,8 @@ impl PyEntityFrame {
                     }
 
                     // Check contingency table cache for comparison metrics
-                    let threshold_key1 = (combination[0].1 * 1_000_000.0).round() as u64;
-                    let threshold_key2 = (combination[1].1 * 1_000_000.0).round() as u64;
+                    let threshold_key1 = threshold_to_cache_key(combination[0].1);
+                    let threshold_key2 = threshold_to_cache_key(combination[1].1);
                     let cont_cache_key = (
                         collection_names[0].clone(),
                         threshold_key1,
@@ -1062,12 +1056,12 @@ impl PyEntityFrame {
                     {
                         cached
                     } else {
-                        // Check if collections share a context (they always do in EntityFrame)
-                        // and if they're different collections
+                        // Check if collections are different to determine algorithm
                         let are_different_collections = collection_names[0] != collection_names[1];
 
                         let table = if are_different_collections {
-                            // Use record-based algorithm for different collections sharing context
+                            // Use record-based algorithm for different collections
+                            // This is O(r) instead of O(k₁ × k₂) where r=records, k=entities
                             // Get shared context from first collection
                             let context = if let Some(hierarchy) =
                                 self.frame.get_collection(&collection_names[0])
@@ -1087,7 +1081,7 @@ impl PyEntityFrame {
                             )
                         } else {
                             // Use delta-based algorithm for same collection comparisons
-                            // Using delta-based algorithm for same-collection comparison
+                            // This enables incremental updates within sweeps
                             SparseContingencyTable::from_partitions(
                                 &owned_partitions[0],
                                 &owned_partitions[1],
@@ -1175,6 +1169,29 @@ impl PyEntityFrame {
     /// String representation
     fn __repr__(&self) -> String {
         format!("EntityFrame(collections={})", self.frame.len())
+    }
+}
+
+impl PyEntityFrame {
+    /// Helper: Build partitions for a collection at multiple thresholds
+    fn build_partitions_for_thresholds(
+        &self,
+        collection_name: &str,
+        thresholds: &[f64],
+    ) -> PyResult<Vec<PartitionLevel>> {
+        let mut partitions = Vec::new();
+        let hierarchy = self.frame.get_collection(collection_name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Collection '{}' not found",
+                collection_name
+            ))
+        })?;
+
+        for threshold in thresholds {
+            let mut h = hierarchy.clone();
+            partitions.push(h.at_threshold(*threshold).clone());
+        }
+        Ok(partitions)
     }
 }
 

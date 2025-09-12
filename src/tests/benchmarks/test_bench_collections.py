@@ -245,6 +245,165 @@ class TestPerformanceBenchmarks:
 
         logger.info("\n✅ Cache performance validated")
 
+    def test_expression_sweep_performance(self) -> None:
+        """Benchmark expression API sweep operations with delta/record algorithms."""
+        logger.info("\n" + "=" * 60)
+        logger.info("🔬 EXPRESSION API SWEEP PERFORMANCE")
+        logger.info("=" * 60)
+
+        # Create test dataset scaled by N - same size as main benchmark (1M for N=1)
+        n_entities = int(self.n * 1_000_000)
+        logger.info(f"\n📊 Generating {n_entities:,} entities for sweep testing...")
+        edge_generator = sl.generate_entity_resolution_edges(n_entities)
+
+        # Create collections
+        logger.info("   Creating test collections...")
+        collection_a = sl.Collection.from_edges(
+            edge_generator,
+            show_progress=False,
+        )
+
+        # Create a different collection for cross-collection comparison
+        edge_generator_b = sl.generate_entity_resolution_edges(n_entities)
+        collection_b = sl.Collection.from_edges(
+            edge_generator_b,
+            show_progress=False,
+        )
+
+        # Create EntityFrame
+        ef = sl.EntityFrame()
+        ef.add_collection("col_a", collection_a)
+        ef.add_collection("col_b", collection_b)
+
+        logger.info(f"   Collections created with ~{n_entities * 5:,} edges each")
+
+        # Test 1: Point comparison (baseline)
+        logger.info("\n1️⃣ POINT COMPARISON (Single threshold)")
+        logger.info("   Testing sl.col('col_a').at(0.8) vs sl.col('col_b').at(0.8)")
+
+        start = time.perf_counter()
+        result = ef.analyse(
+            sl.col("col_a").at(0.8),
+            sl.col("col_b").at(0.8),
+            metrics=[
+                sl.Metrics.eval.f1,
+                sl.Metrics.eval.precision,
+                sl.Metrics.eval.recall,
+            ],
+        )
+        point_time = time.perf_counter() - start
+
+        logger.info(f"   Time: {point_time:.3f}s")
+        logger.info(f"   F1 Score: {result[0]['f1']:.4f}")
+        logger.info("   Algorithm: Record-based (cross-collection)")
+
+        # Test 2: Same collection sweep (Delta algorithm)
+        logger.info("\n2️⃣ SAME COLLECTION SWEEP (Delta algorithm)")
+        logger.info("   Testing sl.col('col_a').sweep(0.5, 0.9, 0.1)")
+
+        start = time.perf_counter()
+        result = ef.analyse(
+            sl.col("col_a").sweep(0.5, 0.9, 0.1),
+            metrics=[sl.Metrics.stats.entity_count, sl.Metrics.stats.entropy],
+        )
+        delta_time = time.perf_counter() - start
+
+        n_points = len(result)
+        logger.info(f"   Time: {delta_time:.3f}s for {n_points} threshold points")
+        logger.info(f"   Throughput: {n_points / delta_time:.1f} points/second")
+        logger.info("   Algorithm: Delta-based (incremental updates)")
+
+        # Show sample results
+        logger.info("   Sample results:")
+        for i in [0, n_points // 2, n_points - 1]:
+            if i < len(result):
+                logger.info(
+                    f"     Threshold {result[i]['col_a_threshold']:.1f}: "
+                    f"{result[i]['entity_count']:.0f} entities"
+                )
+
+        # Test 3: Cross-collection sweep (Record algorithm for cross-collection)
+        logger.info("\n3️⃣ POINT × SWEEP COMPARISON (Record algorithm)")
+        logger.info(
+            "   Testing sl.col('col_a').at(0.8) vs sl.col('col_b').sweep(0.5, 0.9, 0.1)"
+        )
+        logger.info("   Cross-collection comparison uses record-based O(r) algorithm")
+
+        start = time.perf_counter()
+        result = ef.analyse(
+            sl.col("col_a").at(0.8),
+            sl.col("col_b").sweep(0.5, 0.9, 0.1),
+            metrics=[sl.Metrics.eval.f1],
+        )
+        cross_time = time.perf_counter() - start
+
+        n_comparisons = len(result)
+        logger.info(f"   Time: {cross_time:.3f}s for {n_comparisons} comparisons")
+        logger.info(
+            f"   Throughput: {n_comparisons / cross_time:.1f} comparisons/second"
+        )
+        logger.info("   Algorithm: Record-based (different collections, O(r))")
+
+        # Test 4: Cartesian product sweep (demonstrates record algorithm advantage)
+        logger.info("\n4️⃣ CARTESIAN PRODUCT SWEEP (Record algorithm advantage)")
+
+        # Use smaller sweeps for cartesian product to keep reasonable time
+        sweep_points = 3  # 3x3 = 9 comparisons
+        logger.info(
+            "   Testing sl.col('col_a').sweep(0.6, 0.8, 0.1) vs "
+            "sl.col('col_b').sweep(0.6, 0.8, 0.1)"
+        )
+        logger.info(
+            f"   This creates {sweep_points}×{sweep_points} = "
+            f"{sweep_points**2} comparisons"
+        )
+
+        start = time.perf_counter()
+        result = ef.analyse(
+            sl.col("col_a").sweep(0.6, 0.8, 0.1),
+            sl.col("col_b").sweep(0.6, 0.8, 0.1),
+            metrics=[sl.Metrics.eval.f1],
+        )
+        cartesian_time = time.perf_counter() - start
+
+        n_comparisons = len(result)
+        logger.info(f"   Time: {cartesian_time:.3f}s for {n_comparisons} comparisons")
+        logger.info(
+            f"   Throughput: {n_comparisons / cartesian_time:.1f} comparisons/second"
+        )
+        logger.info("   Algorithm: Record-based (massive advantage for sweep×sweep)")
+
+        # Calculate theoretical entity-based time
+        partition_a = collection_a.at(0.7)
+        partition_b = collection_b.at(0.7)
+        k1 = len(partition_a.entities)
+        k2 = len(partition_b.entities)
+
+        # Estimate based on entity comparisons
+        entity_comparisons = k1 * k2 * n_comparisons
+        estimated_entity_time = entity_comparisons * 1e-8  # ~10ns per comparison
+        speedup = estimated_entity_time / cartesian_time
+
+        logger.info("\n📈 ALGORITHM COMPARISON")
+        logger.info(f"   Entities at threshold 0.7: {k1:,} × {k2:,}")
+        logger.info(f"   Entity-based would need: {entity_comparisons:,} comparisons")
+        logger.info(f"   Record-based used: {n_entities:,} record iterations")
+        logger.info(f"   Theoretical speedup: {speedup:.0f}x")
+
+        # Summary
+        logger.info("\n✅ SWEEP PERFORMANCE SUMMARY")
+        logger.info(f"   Dataset size: {n_entities:,} entities")
+        logger.info(f"   Point comparison: {point_time:.3f}s (Record algorithm)")
+        logger.info(f"   Same-collection sweep: {delta_time:.3f}s (Delta algorithm)")
+        logger.info(f"   Point × sweep: {cross_time:.3f}s (Record algorithm)")
+        logger.info(
+            f"   Cartesian sweep (3×3): {cartesian_time:.3f}s "
+            "(Record algorithm optimised)"
+        )
+
+        if speedup > 100:
+            logger.info(f"   🚀 Record algorithm achieved {speedup:.0f}x speedup!")
+
 
 def run_benchmarks(n: float = 1.0) -> None:
     """Run all benchmarks programmatically (for use in justfile)."""
@@ -261,6 +420,7 @@ def run_benchmarks(n: float = 1.0) -> None:
         benchmark_tests.test_production_1m_performance_breakdown()
         benchmark_tests.test_scalability_analysis()
         benchmark_tests.test_threshold_access_performance()
+        benchmark_tests.test_expression_sweep_performance()
 
         logger.info("\n" + "=" * 60)
         logger.info("✅ ALL BENCHMARKS COMPLETED SUCCESSFULLY")
