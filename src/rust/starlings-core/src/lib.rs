@@ -1,4 +1,5 @@
 pub mod core;
+pub mod expressions;
 pub mod frame;
 pub mod hierarchy;
 pub mod test_utils;

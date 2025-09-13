@@ -3,10 +3,10 @@ use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
 mod expressions;
-use expressions::{
+use expressions::{parse_expression, parse_metric};
+use starlings_core::expressions::{
     build_all_sweep_tables, compute_comparison_metric, compute_single_metric,
-    generate_sweep_thresholds, parse_expression, parse_metric, ExpressionType, MetricType,
-    SparseContingencyTable,
+    generate_sweep_thresholds, ExpressionType, MetricType, SparseContingencyTable,
 };
 
 use starlings_core::core::ensure_memory_safety;
@@ -73,7 +73,9 @@ fn get_strategy_message(strategy: &ProcessingStrategy) -> String {
         }
         ProcessingStrategy::Streaming { .. } => "Streaming with aggressive disk spilling",
         ProcessingStrategy::Insufficient { .. } => {
-            unreachable!("Should have been caught earlier")
+            unreachable!(
+                "ProcessingStrategy::Insufficient should have been caught earlier in safety checks"
+            )
         }
     };
     format!("{} ({} threads)", base_msg, thread_count)
@@ -108,7 +110,9 @@ fn extract_batch_size(strategy: &ProcessingStrategy) -> usize {
         ProcessingStrategy::InMemory { batch_size, .. }
         | ProcessingStrategy::MemoryAware { batch_size, .. }
         | ProcessingStrategy::Streaming { batch_size, .. } => *batch_size,
-        ProcessingStrategy::Insufficient { .. } => unreachable!(),
+        ProcessingStrategy::Insufficient { .. } => {
+            unreachable!("ProcessingStrategy::Insufficient has no batch_size")
+        }
     }
 }
 
@@ -931,7 +935,7 @@ impl PyEntityFrame {
                     collection.clone(),
                     generate_sweep_thresholds(*start, *stop, *step),
                 ),
-                _ => unreachable!(),
+                _ => unreachable!("Sweep × sweep case should only have Sweep expressions"),
             };
             let (col2, thresholds2) = match &parsed_expressions[1] {
                 ExpressionType::Sweep {
@@ -944,7 +948,7 @@ impl PyEntityFrame {
                     collection.clone(),
                     generate_sweep_thresholds(*start, *stop, *step),
                 ),
-                _ => unreachable!(),
+                _ => unreachable!("Sweep × sweep case should only have Sweep expressions"),
             };
 
             // Build all partitions upfront
@@ -1119,6 +1123,9 @@ impl PyEntityFrame {
                                 &owned_partitions[1],
                                 metric,
                             )
+                            .map_err(|e| {
+                                PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+                            })?
                         }
                     }
                 } else {
@@ -1128,7 +1135,9 @@ impl PyEntityFrame {
                         ));
                     }
                     // Use first partition for single-collection metrics
-                    compute_single_metric(&owned_partitions[0], metric)
+                    compute_single_metric(&owned_partitions[0], metric).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+                    })?
                 };
 
                 result.insert(metric_name(metric).to_string(), metric_value);
