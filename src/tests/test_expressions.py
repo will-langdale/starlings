@@ -1,5 +1,6 @@
-"""Tests for the Expression API (roadmap task 2.2)."""
+"""Tests for the Expression API."""
 
+import logging
 import time
 
 import pytest
@@ -29,6 +30,25 @@ class TestExpressionAPI:
         assert expr.params["start"] == 0.5
         assert expr.params["stop"] == 0.95
         assert expr.params["step"] == 0.05
+
+    def test_reference_method_on_expression(self):
+        """Test that .reference() method is available on expressions."""
+        # Test with point expression
+        expr = sl.col("truth").at(1.0)
+        assert hasattr(expr, "reference")
+        assert expr.is_reference is False
+
+        # Mark as reference
+        ref_expr = expr.reference()
+        assert ref_expr.is_reference is True
+        assert ref_expr is expr  # Should return self for chaining
+
+        # Test with sweep expression
+        sweep_expr = sl.col("splink").sweep(0.5, 0.9, 0.1)
+        assert sweep_expr.is_reference is False
+
+        ref_sweep = sweep_expr.reference()
+        assert ref_sweep.is_reference is True
 
     def test_metrics_available(self):
         """Test that Metrics classes are available."""
@@ -205,6 +225,109 @@ class TestExpressionIntegration:
 
         expr5 = sl.col("test").sweep(0.5, 0.7, 0.15)
         assert abs(expr5.params["step"] - 0.15) < 1e-10
+
+    def test_explicit_reference_marking(self, entity_frame_with_collections, caplog):
+        """Test explicit reference marking with .reference()."""
+        ef = entity_frame_with_collections
+
+        with caplog.at_level(logging.INFO):
+            # Explicitly mark truth as reference
+            result = ef.analyse(
+                sl.col("a").at(0.8),
+                sl.col("b").at(0.9).reference(),  # Explicit reference
+                metrics=[
+                    sl.Metrics.eval.f1,
+                    sl.Metrics.eval.precision,
+                    sl.Metrics.eval.recall,
+                ],
+            )
+
+        # Should not log about implicit reference since we provided explicit one
+        assert "No explicit reference specified" not in caplog.text
+
+        # Result should still work correctly
+        assert len(result) == 1
+        assert "f1" in result[0]
+        assert "precision" in result[0]
+        assert "recall" in result[0]
+
+    def test_implicit_reference_marking(self, entity_frame_with_collections, caplog):
+        """Test implicit reference marking (last expression)."""
+        ef = entity_frame_with_collections
+
+        with caplog.at_level(logging.INFO):
+            # No explicit reference - b should become implicit reference
+            result = ef.analyse(
+                sl.col("a").at(0.8),
+                sl.col("b").at(0.9),  # Will be implicit reference
+                metrics=[sl.Metrics.eval.f1],
+            )
+
+        # Should log about using implicit reference
+        assert "No explicit reference specified" in caplog.text
+        assert "'b' (last expression) as implicit reference" in caplog.text
+
+        # Result should work correctly
+        assert len(result) == 1
+        assert "f1" in result[0]
+
+    def test_reference_with_sweep(self, entity_frame_with_collections, caplog):
+        """Test reference marking with sweep operations."""
+        ef = entity_frame_with_collections
+
+        with caplog.at_level(logging.INFO):
+            # Sweep vs point with explicit reference
+            result = ef.analyse(
+                sl.col("a").sweep(0.7, 0.9, 0.1),
+                sl.col("b").at(0.85).reference(),  # Explicit reference
+                metrics=[sl.Metrics.eval.precision, sl.Metrics.eval.recall],
+            )
+
+        # Should not log about implicit reference
+        assert "No explicit reference specified" not in caplog.text
+
+        # Should produce 3 results (one for each threshold in sweep)
+        assert len(result) == 3
+        for r in result:
+            assert "precision" in r
+            assert "recall" in r
+
+    def test_multiple_references_error(self, entity_frame_with_collections):
+        """Test that marking multiple collections as reference raises an error."""
+        ef = entity_frame_with_collections
+
+        # Attempting to mark both collections as reference should fail
+        with pytest.raises(
+            ValueError, match="Multiple collections marked as reference"
+        ):
+            ef.analyse(
+                sl.col("a").at(0.8).reference(),  # First reference
+                sl.col("b").at(0.9).reference(),  # Second reference - should error
+                metrics=[sl.Metrics.eval.f1],
+            )
+
+    def test_single_collection_no_reference(self, entity_frame_with_collections):
+        """Test that single collection analysis doesn't need reference."""
+        ef = entity_frame_with_collections
+
+        # Single collection with statistics metrics - no reference needed
+        result = ef.analyse(
+            sl.col("a").at(0.8),
+            metrics=[sl.Metrics.stats.entity_count, sl.Metrics.stats.entropy],
+        )
+
+        assert len(result) == 1
+        assert "entity_count" in result[0]
+        assert "entropy" in result[0]
+
+        # Marking reference on single collection should still work
+        result_with_ref = ef.analyse(
+            sl.col("a").at(0.8).reference(),  # Ignored for single collection
+            metrics=[sl.Metrics.stats.entity_count],
+        )
+
+        assert len(result_with_ref) == 1
+        assert "entity_count" in result_with_ref[0]
 
 
 class TestLargeScaleExpressions:

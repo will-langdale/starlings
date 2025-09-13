@@ -854,7 +854,7 @@ impl PyEntityFrame {
         &mut self,
         expressions: &Bound<'_, pyo3::types::PyTuple>,
         metrics: Option<Vec<Bound<'_, PyAny>>>,
-        _py: Python,
+        py: Python,
     ) -> PyResult<Vec<std::collections::HashMap<String, f64>>> {
         use std::collections::HashMap;
 
@@ -864,6 +864,10 @@ impl PyEntityFrame {
             let parsed = parse_expression(&expr)?;
             parsed_expressions.push(parsed);
         }
+
+        // Determine which collection is the reference for asymmetric metrics
+        // This logs info about implicit reference if needed
+        let _ = self.determine_reference(&parsed_expressions, py)?;
 
         // Parse metrics from Python, providing defaults if none specified
         let parsed_metrics = if let Some(metric_objs) = metrics {
@@ -922,6 +926,7 @@ impl PyEntityFrame {
                     start,
                     stop,
                     step,
+                    ..
                 } => (
                     collection.clone(),
                     generate_sweep_thresholds(*start, *stop, *step),
@@ -934,6 +939,7 @@ impl PyEntityFrame {
                     start,
                     stop,
                     step,
+                    ..
                 } => (
                     collection.clone(),
                     generate_sweep_thresholds(*start, *stop, *step),
@@ -1173,6 +1179,84 @@ impl PyEntityFrame {
 }
 
 impl PyEntityFrame {
+    /// Helper method to log info messages via Python's logging module
+    fn log_info(&self, py: Python, message: &str) {
+        use pyo3::types::PyModule;
+
+        // Best effort logging - ignore failures silently
+        if let Ok(logging) = PyModule::import(py, "logging") {
+            if let Ok(logger) = logging.getattr("getLogger").and_then(|f| f.call0()) {
+                let _ = logger.call_method1("info", (message,));
+            }
+        }
+    }
+
+    /// Helper function to determine which collection is the reference for metrics
+    fn determine_reference(
+        &self,
+        expressions: &[ExpressionType],
+        py: Python,
+    ) -> PyResult<Option<String>> {
+        // Check for explicit reference marking
+        let explicit_refs: Vec<_> = expressions
+            .iter()
+            .filter_map(|expr| {
+                let (collection, is_reference) = match expr {
+                    ExpressionType::Point {
+                        collection,
+                        is_reference,
+                        ..
+                    } => (collection, is_reference),
+                    ExpressionType::Sweep {
+                        collection,
+                        is_reference,
+                        ..
+                    } => (collection, is_reference),
+                };
+
+                if *is_reference {
+                    Some(collection.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Check for multiple references (error condition)
+        if explicit_refs.len() > 1 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Multiple collections marked as reference. Only one reference is allowed.",
+            ));
+        }
+
+        // Return explicit reference if found
+        if !explicit_refs.is_empty() {
+            return Ok(Some(explicit_refs[0].clone()));
+        }
+
+        // If no explicit reference and we have multiple collections, use implicit (last expression)
+        if expressions.len() >= 2 {
+            let last_collection = match &expressions[expressions.len() - 1] {
+                ExpressionType::Point { collection, .. }
+                | ExpressionType::Sweep { collection, .. } => collection.clone(),
+            };
+
+            // Log that we're using implicit reference
+            self.log_info(
+                py,
+                &format!(
+                    "No explicit reference specified. Using '{}' (last expression) as implicit reference for asymmetric metrics.",
+                    last_collection
+                ),
+            );
+
+            return Ok(Some(last_collection));
+        }
+
+        // Single collection or no collections - no reference needed
+        Ok(None)
+    }
+
     /// Helper: Build partitions for a collection at multiple thresholds
     fn build_partitions_for_thresholds(
         &self,

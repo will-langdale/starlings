@@ -22,13 +22,18 @@ use starlings_core::{DataContext, PartitionLevel};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExpressionType {
     /// Single threshold query
-    Point { collection: String, threshold: f64 },
+    Point {
+        collection: String,
+        threshold: f64,
+        is_reference: bool,
+    },
     /// Threshold range query
     Sweep {
         collection: String,
         start: f64,
         stop: f64,
         step: f64,
+        is_reference: bool,
     },
 }
 
@@ -74,6 +79,12 @@ pub fn parse_expression(py_expr: &Bound<'_, PyAny>) -> PyResult<ExpressionType> 
     // Extract expression_type attribute
     let expr_type: String = py_expr.getattr("expression_type")?.extract()?;
 
+    // Extract is_reference attribute (defaults to false if not present)
+    let is_reference: bool = py_expr
+        .getattr("is_reference")
+        .and_then(|attr| attr.extract())
+        .unwrap_or(false);
+
     match expr_type.as_str() {
         "point" => {
             let params = py_expr.getattr("params")?;
@@ -83,6 +94,7 @@ pub fn parse_expression(py_expr: &Bound<'_, PyAny>) -> PyResult<ExpressionType> 
             Ok(ExpressionType::Point {
                 collection,
                 threshold,
+                is_reference,
             })
         }
         "sweep" => {
@@ -97,6 +109,7 @@ pub fn parse_expression(py_expr: &Bound<'_, PyAny>) -> PyResult<ExpressionType> 
                 start,
                 stop,
                 step,
+                is_reference,
             })
         }
         _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(

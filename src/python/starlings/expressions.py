@@ -47,10 +47,45 @@ class Expression:
         """
         self.expression_type = expression_type
         self.params = params
+        self.is_reference = False
+
+    def reference(self) -> Expression:
+        """Mark this collection as the reference (ground truth) for asymmetric metrics.
+
+        When computing asymmetric comparison metrics like precision, recall, and f1,
+        one collection must be designated as the reference (ground truth). Collections
+        not marked with .reference() are treated as predictions.
+
+        If no collection is explicitly marked as reference, the last expression
+        passed to analyse() is implicitly used as the reference.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            ```python
+            # Explicit reference
+            ef.analyse(
+                sl.col("splink").sweep(0.8, 0.9, 0.1),
+                sl.col("truth").at(1.0).reference(),
+                metrics=[sl.Metrics.eval.recall],
+            )
+
+            # Implicit reference (last expression)
+            ef.analyse(
+                sl.col("splink").sweep(0.8, 0.9, 0.1),
+                sl.col("truth").at(1.0),  # Becomes reference implicitly
+                metrics=[sl.Metrics.eval.recall],
+            )
+            ```
+        """
+        self.is_reference = True
+        return self
 
     def __repr__(self) -> str:
         """String representation for debugging."""
-        return f"Expression({self.expression_type}, {self.params})"
+        ref_str = " [reference]" if self.is_reference else ""
+        return f"Expression({self.expression_type}, {self.params}){ref_str}"
 
 
 class ColExpression:
