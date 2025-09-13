@@ -238,14 +238,14 @@ impl PyEntityFrame {
         Ok(())
     }
     
-    pub fn analyse(&mut self, 
+    pub fn analyse(&mut self,
                   expressions: Vec<PyExpression>,
                   metrics: Option<Vec<PyMetric>>) -> PyResult<PyObject> {
         let mut frame = self.inner.lock().unwrap();
-        
-        // Parse expressions to determine operation type
-        let operation = parse_expressions(expressions)?;
-        
+
+        // Parse expressions to determine operation type and reference
+        let (operation, reference_info) = parse_expressions_with_reference(expressions)?;
+
         // Python wrapper provides defaults if metrics not specified
         let metrics = metrics.unwrap_or_else(|| {
             match &operation {
@@ -262,24 +262,31 @@ impl PyEntityFrame {
                 ],
             }
         });
-        
-        // Call Rust implementation with required metrics
+
+        // Call Rust implementation with tidy-row output format
         let results = match operation {
-            Operation::PointComparison(cuts) => {
-                let metrics = frame.compare_cuts(cuts, metrics);
-                vec![metrics]  // Single dict in list
+            Operation::SingleCollection(col_spec) => {
+                frame.compute_single_collection_metrics(col_spec, metrics)
             },
-            Operation::Sweep(sweep_spec) => {
-                frame.sweep(sweep_spec, metrics)  // Already returns List[Dict]
+            Operation::Comparison { predictions, reference } => {
+                frame.compute_comparison_metrics(predictions, reference, metrics)
             },
         };
-        
+
         Python::with_gil(|py| {
-            // Convert to Python list of dicts
-            let py_list = PyList::new(py, 
-                results.into_iter().map(|dict| {
-                    dict.to_pydict(py)
+            // Convert to Python list of dicts with universal schema
+            let py_list = PyList::new(py,
+                results.into_iter().map(|row| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("collection", row.collection)?;
+                    dict.set_item("collection_threshold", row.collection_threshold)?;
+                    dict.set_item("reference", row.reference)?;
+                    dict.set_item("reference_threshold", row.reference_threshold)?;
+                    dict.set_item("metric_name", row.metric_name)?;
+                    dict.set_item("metric_value", row.metric_value)?;
+                    Ok(dict)
                 })
+                .collect::<PyResult<Vec<_>>>()?
             );
             Ok(py_list.into())
         })
@@ -500,6 +507,36 @@ impl Ops {
 }
 ```
 
+### Expression API classes
+
+```rust
+#[pyclass]
+pub struct PyColExpression {
+    collection_name: String,
+    is_reference: bool,  // Tracks if marked as reference
+    threshold: Option<f64>,
+    sweep_params: Option<(f64, f64, f64)>,
+}
+
+#[pymethods]
+impl PyColExpression {
+    pub fn at(&mut self, threshold: f64) -> PyResult<Self> {
+        self.threshold = Some(threshold);
+        Ok(self.clone())
+    }
+
+    pub fn sweep(&mut self, start: f64, stop: f64, step: f64) -> PyResult<Self> {
+        self.sweep_params = Some((start, stop, step));
+        Ok(self.clone())
+    }
+
+    pub fn reference(&mut self) -> PyResult<Self> {
+        self.is_reference = true;
+        Ok(self.clone())
+    }
+}
+```
+
 ### Module registration
 
 ```rust
@@ -549,7 +586,37 @@ fn starlings(_py: Python, m: &PyModule) -> PyResult<()> {
 fn col(name: &str) -> PyColExpression {
     PyColExpression {
         collection_name: name.to_string(),
+        is_reference: false,  // Default to not being a reference
     }
+}
+
+// Helper to parse expressions and determine reference collection
+fn parse_expressions_with_reference(expressions: Vec<PyExpression>)
+    -> PyResult<(Operation, Option<ReferenceInfo>)> {
+    // Check for explicit .reference() marker
+    let explicit_ref = expressions.iter()
+        .position(|e| e.is_reference);
+
+    let reference_info = if let Some(ref_idx) = explicit_ref {
+        Some(ReferenceInfo {
+            collection: expressions[ref_idx].collection_name.clone(),
+            threshold: expressions[ref_idx].threshold,
+        })
+    } else if expressions.len() > 1 {
+        // Implicit reference: use last expression
+        let last = &expressions[expressions.len() - 1];
+        Some(ReferenceInfo {
+            collection: last.collection_name.clone(),
+            threshold: last.threshold,
+        })
+    } else {
+        None  // Single collection, no reference needed
+    };
+
+    // Parse operation type based on expressions
+    let operation = determine_operation_type(&expressions, &reference_info)?;
+
+    Ok((operation, reference_info))
 }
 
 #[pyfunction]

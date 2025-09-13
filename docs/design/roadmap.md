@@ -143,14 +143,23 @@
 
 - [ ] Python col() function returning ColExpression
 - [ ] ColExpression.at() and .sweep() methods
+- [ ] ColExpression.reference() method for marking ground truth
 - [ ] Rust expression parsing distinguishing point vs sweep
+- [ ] Determine reference collection (explicit via .reference() or implicit as last expression)
 - [ ] EntityFrame.analyse() taking variable expressions
-- [ ] Return type always List[Dict[str, float]]
-- [ ] Test: sl.col("a").at(0.8), sl.col("b").at(1.0) comparison
-- [ ] Test: sl.col("a").sweep(0.5, 0.9, 0.1) output format
-- [ ] Update E2E test: Replace manual `.at()` calls with expression API, add sweep testing
+- [ ] Return type always List[Dict[str, Any]] with universal tidy-row schema:
+  - "collection": str (primary collection name)
+  - "collection_threshold": float
+  - "reference": Optional[str] (None for single-collection)
+  - "reference_threshold": Optional[float] (None for single-collection)
+  - "metric_name": str
+  - "metric_value": float
+- [ ] Test: sl.col("a").at(0.8), sl.col("b").at(1.0).reference() with explicit reference
+- [ ] Test: sl.col("a").sweep(0.5, 0.9, 0.1) single-collection output format
+- [ ] Test: implicit reference behaviour (last expression becomes reference)
+- [ ] Update E2E test: Replace manual `.at()` calls with expression API, add sweep testing with new output format
 
-**Reference**: `interface.md` - Expression API section
+**Reference**: `interface.md` - Expression API section (updated with .reference() method and tidy-row format)
 
 ### Task 2.3: Core Metrics
 

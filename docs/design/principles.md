@@ -39,6 +39,7 @@ We choose simple, correct solutions and optimise them using Rust's low-level con
 - Efficiently sweep all thresholds
 - Compute comprehensive metrics (precision, recall, F1, ARI, NMI)
 - Identify optimal cut points for different objectives
+- For asymmetric metrics (precision, recall, F1), explicitly distinguish between prediction and reference collections
 
 **2. Fixed threshold data comparison**
 *"I have entities resolved at a fixed threshold and need to compare with other data"*
@@ -286,11 +287,16 @@ This enables O(k) updates for metrics like ARI and NMI as we move between thresh
 ## Complete mathematical operation space
 
 **Pairwise classification metrics**
-- **Precision**: `P(t) = |TP(t)| / (|TP(t)| + |FP(t)|)`
-- **Recall**: `R(t) = |TP(t)| / (|TP(t)| + |FN(t)|)`
-- **F-measure**: `F_β(t) = (1 + β²) · P(t) · R(t) / (β² · P(t) + R(t))`
 
-These update incrementally in O(k) as only changed pairs need recomputation.
+For asymmetric metrics, one collection must be designated as the reference (ground truth):
+- **Reference collection**: The ground truth against which predictions are evaluated
+- **Prediction collection(s)**: The collection(s) being evaluated against the reference
+
+- **Precision**: `P(t) = |TP(t)| / (|TP(t)| + |FP(t)|)` - fraction of predicted pairs that are correct
+- **Recall**: `R(t) = |TP(t)| / (|TP(t)| + |FN(t)|)` - fraction of true pairs that are found
+- **F-measure**: `F_β(t) = (1 + β²) · P(t) · R(t) / (β² · P(t) + R(t))` - harmonic mean of precision and recall
+
+These update incrementally in O(k) as only changed pairs need recomputation. The API provides `.reference()` to explicitly mark the ground truth collection, or uses the last expression as an implicit reference.
 
 **Cluster evaluation metrics**
 

@@ -177,57 +177,80 @@ class EntityFrame:
             owned = ef["splink"].copy()
         """
     
-    def analyse(self, *expressions, metrics: Optional[List] = None) -> List[Dict[str, float]]:
+    def analyse(self, *expressions, metrics: Optional[List] = None) -> List[Dict[str, Any]]:
         """
         Universal analysis method using expressions.
-        
-        Always returns List[Dict[str, float]] where each dict represents one measurement.
-        This uniform format works seamlessly with DataFrame libraries.
-        
+
+        Always returns List[Dict[str, Any]] with a consistent tidy-row format where each dict
+        has exactly six standard fields. This universal schema works for both single-collection
+        statistics and multi-collection comparison metrics.
+
         Args:
-            *expressions: One or more sl.col() expressions
+            *expressions: One or more sl.col() expressions. For asymmetric metrics (precision,
+                         recall, f1), use .reference() to explicitly mark the ground truth,
+                         or the last expression will be used as reference implicitly.
             metrics: List of metrics to compute. If None, defaults are:
                     - For comparisons (2+ collections): f1, precision, recall, ari, nmi
                     - For single collection: entity_count, entropy
                     The Rust layer always receives explicit metrics (Python provides defaults).
-        
+
         Returns:
-            List[Dict[str, float]]: Uniform format regardless of operation:
-            - Point comparisons: Single dict in list
-            - Sweeps: One dict per threshold point  
-            - Mixed operations: Cartesian product of sweep points
-            
-            Dictionary keys:
-            - "{collection}_threshold" for all threshold values (no special cases)
-            - Direct metric names ("f1", "precision", "recall", etc.)
-        
+            List[Dict[str, Any]]: Universal tidy-row format with these fields:
+            - "collection": Name of the primary collection being measured (str)
+            - "collection_threshold": Threshold of the primary collection (float)
+            - "reference": Name of the reference collection, None for single-collection (str or None)
+            - "reference_threshold": Threshold of reference, None for single-collection (float or None)
+            - "metric_name": Name of the statistic or metric (str)
+            - "metric_value": The calculated value (float)
+
         Example:
-            # Point comparison
+            # Point comparison (explicit reference)
             >>> result = ef.analyse(
             ...     sl.col("splink").at(0.85),
-            ...     sl.col("truth").at(1.0),
+            ...     sl.col("truth").at(1.0).reference(),
             ...     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision]
             ... )
-            [{"splink_threshold": 0.85, "truth_threshold": 1.0, "f1": 0.92, ...}]
-            
-            # Single collection sweep (note: still uses collection_threshold)
+            [{"collection": "splink", "collection_threshold": 0.85,
+              "reference": "truth", "reference_threshold": 1.0,
+              "metric_name": "f1", "metric_value": 0.92},
+             {"collection": "splink", "collection_threshold": 0.85,
+              "reference": "truth", "reference_threshold": 1.0,
+              "metric_name": "precision", "metric_value": 0.89}]
+
+            # Single collection sweep
             >>> result = ef.analyse(
             ...     sl.col("splink").sweep(0.7, 0.9, 0.1),
             ...     metrics=[sl.Metrics.stats.entity_count]
             ... )
-            [{"splink_threshold": 0.7, "entity_count": 1250},
-             {"splink_threshold": 0.8, "entity_count": 980},
-             {"splink_threshold": 0.9, "entity_count": 750}]
-            
-            # Mixed operations (cartesian product)
+            [{"collection": "splink", "collection_threshold": 0.7,
+              "reference": None, "reference_threshold": None,
+              "metric_name": "entity_count", "metric_value": 1250},
+             {"collection": "splink", "collection_threshold": 0.8,
+              "reference": None, "reference_threshold": None,
+              "metric_name": "entity_count", "metric_value": 980},
+             {"collection": "splink", "collection_threshold": 0.9,
+              "reference": None, "reference_threshold": None,
+              "metric_name": "entity_count", "metric_value": 750}]
+
+            # Sweep x point (implicit reference - last expression)
             >>> result = ef.analyse(
             ...     sl.col("splink").sweep(0.8, 0.9, 0.1),
-            ...     sl.col("dedupe").at(0.75),
-            ...     metrics=[sl.Metrics.eval.f1]
+            ...     sl.col("truth").at(1.0),  # Implicitly becomes reference
+            ...     metrics=[sl.Metrics.eval.f1, sl.Metrics.stats.entity_count]
             ... )
-            [{"splink_threshold": 0.8, "dedupe_threshold": 0.75, "f1": 0.82},
-             {"splink_threshold": 0.9, "dedupe_threshold": 0.75, "f1": 0.87}]
-            
+            [{"collection": "splink", "collection_threshold": 0.8,
+              "reference": "truth", "reference_threshold": 1.0,
+              "metric_name": "f1", "metric_value": 0.91},
+             {"collection": "splink", "collection_threshold": 0.8,
+              "reference": None, "reference_threshold": None,
+              "metric_name": "entity_count", "metric_value": 9870},
+             {"collection": "splink", "collection_threshold": 0.9,
+              "reference": "truth", "reference_threshold": 1.0,
+              "metric_name": "f1", "metric_value": 0.94},
+             {"collection": "splink", "collection_threshold": 0.9,
+              "reference": None, "reference_threshold": None,
+              "metric_name": "entity_count", "metric_value": 8540}]
+
             # Easy DataFrame conversion
             >>> import polars as pl
             >>> df = pl.from_dicts(result)
@@ -465,9 +488,36 @@ class col:
     def sweep(self, start: float, stop: float, step: float = 0.01) -> 'Expression':
         """
         Specify threshold range for sweeping.
-        
+
         Example:
             sl.col("splink").sweep(0.5, 0.95, 0.01)
+        """
+
+    def reference(self) -> 'Expression':
+        """
+        Mark this collection as the reference (ground truth) for asymmetric metrics.
+
+        When computing asymmetric comparison metrics like precision, recall, and f1,
+        one collection must be designated as the reference (ground truth). Collections
+        not marked with .reference() are treated as predictions.
+
+        If no collection is explicitly marked as reference, the last expression
+        passed to analyse() is implicitly used as the reference.
+
+        Example:
+            # Explicit reference
+            ef.analyse(
+                sl.col("splink").sweep(0.8, 0.9, 0.1),
+                sl.col("truth").at(1.0).reference(),
+                metrics=[sl.Metrics.eval.recall]
+            )
+
+            # Implicit reference (last expression)
+            ef.analyse(
+                sl.col("splink").sweep(0.8, 0.9, 0.1),
+                sl.col("truth").at(1.0),  # Becomes reference implicitly
+                metrics=[sl.Metrics.eval.recall]
+            )
         """
 
 # Pre-defined metrics as module constants (injectable functions)
@@ -784,15 +834,22 @@ ef.add_collection_from_edges("splink_output", edges)
 # Find optimal threshold using polars-inspired API
 sweep_results = ef.analyse(
     sl.col("splink_output").sweep(0.5, 0.95, 0.01),
-    sl.col("ground_truth").at(1.0),
+    sl.col("ground_truth").at(1.0).reference(),  # Explicit reference
     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision, sl.Metrics.eval.recall]
 )
-# Returns List[Dict]: [{"splink_output_threshold": 0.5, "ground_truth_threshold": 1.0, "f1": 0.72, ...}, ...]
+# Returns tidy-row format:
+# [{"collection": "splink_output", "collection_threshold": 0.5,
+#   "reference": "ground_truth", "reference_threshold": 1.0,
+#   "metric_name": "f1", "metric_value": 0.72}, ...]
 
 # Convert to polars for analysis
 df_results = pl.from_dicts(sweep_results)
-optimal_row = df_results.filter(pl.col("f1") == pl.col("f1").max()).row(0, named=True)
-print(f"Optimal threshold: {optimal_row['splink_output_threshold']:.2f} (F1={optimal_row['f1']:.3f})")
+# Filter for F1 metric and find optimal threshold
+f1_results = df_results.filter(pl.col("metric_name") == "f1")
+optimal_row = f1_results.filter(
+    pl.col("metric_value") == pl.col("metric_value").max()
+).row(0, named=True)
+print(f"Optimal threshold: {optimal_row['collection_threshold']:.2f} (F1={optimal_row['metric_value']:.3f})")
 ```
 
 ## Integration with er-evaluation
@@ -811,12 +868,15 @@ ef.add_collection_from_entities("truth", true_entities)
 # Use Starlings's efficient sweep
 sweep_results = ef.analyse(
     sl.col("predicted").sweep(0.5, 0.95),
-    sl.col("truth").at(1.0),
+    sl.col("truth").at(1.0),  # Implicit reference (last expression)
     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision, sl.Metrics.eval.recall]
 )
-# Returns: [{"predicted_threshold": 0.5, "truth_threshold": 1.0, ...}, ...]
+# Returns tidy-row format:
+# [{"collection": "predicted", "collection_threshold": 0.5,
+#   "reference": "truth", "reference_threshold": 1.0,
+#   "metric_name": "f1", "metric_value": 0.82}, ...]
 
-# Or extract partition for er-evaluation  
+# Or extract partition for er-evaluation
 partition = ef["predicted"].at(0.85)
 clusters = partition.to_list()
 metrics = er_eval.evaluate(clusters, true_clusters)
@@ -824,9 +884,12 @@ metrics = er_eval.evaluate(clusters, true_clusters)
 # Also supports American spelling
 comparison = ef.analyze(
     sl.col("predicted").at(0.85),
-    sl.col("truth").at(1.0),
+    sl.col("truth").at(1.0).reference(),  # Explicit reference
     metrics=[sl.Metrics.eval.f1]
 )
+# Returns: [{"collection": "predicted", "collection_threshold": 0.85,
+#           "reference": "truth", "reference_threshold": 1.0,
+#           "metric_name": "f1", "metric_value": 0.89}]
 ```
 
 ## Integration with Matchbox
@@ -850,14 +913,15 @@ ef.add_collection_from_edges("matchbox", edges)
 # Find optimal threshold
 sweep_results = ef.analyse(
     sl.col("matchbox").sweep(0.7, 0.95),
-    sl.col("truth").at(1.0),
+    sl.col("truth").at(1.0).reference(),
     metrics=[sl.Metrics.eval.f1]
 )
+# Returns tidy-row format for easy analysis
 # Convert to polars and find optimal
 df_results = pl.from_dicts(sweep_results)
 optimal_threshold = df_results.filter(
-    pl.col("f1") == pl.col("f1").max()
-).select("matchbox_threshold")[0, 0]
+    pl.col("metric_value") == pl.col("metric_value").max()
+).select("collection_threshold")[0, 0]
 
 # Export with hashes at optimal threshold
 partition = ef["matchbox"].at(optimal_threshold)
@@ -1117,9 +1181,9 @@ partition = ef["resolved"].at(0.85)  # O(1) if cached
 # Efficient sweep with incremental updates
 sweep_results = ef.analyse(
     sl.col("resolved").sweep(0.5, 0.95),
-    sl.col("truth").at(1.0),
+    sl.col("truth").at(1.0).reference(),
     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision]
-)  # Returns List[Dict], O(k) between thresholds
+)  # Returns tidy-row List[Dict], O(k) between thresholds
 
 # Can convert to polars if needed
 import polars as pl
@@ -1148,21 +1212,27 @@ ef.add_collection_from_entities("truth", truth_entities)
 comparison = ef.analyse(
     sl.col("splink").at(0.85),
     sl.col("dedupe").at(0.76),
-    sl.col("truth").at(1.0),
+    sl.col("truth").at(1.0).reference(),  # Explicit reference
     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision, sl.Metrics.eval.recall]
 )
-# Returns: [{"splink_threshold": 0.85, "dedupe_threshold": 0.76, "truth_threshold": 1.0, ...}]
+# Returns tidy-row format with separate rows per collection and metric:
+# [{"collection": "splink", "collection_threshold": 0.85,
+#   "reference": "truth", "reference_threshold": 1.0,
+#   "metric_name": "f1", "metric_value": 0.89},
+#  {"collection": "dedupe", "collection_threshold": 0.76,
+#   "reference": "truth", "reference_threshold": 1.0,
+#   "metric_name": "f1", "metric_value": 0.85}, ...]
 
 # Find optimal thresholds efficiently
 splink_sweep = ef.analyse(
     sl.col("splink").sweep(0.5, 0.95),
-    sl.col("truth").at(1.0),
+    sl.col("truth").at(1.0),  # Implicit reference (last expression)
     metrics=[sl.Metrics.eval.f1]
 )
 # Convert to dataframe for analysis
 import polars as pl
 df = pl.from_dicts(splink_sweep)
-optimal = df.filter(df['f1'] == df['f1'].max()).row(0, named=True)
+optimal = df.filter(df['metric_value'] == df['metric_value'].max()).row(0, named=True)
 ```
 
 ### Important notes on performance

@@ -812,7 +812,13 @@ pub struct SparseEdgeList {
 
 ### Algorithm selection strategy
 
-When comparing collections, we have two distinct algorithms optimised for different scenarios:
+When comparing collections, we have two distinct algorithms optimised for different scenarios.
+
+**Reference collection handling for asymmetric metrics**:
+When computing asymmetric metrics (precision, recall, F1), one collection must be designated as the reference (ground truth). The algorithms handle this by:
+- Building the contingency table with reference collection as rows, predictions as columns
+- Computing metrics with correct directionality based on this structure
+- The API layer determines which collection is the reference (explicit via `.reference()` or implicit as last expression)
 
 **Delta-based algorithm** (incremental updates)
 - **Complexity**: O(k) updates between adjacent thresholds where k = affected entities
@@ -853,27 +859,28 @@ For cross-collection comparison at single thresholds:
 
 ```rust
 pub fn from_partitions_via_records(
-    partition1: &PartitionLevel,
-    partition2: &PartitionLevel,
+    prediction: &PartitionLevel,
+    reference: &PartitionLevel,
     context: &DataContext,
 ) -> SparseContingencyTable {
     // Build reverse indices: record → entity
-    let record_to_entity1 = build_reverse_index(partition1);
-    let record_to_entity2 = build_reverse_index(partition2);
-    
+    let record_to_entity_pred = build_reverse_index(prediction);
+    let record_to_entity_ref = build_reverse_index(reference);
+
     // Single pass over records (parallelisable)
     let pairs: Vec<(EntityId, EntityId)> = (0..num_records)
         .into_par_iter()
         .filter_map(|record_idx| {
-            match (record_to_entity1[record_idx], record_to_entity2[record_idx]) {
-                (Some(e1), Some(e2)) => Some((e1, e2)),
+            match (record_to_entity_pred[record_idx], record_to_entity_ref[record_idx]) {
+                (Some(pred_entity), Some(ref_entity)) => Some((pred_entity, ref_entity)),
                 _ => None,
             }
         })
         .collect();
-    
+
     // Aggregate into contingency table
-    build_contingency_table(pairs, partition1, partition2)
+    // Reference is rows, prediction is columns for correct metric computation
+    build_contingency_table(pairs, prediction, reference)
 }
 ```
 
