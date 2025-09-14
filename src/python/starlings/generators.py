@@ -21,9 +21,11 @@ def edges(n: int, *, num_thresholds: int | None = None) -> list[tuple[int, int, 
     Args:
         n: Target number of entities for dataset sizing. The algorithm uses an
             effective count where effective_n = n if n is even, n-1 if n is odd.
-        num_thresholds: If provided, snap thresholds to discrete values for
-            controlled testing. If None, add continuous jitter for PGO training
-            diversity.
+        num_thresholds: Controls threshold distribution:
+            - None (default): Applies ±0.001 random jitter to all thresholds,
+              creating continuous variation ideal for PGO training diversity
+            - Integer value: Snaps to exactly that many discrete, evenly-spaced
+              thresholds (e.g., 5 gives [0.0, 0.25, 0.5, 0.75, 0.999])
 
     Returns:
         List of (entity_id1, entity_id2, threshold) tuples with approximately
