@@ -14,6 +14,8 @@ nav:
   - Roadmap: design/roadmap.md
 - API reference:
   - Core: api/index.md
+  - Configuration: api/config.md
+  - Expressions: api/expressions.md
   - Metrics: api/metrics.md
   - Generators: api/generators.md
 - Contributing: contributing.md

@@ -17,3 +17,19 @@
             - "!^generators$"  # Has its own dedicated page
             - "!^metrics$"  # Has its own dedicated page
             - "!^Metrics$"  # Metrics instance has its own page
+            - "!^config$"  # Has its own dedicated page
+            - "!^expressions$"  # Has its own dedicated page
+            - "!^logger$"  # Private/undocumented
+            - "!^logging$"  # Private/undocumented
+            - "!^DEBUG_ENABLED$"  # Part of config module
+            - "!^generate_entity_resolution_edges$"  # Part of generators module
+            - "!^PyCollection$"  # Internal PyO3 class
+            - "!^PyEntityFrame$"  # Internal PyO3 class
+            - "!^PyPartition$"  # Internal PyO3 class
+            - "!^Any$"  # Type annotation
+            - "!^Iterable$"  # Type annotation
+            - "!^annotations$"  # Module internals
+            - "!^cast$"  # Type annotation
+            - "!^tqdm$"  # External dependency
+            - "!^version$"  # Module metadata
+            - "!^debug$"  # Debug class

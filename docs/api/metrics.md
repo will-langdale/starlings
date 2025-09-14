@@ -1,9 +1,3 @@
----
-markdown_extensions:
-    - toc:
-        toc_depth: 3
----
-
 # Metrics
 
 ::: starlings.metrics
