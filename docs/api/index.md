@@ -15,3 +15,5 @@
             - "!^_"       # Excludes private attributes
             - "!^starlings$"  # Excludes the PyO3 module function
             - "!^generators$"  # Has its own dedicated page
+            - "!^metrics$"  # Has its own dedicated page
+            - "!^Metrics$"  # Metrics instance has its own page

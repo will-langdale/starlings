@@ -12,8 +12,9 @@ nav:
   - Rust engine: design/engine.md
   - Python API: design/interface.md
   - Roadmap: design/roadmap.md
-- API reference: 
+- API reference:
   - Core: api/index.md
+  - Metrics: api/metrics.md
   - Generators: api/generators.md
 - Contributing: contributing.md
 
@@ -23,6 +24,7 @@ theme:
   favicon: assets/starling-logo.png
   features:
     - content.code.copy
+    - content.math.mathjax
     - navigation.sections
     - navigation.tabs
     - navigation.tabs.sticky
@@ -74,6 +76,8 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.blocks.caption
+  - pymdownx.arithmatex:
+      generic: true
   - toc:
       permalink: true
 
@@ -109,3 +113,7 @@ extra:
 
 extra_css:
   - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js

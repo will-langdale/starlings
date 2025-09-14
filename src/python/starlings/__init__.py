@@ -48,7 +48,8 @@ from typing import Any, cast
 from tqdm import tqdm
 
 from .config import DEBUG_ENABLED
-from .expressions import Metrics, col
+from .expressions import col
+from .metrics import Metrics
 from .starlings import Collection as PyCollection
 from .starlings import EntityFrame as PyEntityFrame
 from .starlings import Partition as PyPartition
@@ -575,6 +576,7 @@ class EntityFrame:
 
         Always returns List[Dict[str, float]] where each dict represents one
         measurement.
+
         This uniform format works seamlessly with DataFrame libraries.
 
         Args:

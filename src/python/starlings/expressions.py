@@ -1,49 +1,57 @@
-"""Expression API for Starlings analysis operations.
+"""Expression API for entity resolution analysis.
 
-This module provides a Polars-inspired expression API for analysing entity resolution
-results across different thresholds and collections. The API enables composable,
-efficient operations through lazy evaluation.
+This module provides the expression API for creating and composing
+entity resolution analysis queries, inspired by polars.col() pattern.
 
 Example:
-    ```python
-    import starlings as sl
+    Basic usage with single collection::
 
-    # Point comparison between collections
-    result = ef.analyse(
-        sl.col("splink").at(0.85),
-        sl.col("truth").at(1.0),
-        metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision],
-    )
+        import starlings as sl
 
-    # Sweep operation for threshold exploration
-    sweep_results = ef.analyse(
-        sl.col("splink").sweep(0.5, 0.95, 0.01), metrics=[sl.Metrics.stats.entity_count]
-    )
-    ```
+        # Single collection at specific threshold
+        sl.col("splink").at(0.85)
+
+        # Single collection across threshold range
+        sl.col("splink").sweep(0.5, 0.95, 0.01)
+
+    Cross-collection comparison::
+
+        # Compare two collections
+        ef.analyse(
+            sl.col("splink").sweep(0.8, 0.9, 0.01),
+            sl.col("dedupe").at(0.85),
+            metrics=[sl.Metrics.eval.f1],
+        )
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# Performance constants
-MIN_SWEEP_STEP = 0.05  # Minimum step size for reasonable performance
-STEP_ROUNDING_FACTOR = 0.05  # Round steps to this increment
+# Constants for sweep constraints
+MIN_SWEEP_STEP = 0.05  # Minimum step size for sweep operations
+STEP_ROUNDING_FACTOR = 0.05  # Round steps to nearest 0.05
 
 
 class Expression:
-    """Base class for analysis expressions.
+    """Represents a query expression for entity resolution analysis.
 
-    Expressions represent operations that can be applied to collections
-    within an EntityFrame for analysis purposes.
+    An expression defines how to query a collection (either at a specific
+    threshold or across a range) and can optionally be marked as a reference
+    for asymmetric metrics.
+
+    Attributes:
+        expression_type: Type of expression ("point" or "sweep")
+        params: Dictionary of parameters for the expression
+        is_reference: Whether this collection is the ground truth reference
     """
 
     def __init__(self, expression_type: str, **params: Any) -> None:
-        """Initialise expression with type and parameters.
+        """Create an expression with the specified type and parameters.
 
         Args:
-            expression_type: Type of expression ("point" or "sweep")
-            **params: Expression parameters
+            expression_type: Either "point" or "sweep"
+            **params: Expression-specific parameters (threshold, start/stop/step, etc.)
         """
         self.expression_type = expression_type
         self.params = params
@@ -52,19 +60,16 @@ class Expression:
     def reference(self) -> Expression:
         """Mark this collection as the reference (ground truth) for asymmetric metrics.
 
-        When computing asymmetric comparison metrics like precision, recall, and f1,
-        one collection must be designated as the reference (ground truth). Collections
-        not marked with .reference() are treated as predictions.
-
-        If no collection is explicitly marked as reference, the last expression
-        passed to analyse() is implicitly used as the reference.
+        When computing asymmetric metrics (precision, recall, F1), one collection
+        must be designated as the reference or ground truth. This method marks
+        the current expression as the reference.
 
         Returns:
             Self for method chaining
 
         Example:
             ```python
-            # Explicit reference
+            # Explicit reference marking
             ef.analyse(
                 sl.col("splink").sweep(0.8, 0.9, 0.1),
                 sl.col("truth").at(1.0).reference(),
@@ -203,52 +208,3 @@ class MetricFunction:
     def __repr__(self) -> str:
         """String representation for debugging."""
         return f"Metric({self.name})"
-
-
-class EvaluationMetrics:
-    """Evaluation metrics for comparing partitions.
-
-    These metrics require two or more collections to compare partitions
-    and compute agreement measures.
-    """
-
-    def __init__(self) -> None:
-        """Initialise evaluation metrics."""
-        self.f1 = MetricFunction("f1", "evaluation")
-        self.precision = MetricFunction("precision", "evaluation")
-        self.recall = MetricFunction("recall", "evaluation")
-        self.ari = MetricFunction("ari", "evaluation")
-        self.nmi = MetricFunction("nmi", "evaluation")
-        self.v_measure = MetricFunction("v_measure", "evaluation")
-        self.bcubed_precision = MetricFunction("bcubed_precision", "evaluation")
-        self.bcubed_recall = MetricFunction("bcubed_recall", "evaluation")
-
-
-class StatisticsMetrics:
-    """Statistical metrics for single collections.
-
-    These metrics can be computed on a single partition without requiring
-    comparison to other collections.
-    """
-
-    def __init__(self) -> None:
-        """Initialise statistics metrics."""
-        self.entity_count = MetricFunction("entity_count", "statistics")
-        self.entropy = MetricFunction("entropy", "statistics")
-
-
-class Metrics:
-    """Container for all available metrics.
-
-    Provides organised access to different categories of metrics that can
-    be used in the analyse() method.
-    """
-
-    def __init__(self) -> None:
-        """Initialise metrics container."""
-        self.eval = EvaluationMetrics()
-        self.stats = StatisticsMetrics()
-
-
-# Create module-level Metrics instance for easy access
-Metrics = Metrics()  # type: ignore[assignment,misc]
