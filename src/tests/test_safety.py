@@ -15,6 +15,7 @@ import numpy as np
 import psutil
 import pytest
 import starlings as sl
+from starlings import generators
 
 
 class MemoryBalloon:
@@ -231,11 +232,11 @@ class TestGeneratorSafety:
 
         with pytest.raises(ValueError, match="Operation too large"):
             # This should be rejected by safety system before allocation
-            sl.generate_entity_resolution_edges(excessive_entities)
+            generators.edges(excessive_entities)
 
     def test_small_generator_works(self):
         """Test that small generators work normally."""
-        edges = list(sl.generate_entity_resolution_edges(1000))
+        edges = list(generators.edges(1000))
         assert len(edges) >= 1  # Should return at least one batch
 
         # Check structure - first batch should contain actual edges
@@ -246,7 +247,7 @@ class TestGeneratorSafety:
     def test_medium_generator_works(self):
         """Test that medium-sized generators work."""
         # 100k entities should be safe on most systems
-        edge_gen = sl.generate_entity_resolution_edges(100_000)
+        edge_gen = generators.edges(100_000)
         edges = list(edge_gen)
 
         # Should produce multiple batches
@@ -264,7 +265,7 @@ class TestGeneratorSafety:
         excessive_entities = int(available_gb * 5_000_000)  # 5M entities per GB
 
         try:
-            sl.generate_entity_resolution_edges(excessive_entities)
+            generators.edges(excessive_entities)
             # If this succeeds, system has enormous memory - skip the test
             pytest.skip("System has too much memory to trigger safety limits")
         except (ValueError, MemoryError) as e:
@@ -282,11 +283,11 @@ class TestGeneratorSafety:
 
         # Small dataset should work regardless of safety level
         with self._temporary_env_var("STARLINGS_SAFETY_LEVEL", "conservative"):
-            edges = list(sl.generate_entity_resolution_edges(1000))
+            edges = list(generators.edges(1000))
             assert len(edges) >= 1
 
         with self._temporary_env_var("STARLINGS_SAFETY_LEVEL", "performance"):
-            edges = list(sl.generate_entity_resolution_edges(1000))
+            edges = list(generators.edges(1000))
             assert len(edges) >= 1
 
     @contextmanager

@@ -5,6 +5,7 @@ import time
 
 import pytest
 import starlings as sl
+from starlings import generators
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ def test_user_eda_workflow():
 
     # Time graph generation using unified entity resolution generator
     start_time = time.monotonic()
-    edges = sl.generate_entity_resolution_edges(1_000_000)
+    edges = generators.edges(1_000_000)
     total_nodes = 1_000_000  # Unified generator creates exactly n entities at
     # threshold 1.0
     graph_time = time.monotonic() - start_time
@@ -171,7 +172,7 @@ def test_user_eda_workflow():
     # Create a second 1M collection for cross-collection comparison
     logger.info("Creating second 1M-edge collection for cross-collection comparison")
     start_time = time.monotonic()
-    edges_2 = sl.generate_entity_resolution_edges(1_000_000)
+    edges_2 = generators.edges(1_000_000)
     collection_2 = sl.Collection.from_edges(edges_2, show_progress=False)
     frame.add_collection("compare_1m", collection_2)
     setup_time = time.monotonic() - start_time

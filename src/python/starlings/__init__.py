@@ -53,78 +53,11 @@ from .metrics import Metrics
 from .starlings import Collection as PyCollection
 from .starlings import EntityFrame as PyEntityFrame
 from .starlings import Partition as PyPartition
-from .starlings import (
-    generate_entity_resolution_edges as _generate_entity_resolution_edges,
-)
 
 logger = logging.getLogger(__name__)
 
 # Load debug flag once at module import time
 _DEBUG_ENABLED = DEBUG_ENABLED
-
-
-def generate_entity_resolution_edges(
-    n: int, num_thresholds: int | None = None
-) -> list[tuple[int, int, float]]:
-    """Generate entity resolution edges using the unified constructive algorithm.
-
-    ⚠️  **Memory Warning**: This function pre-allocates ~n*5 edges in memory
-    (approximately n*750 bytes). Large values of n may be rejected by the
-    safety system to prevent system crashes.
-
-    Creates realistic entity resolution test data following a constructive approach
-    that produces exactly n/2 entities at threshold 0.0 through systematic pair
-    construction, with realistic hierarchical patterns for benchmarking.
-
-    **Safety**: Respects STARLINGS_SAFETY_LEVEL environment variable:
-    - Conservative (default): Max 50% RAM usage
-    - Performance: Max 85% RAM usage
-
-    Args:
-        n: Target number of entities for sizing. Large values (>1M) may require
-            STARLINGS_SAFETY_LEVEL=performance or more system memory.
-            Algorithm uses effective_n where effective_n = n if n is even, n-1 if
-            n is odd.
-        num_thresholds: If provided, snap thresholds to discrete values;
-            if None, add continuous jitter for PGO training diversity
-
-    Returns:
-        List of (entity_id1, entity_id2, threshold) tuples with entity IDs as integers
-        and thresholds between 0.0 and 1.0
-
-    Raises:
-        MemoryError: If estimated memory usage exceeds safety limits
-
-    Algorithm:
-        Implements the 5-step constructive approach:
-        1. Create n/2 pairs of entities with high thresholds (>0.9) for merging
-        2. Add noise edges within pairs for density and realistic patterns
-        3. Apply jitter (continuous) or discrete threshold snapping
-        4. Remove duplicate edges and shuffle for randomization
-
-        Guarantees: exactly effective_n/2 entities at threshold 0.0
-
-    Example:
-        ```python
-        # Generate dataset with PGO jitter for training
-        edges = generate_entity_resolution_edges(100_000)
-        collection = Collection.from_edges(edges)
-
-        # Key guarantee: exactly n/2 entities at threshold 0.0
-        assert collection.at(0.0).num_entities == 50_000
-
-        # Generate dataset with discrete thresholds for testing
-        edges = generate_entity_resolution_edges(100_000, num_thresholds=10)
-
-        # For large datasets, you may need performance mode
-        import os
-
-        os.environ["STARLINGS_SAFETY_LEVEL"] = "performance"
-        edges = generate_entity_resolution_edges(5_000_000)  # 5M entities
-        ```
-    """
-    result = _generate_entity_resolution_edges(n, num_thresholds)
-    return result  # type: ignore[no-any-return]
 
 
 __version__ = version("starlings")
@@ -135,7 +68,6 @@ __all__ = [
     "Partition",
     "Metrics",
     "col",
-    "generate_entity_resolution_edges",
     "Key",
 ]
 

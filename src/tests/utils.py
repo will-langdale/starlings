@@ -30,9 +30,9 @@ def validate_entity_resolution_data(
     Example:
         ```python
         from tests.utils import validate_entity_resolution_data
-        import starlings
+        from starlings import generators
 
-        edges = starlings.generate_entity_resolution_edges(n=100_000)
+        edges = generators.edges(100_000)
         if validate_entity_resolution_data(edges, 100_000):
             logging.info("✅ Structure correct, scaling up...")
         ```

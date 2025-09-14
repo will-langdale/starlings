@@ -12,6 +12,7 @@ import time
 import psutil
 import pytest
 import starlings as sl
+from starlings import generators
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class TestPerformanceBenchmarks:
         )
 
         # Create generator (no upfront memory allocation)
-        edge_generator = sl.generate_entity_resolution_edges(int(self.n * 1_000_000))
+        edge_generator = generators.edges(int(self.n * 1_000_000))
 
         logger.info(
             f"   Target: ~{int(self.n * 5_000_000):,} edges, "
@@ -177,7 +178,7 @@ class TestPerformanceBenchmarks:
             entity_count = max(size // 5, 1000)  # Minimum 1000 entities
 
             # For scalability testing, use small datasets as lists for precise timing
-            edge_generator = sl.generate_entity_resolution_edges(int(entity_count))
+            edge_generator = generators.edges(int(entity_count))
             # Convert small datasets to list for precise edge count control
             edges = []
             for batch in edge_generator:
@@ -215,7 +216,7 @@ class TestPerformanceBenchmarks:
 
         # Create test collection using unified generator
         # Generate N*20k entities (produces N*100k edges)
-        edge_generator = sl.generate_entity_resolution_edges(int(self.n * 20_000))
+        edge_generator = generators.edges(int(self.n * 20_000))
         collection = sl.Collection.from_edges(
             edge_generator,
             show_progress=False,
@@ -254,7 +255,7 @@ class TestPerformanceBenchmarks:
         # Create test dataset scaled by N - same size as main benchmark (1M for N=1)
         n_entities = int(self.n * 1_000_000)
         logger.info(f"\n📊 Generating {n_entities:,} entities for sweep testing...")
-        edge_generator = sl.generate_entity_resolution_edges(n_entities)
+        edge_generator = generators.edges(n_entities)
 
         # Create collections
         logger.info("   Creating test collections...")
@@ -264,7 +265,7 @@ class TestPerformanceBenchmarks:
         )
 
         # Create a different collection for cross-collection comparison
-        edge_generator_b = sl.generate_entity_resolution_edges(n_entities)
+        edge_generator_b = generators.edges(n_entities)
         collection_b = sl.Collection.from_edges(
             edge_generator_b,
             show_progress=False,

@@ -5,6 +5,7 @@ import time
 
 import pytest
 import starlings as sl
+from starlings import generators
 
 
 class TestExpressionAPI:
@@ -346,8 +347,8 @@ class TestLargeScaleExpressions:
     ):
         """Test cross-collection comparison at various scales."""
         # Generate test data with fewer entities for practical performance
-        edges_a = sl.generate_entity_resolution_edges(scale, min(scale // 100, 10000))
-        edges_b = sl.generate_entity_resolution_edges(scale, min(scale // 100, 10000))
+        edges_a = generators.edges(scale, num_thresholds=min(scale // 100, 10000))
+        edges_b = generators.edges(scale, num_thresholds=min(scale // 100, 10000))
 
         # Create collections
         collection_a = sl.Collection.from_edges(edges_a, show_progress=False)
@@ -383,7 +384,7 @@ class TestLargeScaleExpressions:
     def test_large_scale_sweep_with_constraints(self):
         """Test that sweeps with 0.05 steps work efficiently at large scale."""
         # Generate 100k edges for practical test time
-        edges = sl.generate_entity_resolution_edges(100_000, 10_000)
+        edges = generators.edges(100_000, num_thresholds=10_000)
         collection = sl.Collection.from_edges(edges, show_progress=False)
 
         ef = sl.EntityFrame()
@@ -415,8 +416,8 @@ class TestLargeScaleExpressions:
     def test_cross_collection_sweep_performance(self):
         """Test cross-collection comparison with sweeps."""
         # Use smaller scale for cross-collection sweep test
-        edges_a = sl.generate_entity_resolution_edges(1_000, 100)
-        edges_b = sl.generate_entity_resolution_edges(1_000, 100)
+        edges_a = generators.edges(1_000, num_thresholds=100)
+        edges_b = generators.edges(1_000, num_thresholds=100)
 
         collection_a = sl.Collection.from_edges(edges_a, show_progress=False)
         collection_b = sl.Collection.from_edges(edges_b, show_progress=False)

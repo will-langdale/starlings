@@ -13,6 +13,7 @@ import time
 import psutil
 import pytest
 import starlings as sl
+from starlings import generators
 
 try:
     from .test_safety import MemoryBalloon
@@ -407,7 +408,7 @@ class TestSafetyIntegration:
             large_entities = min(100000, int(available_gb * 50000))
 
             try:
-                large_edges = sl.generate_entity_resolution_edges(large_entities)
+                large_edges = generators.edges(large_entities)
                 large_collection = sl.Collection.from_edges(large_edges)
 
                 # If it succeeds, it should work correctly
