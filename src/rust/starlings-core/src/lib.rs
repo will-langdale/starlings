@@ -2,6 +2,7 @@ pub mod core;
 pub mod expressions;
 pub mod frame;
 pub mod hierarchy;
+pub mod metrics;
 pub mod test_utils;
 
 // Re-export commonly used types for easier access

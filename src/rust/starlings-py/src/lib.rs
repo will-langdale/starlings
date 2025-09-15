@@ -8,6 +8,7 @@ use starlings_core::expressions::{
     build_all_sweep_tables, compute_comparison_metric, compute_single_metric,
     generate_sweep_thresholds, ExpressionType, MetricType, SparseContingencyTable,
 };
+use starlings_core::metrics::CoreMetricType;
 
 use starlings_core::core::ensure_memory_safety;
 use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
@@ -22,7 +23,7 @@ fn threshold_to_cache_key(threshold: f64) -> u64 {
     (threshold * 1_000_000.0).round() as u64
 }
 
-/// Determines the optimal algorithm for cross-collection comparison
+/// Check if we should use record-based algorithm (for backward compatibility)
 fn should_use_record_based_algorithm(
     expressions: &[ExpressionType],
     collection_names: &[String],
@@ -43,6 +44,23 @@ fn should_use_record_based_algorithm(
     }
 
     false
+}
+
+/// Convert MetricType to CoreMetricType
+#[allow(dead_code)]
+fn convert_metric_type(metric: &MetricType) -> CoreMetricType {
+    match metric {
+        MetricType::F1 => CoreMetricType::F1,
+        MetricType::Precision => CoreMetricType::Precision,
+        MetricType::Recall => CoreMetricType::Recall,
+        MetricType::ARI => CoreMetricType::ARI,
+        MetricType::NMI => CoreMetricType::NMI,
+        MetricType::VMeasure => CoreMetricType::VMeasure,
+        MetricType::BCubedPrecision => CoreMetricType::BCubedPrecision,
+        MetricType::BCubedRecall => CoreMetricType::BCubedRecall,
+        MetricType::EntityCount => CoreMetricType::EntityCount,
+        MetricType::Entropy => CoreMetricType::Entropy,
+    }
 }
 
 /// Progress callback type for Rust-level progress reporting
@@ -1103,6 +1121,7 @@ impl PyEntityFrame {
                     };
 
                     // Compute metric from cached contingency table
+                    // For now, keep using old implementation until we fully migrate
                     match metric {
                         MetricType::F1 => {
                             let table = sparse_table.to_contingency_table();
