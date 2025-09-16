@@ -484,7 +484,13 @@ class TestAnalysisBenchmarks:
             first = memory_results[0]
             last = memory_results[-1]
             entity_scale = last["entities"] / first["entities"]
-            memory_scale = last["memory_mb"] / first["memory_mb"]
+            memory_scale = (
+                last["memory_mb"] / first["memory_mb"]
+                if first["memory_mb"] > 0
+                else 1.0
+                if last["memory_mb"] == 0
+                else float("inf")
+            )
             time_scale = last["analysis_time"] / first["analysis_time"]
 
             logger.info(f"\n📈 SCALING ANALYSIS ({entity_scale:.1f}x entities)")

@@ -1,6 +1,6 @@
 //! Core algorithms for entity resolution analysis
 
-use super::contingency::{ContingencyTable, SparseContingencyTable};
+use super::contingency::SparseContingencyTable;
 use super::metrics::{compute_entity_count, compute_entropy};
 use super::types::MetricType;
 use crate::{DataContext, PartitionLevel};
@@ -88,40 +88,6 @@ pub fn build_all_sweep_tables(
     tables
 }
 
-/// Build contingency table using sparse representation for efficiency
-/// Uses SparseContingencyTable for O(k₁ × k₂) complexity where k = entities
-/// Automatically uses parallel processing for large partitions
-pub fn build_contingency_table(
-    partition1: &PartitionLevel,
-    partition2: &PartitionLevel,
-) -> ContingencyTable {
-    // Fast path for identical partitions (same threshold comparison)
-    if std::ptr::eq(partition1, partition2) {
-        // Perfect match case - all pairs are true positives
-        let mut true_positives = 0u64;
-        for entity in partition1.entities() {
-            let size = entity.len();
-            if size > 1 {
-                true_positives += (size * (size - 1)) / 2;
-            }
-        }
-
-        let total_records = partition1.entities().iter().map(|e| e.len()).sum::<u64>();
-        let total_possible_pairs = (total_records * (total_records - 1)) / 2;
-
-        return ContingencyTable {
-            true_positives: true_positives as u32,
-            false_positives: 0,
-            false_negatives: 0,
-            true_negatives: (total_possible_pairs - true_positives) as u32,
-        };
-    }
-
-    // Use sparse contingency table for efficient computation
-    let sparse_table = SparseContingencyTable::from_partitions(partition1, partition2);
-    sparse_table.to_contingency_table()
-}
-
 /// Error type for metric computation
 #[derive(Debug)]
 pub enum MetricError {
@@ -149,42 +115,6 @@ impl std::fmt::Display for MetricError {
 }
 
 impl std::error::Error for MetricError {}
-
-/// Compute specified metric for comparison between partitions
-pub fn compute_comparison_metric(
-    partition1: &PartitionLevel,
-    partition2: &PartitionLevel,
-    metric: &MetricType,
-) -> Result<f64, MetricError> {
-    match metric {
-        MetricType::F1 => {
-            let table = build_contingency_table(partition1, partition2);
-            Ok(table.f1_score())
-        }
-        MetricType::Precision => {
-            let table = build_contingency_table(partition1, partition2);
-            Ok(table.precision())
-        }
-        MetricType::Recall => {
-            let table = build_contingency_table(partition1, partition2);
-            Ok(table.recall())
-        }
-        MetricType::ARI | MetricType::NMI | MetricType::VMeasure => {
-            // Placeholder: These metrics require more complex implementations
-            // For now, return 0.0 as they're not yet implemented
-            Ok(0.0)
-        }
-        MetricType::BCubedPrecision | MetricType::BCubedRecall => {
-            // Placeholder: B-cubed metrics require different approach
-            // For now, return 0.0 as they're not yet implemented
-            Ok(0.0)
-        }
-        MetricType::EntityCount | MetricType::Entropy => {
-            // Single collection metrics shouldn't be called with comparison
-            Err(MetricError::SingleMetricUsedForComparison(metric.clone()))
-        }
-    }
-}
 
 /// Compute specified metric for a single partition
 pub fn compute_single_metric(
@@ -234,14 +164,6 @@ mod tests {
         // Create a test partition
         let entities = vec![RoaringBitmap::from_iter([0, 1])];
         let partition = PartitionLevel::new(0.5, entities);
-
-        // Test single metric used in comparison context
-        let result = compute_comparison_metric(&partition, &partition, &MetricType::EntityCount);
-        assert!(result.is_err());
-        match result {
-            Err(MetricError::SingleMetricUsedForComparison(MetricType::EntityCount)) => {}
-            _ => panic!("Expected SingleMetricUsedForComparison error"),
-        }
 
         // Test comparison metric used in single context
         let result = compute_single_metric(&partition, &MetricType::F1);

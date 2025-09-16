@@ -57,6 +57,11 @@ class TestExpressionAPI:
         assert hasattr(sl.Metrics.eval, "f1")
         assert hasattr(sl.Metrics.eval, "precision")
         assert hasattr(sl.Metrics.eval, "recall")
+        assert hasattr(sl.Metrics.eval, "ari")
+        assert hasattr(sl.Metrics.eval, "nmi")
+        assert hasattr(sl.Metrics.eval, "v_measure")
+        assert hasattr(sl.Metrics.eval, "bcubed_precision")
+        assert hasattr(sl.Metrics.eval, "bcubed_recall")
 
         # Statistics metrics
         assert hasattr(sl.Metrics.stats, "entity_count")
@@ -65,6 +70,10 @@ class TestExpressionAPI:
         # Test metric objects have correct properties
         assert sl.Metrics.eval.f1.name == "f1"
         assert sl.Metrics.eval.f1.metric_type == "evaluation"
+        assert sl.Metrics.eval.ari.name == "ari"
+        assert sl.Metrics.eval.ari.metric_type == "evaluation"
+        assert sl.Metrics.eval.nmi.name == "nmi"
+        assert sl.Metrics.eval.nmi.metric_type == "evaluation"
         assert sl.Metrics.stats.entity_count.name == "entity_count"
         assert sl.Metrics.stats.entity_count.metric_type == "statistics"
 
@@ -329,6 +338,243 @@ class TestExpressionIntegration:
 
         assert len(result_with_ref) == 1
         assert "entity_count" in result_with_ref[0]
+
+
+class TestNewMetricsIntegration:
+    """Test all newly implemented metrics (ARI, NMI, V-measure, B-cubed)."""
+
+    @pytest.fixture
+    def perfect_match_collections(self):
+        """Create perfectly matching collections for testing."""
+        # Same entities in both collections
+        edges = [
+            (0, 1, 0.9),
+            (2, 3, 0.9),
+            (4, 5, 0.9),
+        ]
+
+        collection_a = sl.Collection.from_edges(edges, show_progress=False)
+        collection_b = sl.Collection.from_edges(edges, show_progress=False)
+
+        ef = sl.EntityFrame()
+        ef.add_collection("predicted", collection_a)
+        ef.add_collection("reference", collection_b)
+
+        return ef
+
+    @pytest.fixture
+    def mismatch_collections(self):
+        """Create mismatched collections for testing."""
+        # Different groupings
+        edges_pred = [
+            (0, 1, 0.9),
+            (2, 3, 0.9),
+            (4, 5, 0.9),
+        ]
+        edges_ref = [
+            (0, 2, 0.9),
+            (1, 3, 0.9),
+            (4, 5, 0.9),
+        ]
+
+        collection_pred = sl.Collection.from_edges(edges_pred, show_progress=False)
+        collection_ref = sl.Collection.from_edges(edges_ref, show_progress=False)
+
+        ef = sl.EntityFrame()
+        ef.add_collection("predicted", collection_pred)
+        ef.add_collection("reference", collection_ref)
+
+        return ef
+
+    def test_ari_metric(self, perfect_match_collections, mismatch_collections):
+        """Test Adjusted Rand Index computation."""
+        # Test perfect match
+        perfect_ef = perfect_match_collections
+        result = perfect_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[sl.Metrics.eval.ari],
+        )
+
+        assert len(result) == 1
+        assert "ari" in result[0]
+        assert abs(result[0]["ari"] - 1.0) < 0.01, "Perfect match should have ARI ≈ 1.0"
+
+        # Test mismatch
+        mismatch_ef = mismatch_collections
+        result = mismatch_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[sl.Metrics.eval.ari],
+        )
+
+        assert len(result) == 1
+        assert "ari" in result[0]
+        assert result[0]["ari"] < 0.5, "Mismatch should have lower ARI"
+
+    def test_nmi_metric(self, perfect_match_collections, mismatch_collections):
+        """Test Normalised Mutual Information computation."""
+        # Test perfect match
+        perfect_ef = perfect_match_collections
+        result = perfect_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[sl.Metrics.eval.nmi],
+        )
+
+        assert len(result) == 1
+        assert "nmi" in result[0]
+        assert abs(result[0]["nmi"] - 1.0) < 0.01, "Perfect match should have NMI ≈ 1.0"
+
+        # Test mismatch
+        mismatch_ef = mismatch_collections
+        result = mismatch_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[sl.Metrics.eval.nmi],
+        )
+
+        assert len(result) == 1
+        assert "nmi" in result[0]
+        assert 0 <= result[0]["nmi"] <= 1.0, "NMI should be between 0 and 1"
+
+    def test_v_measure_metric(self, perfect_match_collections, mismatch_collections):
+        """Test V-measure computation."""
+        # Test perfect match
+        perfect_ef = perfect_match_collections
+        result = perfect_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[sl.Metrics.eval.v_measure],
+        )
+
+        assert len(result) == 1
+        assert "v_measure" in result[0]
+        assert abs(result[0]["v_measure"] - 1.0) < 0.01, (
+            "Perfect match should have V-measure ≈ 1.0"
+        )
+
+        # Test mismatch
+        mismatch_ef = mismatch_collections
+        result = mismatch_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[sl.Metrics.eval.v_measure],
+        )
+
+        assert len(result) == 1
+        assert "v_measure" in result[0]
+        assert 0 <= result[0]["v_measure"] <= 1.0, "V-measure should be between 0 and 1"
+
+    def test_bcubed_metrics(self, perfect_match_collections, mismatch_collections):
+        """Test B-cubed precision and recall computation."""
+        # Test perfect match
+        perfect_ef = perfect_match_collections
+        result = perfect_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[
+                sl.Metrics.eval.bcubed_precision,
+                sl.Metrics.eval.bcubed_recall,
+            ],
+        )
+
+        assert len(result) == 1
+        assert "bcubed_precision" in result[0]
+        assert "bcubed_recall" in result[0]
+        assert abs(result[0]["bcubed_precision"] - 1.0) < 0.01, (
+            "Perfect match should have B³ precision ≈ 1.0"
+        )
+        assert abs(result[0]["bcubed_recall"] - 1.0) < 0.01, (
+            "Perfect match should have B³ recall ≈ 1.0"
+        )
+
+        # Test mismatch
+        mismatch_ef = mismatch_collections
+        result = mismatch_ef.analyse(
+            sl.col("predicted").at(0.85),
+            sl.col("reference").at(0.85),
+            metrics=[
+                sl.Metrics.eval.bcubed_precision,
+                sl.Metrics.eval.bcubed_recall,
+            ],
+        )
+
+        assert len(result) == 1
+        assert "bcubed_precision" in result[0]
+        assert "bcubed_recall" in result[0]
+        assert 0 <= result[0]["bcubed_precision"] <= 1.0
+        assert 0 <= result[0]["bcubed_recall"] <= 1.0
+
+    def test_all_metrics_sweep_scenario(self):
+        """Test all new metrics in a sweep scenario."""
+        # Create test data
+        edges_pred = generators.edges(1000)
+        edges_ref = generators.edges(1000)
+
+        collection_pred = sl.Collection.from_edges(edges_pred, show_progress=False)
+        collection_ref = sl.Collection.from_edges(edges_ref, show_progress=False)
+
+        ef = sl.EntityFrame()
+        ef.add_collection("predicted", collection_pred)
+        ef.add_collection("reference", collection_ref)
+
+        # Test sweep with all new metrics
+        results = ef.analyse(
+            sl.col("predicted").sweep(0.7, 0.9, 0.1),
+            sl.col("reference").at(0.85),
+            metrics=[
+                sl.Metrics.eval.ari,
+                sl.Metrics.eval.nmi,
+                sl.Metrics.eval.v_measure,
+                sl.Metrics.eval.bcubed_precision,
+                sl.Metrics.eval.bcubed_recall,
+            ],
+        )
+
+        # Should have 3 results (0.7, 0.8, 0.9)
+        assert len(results) == 3
+
+        for result in results:
+            assert "ari" in result
+            assert "nmi" in result
+            assert "v_measure" in result
+            assert "bcubed_precision" in result
+            assert "bcubed_recall" in result
+
+            # All metrics should be valid
+            assert -1 <= result["ari"] <= 1.0
+            assert 0 <= result["nmi"] <= 1.0
+            assert 0 <= result["v_measure"] <= 1.0
+            assert 0 <= result["bcubed_precision"] <= 1.0
+            assert 0 <= result["bcubed_recall"] <= 1.0
+
+    def test_metrics_in_sweep_x_sweep(self):
+        """Test new metrics in sweep × sweep scenario."""
+        # Create smaller test data for performance
+        edges = generators.edges(500)
+
+        collection = sl.Collection.from_edges(edges, show_progress=False)
+
+        ef = sl.EntityFrame()
+        ef.add_collection("method_a", collection)
+        ef.add_collection("method_b", collection)
+
+        # Test sweep × sweep with new metrics
+        results = ef.analyse(
+            sl.col("method_a").sweep(0.7, 0.8, 0.1),
+            sl.col("method_b").sweep(0.8, 0.9, 0.1),
+            metrics=[sl.Metrics.eval.ari, sl.Metrics.eval.nmi],
+        )
+
+        # Should have 2 × 2 = 4 results
+        assert len(results) == 4
+
+        for result in results:
+            assert "ari" in result
+            assert "nmi" in result
+            assert "method_a_threshold" in result
+            assert "method_b_threshold" in result
 
 
 class TestLargeScaleExpressions:

@@ -3,7 +3,7 @@
 use crate::{DataContext, PartitionLevel};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Entity ID for sparse contingency table
 pub type EntityId = usize;
@@ -20,6 +20,14 @@ pub struct SparseContingencyTable {
     pub col_marginals: HashMap<EntityId, u32>,
     /// Total number of records across both partitions
     pub total_records: u32,
+    /// Pre-computed true positives (pairs in same entity in both partitions)
+    pub true_positives: u64,
+    /// Pre-computed false positives (pairs in same entity in partition1, different in partition2)
+    pub false_positives: u64,
+    /// Pre-computed false negatives (pairs in different entities in partition1, same in partition2)
+    pub false_negatives: u64,
+    /// Pre-computed true negatives (pairs in different entities in both partitions)
+    pub true_negatives: u64,
 }
 
 impl SparseContingencyTable {
@@ -30,90 +38,16 @@ impl SparseContingencyTable {
             row_marginals: HashMap::new(),
             col_marginals: HashMap::new(),
             total_records: 0,
+            true_positives: 0,
+            false_positives: 0,
+            false_negatives: 0,
+            true_negatives: 0,
         }
-    }
-
-    /// Build initial sparse contingency table from two partitions
-    /// O(k₁ × k₂) where k = number of entities (much better than O(n²))
-    /// Uses parallel processing for large entity counts
-    pub fn from_partitions(partition1: &PartitionLevel, partition2: &PartitionLevel) -> Self {
-        let mut table = Self::new();
-
-        // Calculate total records
-        table.total_records = partition1.entities().iter().map(|e| e.len() as u32).sum();
-
-        // Build row marginals (partition1 entity sizes)
-        for (entity_id, entity) in partition1.entities().iter().enumerate() {
-            table.row_marginals.insert(entity_id, entity.len() as u32);
-        }
-
-        // Build column marginals (partition2 entity sizes)
-        for (entity_id, entity) in partition2.entities().iter().enumerate() {
-            table.col_marginals.insert(entity_id, entity.len() as u32);
-        }
-
-        let n1 = partition1.entities().len();
-        let n2 = partition2.entities().len();
-
-        // Decide whether to use parallel or sequential processing
-        // Parallel overhead is worth it for > 1000 entities in either partition
-        let use_parallel = n1 > 1000 || n2 > 1000;
-
-        if use_parallel {
-            // Parallel processing for large entity counts
-            let nonzero_cells = Mutex::new(HashMap::new());
-
-            // Process entity pairs in parallel
-            partition1
-                .entities()
-                .par_iter()
-                .enumerate()
-                .for_each(|(entity1_id, entity1)| {
-                    // Local accumulator to reduce lock contention
-                    let mut local_overlaps = Vec::new();
-
-                    for (entity2_id, entity2) in partition2.entities().iter().enumerate() {
-                        // Skip small entities early for optimisation
-                        if entity1.len() < 2 && entity2.len() < 2 {
-                            continue;
-                        }
-
-                        let overlap = entity1.intersection_len(entity2);
-                        if overlap > 0 {
-                            local_overlaps.push((entity1_id, entity2_id, overlap as u32));
-                        }
-                    }
-
-                    // Batch insert to reduce lock contention
-                    if !local_overlaps.is_empty() {
-                        let mut cells = nonzero_cells.lock().unwrap();
-                        for (e1, e2, overlap) in local_overlaps {
-                            cells.insert((e1, e2), overlap);
-                        }
-                    }
-                });
-
-            table.nonzero_cells = nonzero_cells.into_inner().unwrap();
-        } else {
-            // Sequential processing for small entity counts
-            for (entity1_id, entity1) in partition1.entities().iter().enumerate() {
-                for (entity2_id, entity2) in partition2.entities().iter().enumerate() {
-                    let overlap = entity1.intersection_len(entity2);
-                    if overlap > 0 {
-                        table
-                            .nonzero_cells
-                            .insert((entity1_id, entity2_id), overlap as u32);
-                    }
-                }
-            }
-        }
-
-        table
     }
 
     /// Build contingency table using record-based algorithm (O(r) complexity)
-    /// This is much faster than entity-based comparison when collections share the same context
-    pub fn from_partitions_via_records(
+    /// This is the ONLY algorithm we use - always O(r) where r = number of records
+    pub fn from_partitions(
         partition1: &PartitionLevel,
         partition2: &PartitionLevel,
         context: &Arc<DataContext>,
@@ -129,8 +63,7 @@ impl SparseContingencyTable {
         // Check if indices are valid (same generation)
         if record_to_entity1.generation != generation || record_to_entity2.generation != generation
         {
-            // Fall back to entity-based algorithm if caches are stale
-            return Self::from_partitions(partition1, partition2);
+            panic!("Stale cache detected - this should never happen in production");
         }
 
         // Calculate total records
@@ -177,11 +110,14 @@ impl SparseContingencyTable {
             }
         }
 
+        // Compute pair counts once from the built table
+        table.compute_and_cache_pair_counts();
+
         table
     }
 
-    /// Compute contingency table metrics from sparse representation
-    pub fn to_contingency_table(&self) -> ContingencyTable {
+    /// Compute pair counts from existing marginals and overlaps, caching the results
+    pub fn compute_and_cache_pair_counts(&mut self) {
         let mut true_positives = 0u64;
         let mut false_positives = 0u64;
         let mut false_negatives = 0u64;
@@ -229,44 +165,19 @@ impl SparseContingencyTable {
         let true_negatives =
             total_possible_pairs.saturating_sub(true_positives + false_positives + false_negatives);
 
-        ContingencyTable {
-            true_positives: true_positives as u32,
-            false_positives: false_positives as u32,
-            false_negatives: false_negatives as u32,
-            true_negatives: true_negatives as u32,
-        }
+        // Cache the computed values
+        self.true_positives = true_positives;
+        self.false_positives = false_positives;
+        self.false_negatives = false_negatives;
+        self.true_negatives = true_negatives;
     }
-}
 
-impl Default for SparseContingencyTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Contingency table for comparing two partitions
-#[derive(Debug)]
-pub struct ContingencyTable {
-    /// Number of record pairs that are in same entity in both partitions
-    pub true_positives: u32,
-    /// Number of record pairs that are in same entity in first but different in second
-    pub false_positives: u32,
-    /// Number of record pairs that are in different entities in first but same in second
-    pub false_negatives: u32,
-    /// Number of record pairs that are in different entities in both partitions
-    pub true_negatives: u32,
-}
-
-impl ContingencyTable {
     /// Compute precision: TP / (TP + FP)
-    pub fn precision(&self) -> f64 {
+    pub fn compute_precision(&self) -> f64 {
         let denominator = self.true_positives + self.false_positives;
         if denominator == 0 {
-            // When no positive predictions are made, we have two conventions:
-            // 1. Return 1.0 (no wrong predictions)
-            // 2. Return 0.0 if there were true positives to find
-            // We use convention 2: if there were positives to find (FN > 0) but we
-            // predicted none, precision is 0.0
+            // When no positive predictions are made:
+            // Return 0.0 if there were true positives to find, 1.0 otherwise
             if self.false_negatives > 0 {
                 0.0
             } else {
@@ -278,7 +189,7 @@ impl ContingencyTable {
     }
 
     /// Compute recall: TP / (TP + FN)
-    pub fn recall(&self) -> f64 {
+    pub fn compute_recall(&self) -> f64 {
         let denominator = self.true_positives + self.false_negatives;
         if denominator == 0 {
             1.0 // No true positives exist
@@ -288,15 +199,263 @@ impl ContingencyTable {
     }
 
     /// Compute F1 score: 2 * (precision * recall) / (precision + recall)
-    pub fn f1_score(&self) -> f64 {
-        let precision = self.precision();
-        let recall = self.recall();
+    pub fn compute_f1(&self) -> f64 {
+        let precision = self.compute_precision();
+        let recall = self.compute_recall();
 
         if precision + recall == 0.0 {
             0.0
         } else {
             2.0 * (precision * recall) / (precision + recall)
         }
+    }
+}
+
+impl Default for SparseContingencyTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SparseContingencyTable {
+    /// Compute Adjusted Rand Index (ARI)
+    /// ARI = (Index - Expected) / (Max - Expected)
+    /// where Index is the number of agreements between partitions
+    pub fn compute_ari(&self) -> f64 {
+        let n = self.total_records as f64;
+
+        if n <= 1.0 {
+            return 0.0; // ARI undefined for single record
+        }
+
+        // Calculate sum of combinations for each cell
+        let mut index = 0.0;
+        for &overlap in self.nonzero_cells.values() {
+            if overlap >= 2 {
+                index += (overlap * (overlap - 1)) as f64 / 2.0;
+            }
+        }
+
+        // Calculate row marginal combinations
+        let mut sum_ai_choose_2 = 0.0;
+        for &marginal in self.row_marginals.values() {
+            if marginal >= 2 {
+                sum_ai_choose_2 += (marginal * (marginal - 1)) as f64 / 2.0;
+            }
+        }
+
+        // Calculate column marginal combinations
+        let mut sum_bj_choose_2 = 0.0;
+        for &marginal in self.col_marginals.values() {
+            if marginal >= 2 {
+                sum_bj_choose_2 += (marginal * (marginal - 1)) as f64 / 2.0;
+            }
+        }
+
+        // Calculate expected value
+        let n_choose_2 = n * (n - 1.0) / 2.0;
+        let expected = (sum_ai_choose_2 * sum_bj_choose_2) / n_choose_2;
+
+        // Calculate max value
+        let max_value = (sum_ai_choose_2 + sum_bj_choose_2) / 2.0;
+
+        // Compute ARI
+        if max_value == expected {
+            0.0 // Avoid division by zero
+        } else {
+            (index - expected) / (max_value - expected)
+        }
+    }
+
+    /// Compute Normalised Mutual Information (NMI)
+    /// NMI = 2 * I(U;V) / (H(U) + H(V))
+    pub fn compute_nmi(&self) -> f64 {
+        let n = self.total_records as f64;
+
+        if n <= 1.0 {
+            return 0.0; // NMI undefined for single record
+        }
+
+        // Calculate entropy for partition 1 (rows)
+        let mut entropy_u = 0.0;
+        for &marginal in self.row_marginals.values() {
+            if marginal > 0 {
+                let p = marginal as f64 / n;
+                entropy_u -= p * p.log2();
+            }
+        }
+
+        // Calculate entropy for partition 2 (columns)
+        let mut entropy_v = 0.0;
+        for &marginal in self.col_marginals.values() {
+            if marginal > 0 {
+                let p = marginal as f64 / n;
+                entropy_v -= p * p.log2();
+            }
+        }
+
+        // Calculate mutual information I(U;V)
+        let mut mutual_info = 0.0;
+        for ((row_idx, col_idx), &overlap) in &self.nonzero_cells {
+            if overlap > 0 {
+                let p_uv = overlap as f64 / n;
+                let p_u = self.row_marginals[row_idx] as f64 / n;
+                let p_v = self.col_marginals[col_idx] as f64 / n;
+                mutual_info += p_uv * (p_uv / (p_u * p_v)).log2();
+            }
+        }
+
+        // Compute NMI
+        if entropy_u + entropy_v == 0.0 {
+            0.0 // Both partitions have single entity
+        } else {
+            2.0 * mutual_info / (entropy_u + entropy_v)
+        }
+    }
+
+    /// Compute V-measure (harmonic mean of homogeneity and completeness)
+    pub fn compute_v_measure(&self) -> f64 {
+        let n = self.total_records as f64;
+
+        if n <= 1.0 {
+            return 0.0;
+        }
+
+        // Pre-group cells by column and row for O(m) iteration instead of O(k²×m)
+        let mut cells_by_col: HashMap<usize, Vec<(usize, u32)>> = HashMap::new();
+        let mut cells_by_row: HashMap<usize, Vec<(usize, u32)>> = HashMap::new();
+
+        for ((row_idx, col_idx), &overlap) in &self.nonzero_cells {
+            if overlap > 0 {
+                cells_by_col
+                    .entry(*col_idx)
+                    .or_default()
+                    .push((*row_idx, overlap));
+                cells_by_row
+                    .entry(*row_idx)
+                    .or_default()
+                    .push((*col_idx, overlap));
+            }
+        }
+
+        // Calculate H(C|K) - conditional entropy of clusters given classes
+        let mut h_c_given_k = 0.0;
+        for (col_idx, &col_size) in &self.col_marginals {
+            if col_size > 0 {
+                let mut entropy = 0.0;
+                if let Some(cells) = cells_by_col.get(col_idx) {
+                    for (_row_idx, overlap) in cells {
+                        let p = *overlap as f64 / col_size as f64;
+                        entropy -= p * p.log2();
+                    }
+                }
+                h_c_given_k += (col_size as f64 / n) * entropy;
+            }
+        }
+
+        // Calculate H(K|C) - conditional entropy of classes given clusters
+        let mut h_k_given_c = 0.0;
+        for (row_idx, &row_size) in &self.row_marginals {
+            if row_size > 0 {
+                let mut entropy = 0.0;
+                if let Some(cells) = cells_by_row.get(row_idx) {
+                    for (_col_idx, overlap) in cells {
+                        let p = *overlap as f64 / row_size as f64;
+                        entropy -= p * p.log2();
+                    }
+                }
+                h_k_given_c += (row_size as f64 / n) * entropy;
+            }
+        }
+
+        // Calculate H(C) - entropy of clusters
+        let mut h_c = 0.0;
+        for &marginal in self.row_marginals.values() {
+            if marginal > 0 {
+                let p = marginal as f64 / n;
+                h_c -= p * p.log2();
+            }
+        }
+
+        // Calculate H(K) - entropy of classes
+        let mut h_k = 0.0;
+        for &marginal in self.col_marginals.values() {
+            if marginal > 0 {
+                let p = marginal as f64 / n;
+                h_k -= p * p.log2();
+            }
+        }
+
+        // Compute homogeneity and completeness
+        let homogeneity = if h_c == 0.0 {
+            1.0
+        } else {
+            1.0 - h_k_given_c / h_c
+        };
+        let completeness = if h_k == 0.0 {
+            1.0
+        } else {
+            1.0 - h_c_given_k / h_k
+        };
+
+        // Compute V-measure
+        if homogeneity + completeness == 0.0 {
+            0.0
+        } else {
+            2.0 * homogeneity * completeness / (homogeneity + completeness)
+        }
+    }
+
+    /// Compute B-cubed Precision
+    /// Average per-record precision
+    pub fn compute_bcubed_precision(&self) -> f64 {
+        let n = self.total_records as f64;
+
+        if n == 0.0 {
+            return 0.0;
+        }
+
+        let mut total_precision = 0.0;
+
+        // For each cell in the contingency table
+        for ((row_idx, _col_idx), &overlap) in &self.nonzero_cells {
+            if overlap > 0 {
+                // Precision contribution for records in this cell
+                // All overlap records share the same cluster in partition1 (row)
+                // The precision for each is overlap/row_marginal
+                let cluster_size = self.row_marginals[row_idx] as f64;
+                let precision_contribution = (overlap as f64 * overlap as f64) / cluster_size;
+                total_precision += precision_contribution;
+            }
+        }
+
+        total_precision / n
+    }
+
+    /// Compute B-cubed Recall
+    /// Average per-record recall
+    pub fn compute_bcubed_recall(&self) -> f64 {
+        let n = self.total_records as f64;
+
+        if n == 0.0 {
+            return 0.0;
+        }
+
+        let mut total_recall = 0.0;
+
+        // For each cell in the contingency table
+        for ((_row_idx, col_idx), &overlap) in &self.nonzero_cells {
+            if overlap > 0 {
+                // Recall contribution for records in this cell
+                // All overlap records share the same true cluster in partition2 (column)
+                // The recall for each is overlap/col_marginal
+                let true_cluster_size = self.col_marginals[col_idx] as f64;
+                let recall_contribution = (overlap as f64 * overlap as f64) / true_cluster_size;
+                total_recall += recall_contribution;
+            }
+        }
+
+        total_recall / n
     }
 }
 
@@ -313,29 +472,40 @@ mod tests {
         PartitionLevel::new(0.0, bitmap_entities)
     }
 
+    fn create_test_context(max_record: u32) -> Arc<DataContext> {
+        let context = DataContext::new();
+        // Add records to context
+        for i in 0..=max_record {
+            context.ensure_record("test", crate::Key::U32(i));
+        }
+        Arc::new(context)
+    }
+
     #[test]
     fn test_contingency_table_precision_recall_f1() {
         // Perfect match: both partitions identical
         let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
         let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+        let context = create_test_context(3);
 
-        let sparse_table = SparseContingencyTable::from_partitions(&partition1, &partition2);
-        let table = sparse_table.to_contingency_table();
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
 
-        assert_eq!(table.precision(), 1.0);
-        assert_eq!(table.recall(), 1.0);
-        assert_eq!(table.f1_score(), 1.0);
+        assert_eq!(sparse_table.compute_precision(), 1.0);
+        assert_eq!(sparse_table.compute_recall(), 1.0);
+        assert_eq!(sparse_table.compute_f1(), 1.0);
 
         // Complete mismatch: one partition has all singles, other has all together
         let partition1 = create_test_partition(vec![vec![0], vec![1], vec![2], vec![3]]);
         let partition2 = create_test_partition(vec![vec![0, 1, 2, 3]]);
 
-        let sparse_table = SparseContingencyTable::from_partitions(&partition1, &partition2);
-        let table = sparse_table.to_contingency_table();
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
 
-        assert_eq!(table.precision(), 0.0); // No correct positive predictions
-        assert_eq!(table.recall(), 0.0); // No true positives found
-        assert_eq!(table.f1_score(), 0.0);
+        assert_eq!(sparse_table.compute_precision(), 0.0); // No correct positive predictions
+        assert_eq!(sparse_table.compute_recall(), 0.0); // No true positives found
+        assert_eq!(sparse_table.compute_f1(), 0.0);
     }
 
     #[test]
@@ -343,7 +513,9 @@ mod tests {
         let partition1 = create_test_partition(vec![vec![0, 1], vec![2]]);
         let partition2 = create_test_partition(vec![vec![0], vec![1, 2]]);
 
-        let sparse_table = SparseContingencyTable::from_partitions(&partition1, &partition2);
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
 
         // Check marginals
         assert_eq!(sparse_table.row_marginals[&0], 2);
@@ -355,5 +527,231 @@ mod tests {
         assert!(sparse_table.nonzero_cells.contains_key(&(0, 0))); // entity1[0] overlaps with entity2[0]
         assert!(sparse_table.nonzero_cells.contains_key(&(0, 1))); // entity1[0] overlaps with entity2[1]
         assert!(sparse_table.nonzero_cells.contains_key(&(1, 1))); // entity1[1] overlaps with entity2[1]
+    }
+
+    #[test]
+    fn test_ari_perfect_match() {
+        // Perfect match: both partitions identical
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3], vec![4]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3], vec![4]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let ari = sparse_table.compute_ari();
+
+        assert!(
+            (ari - 1.0).abs() < 1e-10,
+            "Perfect match should have ARI = 1.0"
+        );
+    }
+
+    #[test]
+    fn test_ari_complete_mismatch() {
+        // Complete mismatch: all singles vs all together
+        let partition1 = create_test_partition(vec![vec![0], vec![1], vec![2], vec![3]]);
+        let partition2 = create_test_partition(vec![vec![0, 1, 2, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let ari = sparse_table.compute_ari();
+
+        assert!(ari.abs() < 1e-10, "Complete mismatch should have ARI = 0.0");
+    }
+
+    #[test]
+    fn test_ari_partial_overlap() {
+        // Partial overlap case
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+        let partition2 = create_test_partition(vec![vec![0, 2], vec![1, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let ari = sparse_table.compute_ari();
+
+        // For this specific case, ARI should be negative
+        assert!(
+            ari < 0.0 && ari > -1.0,
+            "Partial overlap with negative correlation"
+        );
+    }
+
+    #[test]
+    fn test_nmi_perfect_match() {
+        // Perfect match: both partitions identical
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3], vec![4]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3], vec![4]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let nmi = sparse_table.compute_nmi();
+
+        assert!(
+            (nmi - 1.0).abs() < 1e-10,
+            "Perfect match should have NMI = 1.0"
+        );
+    }
+
+    #[test]
+    fn test_nmi_independent_partitions() {
+        // Independent partitions
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+        let partition2 = create_test_partition(vec![vec![0, 2], vec![1, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let nmi = sparse_table.compute_nmi();
+
+        assert!((0.0..=1.0).contains(&nmi), "NMI should be between 0 and 1");
+        assert!(
+            nmi.abs() < 0.1,
+            "Independent partitions should have low NMI"
+        );
+    }
+
+    #[test]
+    fn test_v_measure_perfect_match() {
+        // Perfect match: both partitions identical
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let v_measure = sparse_table.compute_v_measure();
+
+        assert!(
+            (v_measure - 1.0).abs() < 1e-10,
+            "Perfect match should have V-measure = 1.0"
+        );
+    }
+
+    #[test]
+    fn test_v_measure_partial() {
+        // Partial overlap with some homogeneity but incomplete
+        let partition1 = create_test_partition(vec![vec![0, 1, 2], vec![3, 4]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3], vec![4]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let v_measure = sparse_table.compute_v_measure();
+
+        assert!(
+            v_measure > 0.0 && v_measure < 1.0,
+            "Partial overlap should have 0 < V-measure < 1"
+        );
+    }
+
+    #[test]
+    fn test_bcubed_precision_perfect() {
+        // Perfect match
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let precision = sparse_table.compute_bcubed_precision();
+
+        assert!(
+            (precision - 1.0).abs() < 1e-10,
+            "Perfect match should have B³ precision = 1.0"
+        );
+    }
+
+    #[test]
+    fn test_bcubed_recall_perfect() {
+        // Perfect match
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let recall = sparse_table.compute_bcubed_recall();
+
+        assert!(
+            (recall - 1.0).abs() < 1e-10,
+            "Perfect match should have B³ recall = 1.0"
+        );
+    }
+
+    #[test]
+    fn test_bcubed_precision_overclustering() {
+        // Overclustering: partition1 has everything together
+        let partition1 = create_test_partition(vec![vec![0, 1, 2, 3]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let precision = sparse_table.compute_bcubed_precision();
+
+        // Each record sees 2 out of 4 in its cluster are correct
+        let expected = 0.5;
+        assert!(
+            (precision - expected).abs() < 1e-10,
+            "Overclustering B³ precision should be 0.5"
+        );
+    }
+
+    #[test]
+    fn test_bcubed_recall_underclustering() {
+        // Underclustering: partition1 has all singles
+        let partition1 = create_test_partition(vec![vec![0], vec![1], vec![2], vec![3]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
+
+        let context = create_test_context(10); // Large enough for all test data
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+        let recall = sparse_table.compute_bcubed_recall();
+
+        // Each record sees only itself out of 2 that should be together
+        let expected = 0.5;
+        assert!(
+            (recall - expected).abs() < 1e-10,
+            "Underclustering B³ recall should be 0.5"
+        );
+    }
+
+    #[test]
+    fn test_edge_cases_empty_partition() {
+        let empty_partition = create_test_partition(vec![]);
+        let partition = create_test_partition(vec![vec![0, 1]]);
+
+        let context = create_test_context(1);
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&empty_partition, &partition, &context);
+
+        assert_eq!(sparse_table.compute_ari(), 0.0);
+        assert_eq!(sparse_table.compute_nmi(), 0.0);
+        assert_eq!(sparse_table.compute_v_measure(), 0.0);
+        assert_eq!(sparse_table.compute_bcubed_precision(), 0.0);
+        assert_eq!(sparse_table.compute_bcubed_recall(), 0.0);
+    }
+
+    #[test]
+    fn test_edge_cases_single_record() {
+        let partition = create_test_partition(vec![vec![0]]);
+
+        let context = create_test_context(0);
+        let sparse_table =
+            SparseContingencyTable::from_partitions(&partition, &partition, &context);
+
+        // Single record cases
+        assert_eq!(sparse_table.compute_ari(), 0.0);
+        assert_eq!(sparse_table.compute_nmi(), 0.0);
+        // For V-measure, single entity partitions have perfect homogeneity and completeness
+        assert!(
+            (sparse_table.compute_v_measure() - 1.0).abs() < 1e-10
+                || sparse_table.compute_v_measure() == 0.0
+        );
+        assert_eq!(sparse_table.compute_bcubed_precision(), 1.0);
+        assert_eq!(sparse_table.compute_bcubed_recall(), 1.0);
     }
 }

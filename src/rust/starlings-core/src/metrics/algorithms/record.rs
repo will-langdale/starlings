@@ -95,6 +95,13 @@ impl RecordAlgorithm {
             }
         }
 
+        // Compute pair counts for all tables
+        for row in &mut tables {
+            for table in row {
+                table.compute_and_cache_pair_counts();
+            }
+        }
+
         tables
     }
 
@@ -105,13 +112,12 @@ impl RecordAlgorithm {
         metrics: &[MetricType],
     ) -> MetricResults {
         let mut results = HashMap::new();
-        let contingency = table.to_contingency_table();
 
         for metric in metrics {
             let value = match metric {
-                MetricType::F1 => contingency.f1_score(),
-                MetricType::Precision => contingency.precision(),
-                MetricType::Recall => contingency.recall(),
+                MetricType::F1 => table.compute_f1(),
+                MetricType::Precision => table.compute_precision(),
+                MetricType::Recall => table.compute_recall(),
                 MetricType::ARI => self.compute_ari(table),
                 MetricType::NMI => self.compute_nmi(table),
                 MetricType::VMeasure => self.compute_v_measure(table),
@@ -203,9 +209,7 @@ impl MetricAlgorithm for RecordAlgorithm {
 
         if let Some(partition2) = partition2 {
             // Comparison metrics
-            let table = SparseContingencyTable::from_partitions_via_records(
-                partition1, partition2, context,
-            );
+            let table = SparseContingencyTable::from_partitions(partition1, partition2, context);
             results.extend(self.compute_metrics_from_table(&table, metrics));
         } else {
             // Single partition statistics

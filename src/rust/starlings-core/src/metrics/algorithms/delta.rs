@@ -6,7 +6,6 @@
 //! through merges and updates only affected cells.
 
 use super::{ComparisonType, ComplexityEstimate, MetricAlgorithm, MetricResults, MetricType};
-use crate::expressions::contingency::ContingencyTable;
 use crate::metrics::implementations::statistics::{compute_entity_count, compute_entropy};
 use crate::{DataContext, PartitionLevel};
 use roaring::RoaringBitmap;
@@ -37,6 +36,14 @@ struct IncrementalState {
     col_marginals: HashMap<u32, u32>,
     /// Total number of records
     total_records: u32,
+    /// Cached true positives
+    true_positives: u64,
+    /// Cached false positives
+    false_positives: u64,
+    /// Cached false negatives
+    false_negatives: u64,
+    /// Cached true negatives
+    true_negatives: u64,
 }
 
 /// Get the canonical ID for an entity (its minimum record ID)
@@ -72,6 +79,10 @@ impl DeltaAlgorithm {
             row_marginals: HashMap::new(),
             col_marginals: HashMap::new(),
             total_records: 0,
+            true_positives: 0,
+            false_positives: 0,
+            false_negatives: 0,
+            true_negatives: 0,
         };
 
         // Build canonical ID list and marginals for partition1
@@ -111,7 +122,66 @@ impl DeltaAlgorithm {
             }
         }
 
+        // Compute initial pair counts
+        DeltaAlgorithm::compute_state_pair_counts(&mut state);
+
         state
+    }
+
+    /// Compute pair counts for the current state
+    fn compute_state_pair_counts(state: &mut IncrementalState) {
+        let mut true_positives = 0u64;
+        let mut false_positives = 0u64;
+        let mut false_negatives = 0u64;
+
+        // Pre-compute pairs together for each entity to avoid double counting
+        let mut entity1_pairs_together: HashMap<u32, u64> = HashMap::new();
+        let mut entity2_pairs_together: HashMap<u32, u64> = HashMap::new();
+
+        // Single pass through contingency table to compute all necessary sums
+        for (&(id1, id2), &overlap) in &state.contingency_table {
+            if overlap > 1 {
+                let pairs = (overlap as u64 * (overlap as u64 - 1)) / 2;
+                true_positives += pairs;
+                *entity1_pairs_together.entry(id1).or_insert(0) += pairs;
+                *entity2_pairs_together.entry(id2).or_insert(0) += pairs;
+            }
+        }
+
+        // False positives: pairs together in partition1, apart in partition2
+        for (&entity_id, &size) in &state.row_marginals {
+            if size > 1 {
+                let all_pairs_in_entity = (size as u64 * (size as u64 - 1)) / 2;
+                let pairs_also_together =
+                    entity1_pairs_together.get(&entity_id).copied().unwrap_or(0);
+                false_positives += all_pairs_in_entity.saturating_sub(pairs_also_together);
+            }
+        }
+
+        // False negatives: pairs apart in partition1, together in partition2
+        for (&entity_id, &size) in &state.col_marginals {
+            if size > 1 {
+                let all_pairs_in_entity = (size as u64 * (size as u64 - 1)) / 2;
+                let pairs_also_together =
+                    entity2_pairs_together.get(&entity_id).copied().unwrap_or(0);
+                false_negatives += all_pairs_in_entity.saturating_sub(pairs_also_together);
+            }
+        }
+
+        // True negatives
+        let total_pairs = if state.total_records > 1 {
+            (state.total_records as u64 * (state.total_records as u64 - 1)) / 2
+        } else {
+            0
+        };
+        let true_negatives =
+            total_pairs.saturating_sub(true_positives + false_positives + false_negatives);
+
+        // Cache the computed values
+        state.true_positives = true_positives;
+        state.false_positives = false_positives;
+        state.false_negatives = false_negatives;
+        state.true_negatives = true_negatives;
     }
 
     /// Perform incremental update from old state to new partition
@@ -219,6 +289,9 @@ impl DeltaAlgorithm {
             .iter()
             .map(|e| e.len() as u32)
             .sum();
+
+        // Recompute pair counts after update
+        DeltaAlgorithm::compute_state_pair_counts(state);
     }
 
     /// Compute metrics from current state
@@ -226,14 +299,11 @@ impl DeltaAlgorithm {
         let mut results = HashMap::new();
 
         if let Some(state) = &self.state {
-            // Convert our clean HashMap to contingency table for metrics
-            let contingency = self.state_to_contingency_table(state);
-
             for metric in metrics {
                 let value = match metric {
-                    MetricType::F1 => contingency.f1_score(),
-                    MetricType::Precision => contingency.precision(),
-                    MetricType::Recall => contingency.recall(),
+                    MetricType::F1 => self.compute_f1_from_state(state),
+                    MetricType::Precision => self.compute_precision_from_state(state),
+                    MetricType::Recall => self.compute_recall_from_state(state),
                     // TODO: Implement other metrics
                     MetricType::ARI => 0.0,
                     MetricType::NMI => 0.0,
@@ -249,60 +319,39 @@ impl DeltaAlgorithm {
         results
     }
 
-    /// Convert internal state to contingency table for metric computation
-    fn state_to_contingency_table(&self, state: &IncrementalState) -> ContingencyTable {
-        let mut true_positives = 0u32;
-        let mut false_positives = 0u32;
-        let mut false_negatives = 0u32;
-
-        // Pre-compute pairs together for each entity to avoid double counting
-        let mut entity1_pairs_together: HashMap<u32, u32> = HashMap::new();
-        let mut entity2_pairs_together: HashMap<u32, u32> = HashMap::new();
-
-        // Single pass through contingency table to compute all necessary sums
-        for (&(id1, id2), &overlap) in &state.contingency_table {
-            if overlap > 1 {
-                let pairs = (overlap * (overlap - 1)) / 2;
-                true_positives += pairs;
-                *entity1_pairs_together.entry(id1).or_insert(0) += pairs;
-                *entity2_pairs_together.entry(id2).or_insert(0) += pairs;
+    /// Compute precision directly from state
+    fn compute_precision_from_state(&self, state: &IncrementalState) -> f64 {
+        let denominator = state.true_positives + state.false_positives;
+        if denominator == 0 {
+            if state.false_negatives > 0 {
+                0.0
+            } else {
+                1.0
             }
-        }
-
-        // False positives: pairs together in partition1, apart in partition2
-        for (&entity_id, &size) in &state.row_marginals {
-            if size > 1 {
-                let all_pairs_in_entity = (size * (size - 1)) / 2;
-                let pairs_also_together =
-                    entity1_pairs_together.get(&entity_id).copied().unwrap_or(0);
-                false_positives += all_pairs_in_entity.saturating_sub(pairs_also_together);
-            }
-        }
-
-        // False negatives: pairs apart in partition1, together in partition2
-        for (&entity_id, &size) in &state.col_marginals {
-            if size > 1 {
-                let all_pairs_in_entity = (size * (size - 1)) / 2;
-                let pairs_also_together =
-                    entity2_pairs_together.get(&entity_id).copied().unwrap_or(0);
-                false_negatives += all_pairs_in_entity.saturating_sub(pairs_also_together);
-            }
-        }
-
-        // True negatives
-        let total_pairs = if state.total_records > 1 {
-            (state.total_records * (state.total_records - 1)) / 2
         } else {
-            0
-        };
-        let true_negatives =
-            total_pairs.saturating_sub(true_positives + false_positives + false_negatives);
+            state.true_positives as f64 / denominator as f64
+        }
+    }
 
-        ContingencyTable {
-            true_positives,
-            false_positives,
-            false_negatives,
-            true_negatives,
+    /// Compute recall directly from state
+    fn compute_recall_from_state(&self, state: &IncrementalState) -> f64 {
+        let denominator = state.true_positives + state.false_negatives;
+        if denominator == 0 {
+            1.0
+        } else {
+            state.true_positives as f64 / denominator as f64
+        }
+    }
+
+    /// Compute F1 score directly from state
+    fn compute_f1_from_state(&self, state: &IncrementalState) -> f64 {
+        let precision = self.compute_precision_from_state(state);
+        let recall = self.compute_recall_from_state(state);
+
+        if precision + recall == 0.0 {
+            0.0
+        } else {
+            2.0 * (precision * recall) / (precision + recall)
         }
     }
 }

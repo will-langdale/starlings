@@ -5,8 +5,8 @@ use std::sync::Arc;
 mod expressions;
 use expressions::{parse_expression, parse_metric};
 use starlings_core::expressions::{
-    build_all_sweep_tables, compute_comparison_metric, compute_single_metric,
-    generate_sweep_thresholds, ExpressionType, MetricType, SparseContingencyTable,
+    build_all_sweep_tables, compute_single_metric, generate_sweep_thresholds, ExpressionType,
+    MetricType, SparseContingencyTable,
 };
 use starlings_core::metrics::CoreMetricType;
 
@@ -996,10 +996,15 @@ impl PyEntityFrame {
                     let table = &all_tables[i][j];
                     for metric in &parsed_metrics {
                         let value = match metric {
-                            MetricType::F1 => table.to_contingency_table().f1_score(),
-                            MetricType::Precision => table.to_contingency_table().precision(),
-                            MetricType::Recall => table.to_contingency_table().recall(),
-                            _ => 0.0, // Other metrics not yet implemented
+                            MetricType::F1 => table.compute_f1(),
+                            MetricType::Precision => table.compute_precision(),
+                            MetricType::Recall => table.compute_recall(),
+                            MetricType::ARI => table.compute_ari(),
+                            MetricType::NMI => table.compute_nmi(),
+                            MetricType::VMeasure => table.compute_v_measure(),
+                            MetricType::BCubedPrecision => table.compute_bcubed_precision(),
+                            MetricType::BCubedRecall => table.compute_bcubed_recall(),
+                            _ => 0.0, // Single collection metrics shouldn't be here
                         };
                         let metric_name = format!("{:?}", metric).to_lowercase();
                         result.insert(metric_name, value);
@@ -1080,16 +1085,11 @@ impl PyEntityFrame {
                         threshold_key2,
                     );
 
-                    let sparse_table = if let Some(cached) = contingency_cache.get(&cont_cache_key)
-                    {
-                        cached
-                    } else {
-                        // Check if collections are different to determine algorithm
-                        let are_different_collections = collection_names[0] != collection_names[1];
-
-                        let table = if are_different_collections {
-                            // Use record-based algorithm for different collections
-                            // This is O(r) instead of O(k₁ × k₂) where r=records, k=entities
+                    let sparse_table =
+                        if let Some(cached) = contingency_cache.get(&cont_cache_key) {
+                            cached
+                        } else {
+                            // ALWAYS use record-based algorithm - O(r) beats O(k²)
                             // Get shared context from first collection
                             let context = if let Some(hierarchy) =
                                 self.frame.get_collection(&collection_names[0])
@@ -1101,50 +1101,33 @@ impl PyEntityFrame {
                                 ));
                             };
 
-                            // Using record-based algorithm for cross-collection comparison
-                            SparseContingencyTable::from_partitions_via_records(
+                            // Always use the fast record-based algorithm
+                            let table = SparseContingencyTable::from_partitions(
                                 &owned_partitions[0],
                                 &owned_partitions[1],
                                 &context,
-                            )
-                        } else {
-                            // Use delta-based algorithm for same collection comparisons
-                            // This enables incremental updates within sweeps
-                            SparseContingencyTable::from_partitions(
-                                &owned_partitions[0],
-                                &owned_partitions[1],
-                            )
+                            );
+
+                            contingency_cache.insert(cont_cache_key.clone(), table);
+                            contingency_cache.get(&cont_cache_key).unwrap()
                         };
 
-                        contingency_cache.insert(cont_cache_key.clone(), table);
-                        contingency_cache.get(&cont_cache_key).unwrap()
-                    };
-
                     // Compute metric from cached contingency table
-                    // For now, keep using old implementation until we fully migrate
                     match metric {
-                        MetricType::F1 => {
-                            let table = sparse_table.to_contingency_table();
-                            table.f1_score()
-                        }
-                        MetricType::Precision => {
-                            let table = sparse_table.to_contingency_table();
-                            table.precision()
-                        }
-                        MetricType::Recall => {
-                            let table = sparse_table.to_contingency_table();
-                            table.recall()
-                        }
+                        MetricType::F1 => sparse_table.compute_f1(),
+                        MetricType::Precision => sparse_table.compute_precision(),
+                        MetricType::Recall => sparse_table.compute_recall(),
+                        MetricType::ARI => sparse_table.compute_ari(),
+                        MetricType::NMI => sparse_table.compute_nmi(),
+                        MetricType::VMeasure => sparse_table.compute_v_measure(),
+                        MetricType::BCubedPrecision => sparse_table.compute_bcubed_precision(),
+                        MetricType::BCubedRecall => sparse_table.compute_bcubed_recall(),
                         _ => {
-                            // For unimplemented metrics, fall back to direct computation
-                            compute_comparison_metric(
-                                &owned_partitions[0],
-                                &owned_partitions[1],
-                                metric,
-                            )
-                            .map_err(|e| {
-                                PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
-                            })?
+                            // Single collection metrics shouldn't be here
+                            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                                "Metric {:?} is not a comparison metric",
+                                metric
+                            )));
                         }
                     }
                 } else {

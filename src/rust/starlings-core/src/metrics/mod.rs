@@ -14,7 +14,6 @@ use algorithms::{
 use std::sync::Arc;
 
 pub use algorithms::MetricType as CoreMetricType;
-pub use types::ContingencyTable;
 
 /// Main engine for metric computation with automatic algorithm selection
 pub struct MetricEngine {
