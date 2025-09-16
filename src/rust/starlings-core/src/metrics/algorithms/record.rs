@@ -131,30 +131,24 @@ impl RecordAlgorithm {
         results
     }
 
-    // Placeholder implementations for missing metrics
-    fn compute_ari(&self, _table: &SparseContingencyTable) -> f64 {
-        // TODO: Implement ARI calculation
-        0.0
+    fn compute_ari(&self, table: &SparseContingencyTable) -> f64 {
+        table.compute_ari()
     }
 
-    fn compute_nmi(&self, _table: &SparseContingencyTable) -> f64 {
-        // TODO: Implement NMI calculation
-        0.0
+    fn compute_nmi(&self, table: &SparseContingencyTable) -> f64 {
+        table.compute_nmi()
     }
 
-    fn compute_v_measure(&self, _table: &SparseContingencyTable) -> f64 {
-        // TODO: Implement V-measure calculation
-        0.0
+    fn compute_v_measure(&self, table: &SparseContingencyTable) -> f64 {
+        table.compute_v_measure()
     }
 
-    fn compute_bcubed_precision(&self, _table: &SparseContingencyTable) -> f64 {
-        // TODO: Implement B-cubed precision
-        0.0
+    fn compute_bcubed_precision(&self, table: &SparseContingencyTable) -> f64 {
+        table.compute_bcubed_precision()
     }
 
-    fn compute_bcubed_recall(&self, _table: &SparseContingencyTable) -> f64 {
-        // TODO: Implement B-cubed recall
-        0.0
+    fn compute_bcubed_recall(&self, table: &SparseContingencyTable) -> f64 {
+        table.compute_bcubed_recall()
     }
 }
 

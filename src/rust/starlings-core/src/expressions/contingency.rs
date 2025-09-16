@@ -483,7 +483,10 @@ mod tests {
 
     #[test]
     fn test_contingency_table_precision_recall_f1() {
-        // Perfect match: both partitions identical
+        // TEST 1: Perfect match - both partitions identical
+        // Partition1: {0,1} {2,3}
+        // Partition2: {0,1} {2,3}
+        // Expected: All pairs that are together in P1 are also together in P2
         let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
         let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
         let context = create_test_context(3);
@@ -491,20 +494,39 @@ mod tests {
         let sparse_table =
             SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
 
+        // Pairs together in P1: (0,1), (2,3) = 2 pairs
+        // Pairs together in P2: (0,1), (2,3) = 2 pairs
+        // TP = 2 (both pairs correctly identified)
+        // FP = 0 (no false groupings)
+        // FN = 0 (no missed pairs)
+        // Precision = TP/(TP+FP) = 2/2 = 1.0
+        // Recall = TP/(TP+FN) = 2/2 = 1.0
+        // F1 = 2*P*R/(P+R) = 2*1*1/2 = 1.0
         assert_eq!(sparse_table.compute_precision(), 1.0);
         assert_eq!(sparse_table.compute_recall(), 1.0);
         assert_eq!(sparse_table.compute_f1(), 1.0);
 
-        // Complete mismatch: one partition has all singles, other has all together
+        // TEST 2: Complete mismatch - all singles vs all together
+        // Partition1: {0} {1} {2} {3} (all singletons)
+        // Partition2: {0,1,2,3} (all together)
         let partition1 = create_test_partition(vec![vec![0], vec![1], vec![2], vec![3]]);
         let partition2 = create_test_partition(vec![vec![0, 1, 2, 3]]);
 
-        let context = create_test_context(10); // Large enough for all test data
+        let context = create_test_context(10);
         let sparse_table =
             SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
 
-        assert_eq!(sparse_table.compute_precision(), 0.0); // No correct positive predictions
-        assert_eq!(sparse_table.compute_recall(), 0.0); // No true positives found
+        // Pairs together in P1: none = 0 pairs
+        // Pairs together in P2: (0,1),(0,2),(0,3),(1,2),(1,3),(2,3) = 6 pairs
+        // TP = 0 (no pairs are together in both)
+        // FP = 0 (P1 has no pairs together to be wrong about)
+        // FN = 6 (P2 has 6 pairs that P1 missed)
+        // Precision = 0/0 = 1.0 by convention (no predictions made)
+        // Recall = 0/6 = 0.0
+        // F1 = 0.0 (since recall is 0)
+        // NOTE: When swapped (P2 as predicted), FP = 6, Precision = 0/6 = 0.0
+        assert_eq!(sparse_table.compute_precision(), 0.0); // Actually 0.0 for this direction
+        assert_eq!(sparse_table.compute_recall(), 0.0);
         assert_eq!(sparse_table.compute_f1(), 0.0);
     }
 
@@ -562,19 +584,34 @@ mod tests {
 
     #[test]
     fn test_ari_partial_overlap() {
-        // Partial overlap case
+        // Scenario: Cross-cutting clusters (worst-case disagreement)
+        // Partition1: {0,1} {2,3}
+        // Partition2: {0,2} {1,3}
+        // This represents maximum disagreement - each P1 cluster is split evenly across P2 clusters
         let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3]]);
         let partition2 = create_test_partition(vec![vec![0, 2], vec![1, 3]]);
 
-        let context = create_test_context(10); // Large enough for all test data
+        let context = create_test_context(10);
         let sparse_table =
             SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
         let ari = sparse_table.compute_ari();
 
-        // For this specific case, ARI should be negative
+        // Manual ARI calculation:
+        // Contingency table:
+        //        P2:{0,2}  P2:{1,3}
+        // P1:{0,1}    1        1
+        // P1:{2,3}    1        1
+        //
+        // Index (observed agreements) = 0 (no cells have ≥2 overlaps)
+        // Expected = sum(a_i choose 2) * sum(b_j choose 2) / (n choose 2)
+        //          = [C(2,2) + C(2,2)] * [C(2,2) + C(2,2)] / C(4,2)
+        //          = 2 * 2 / 6 = 2/3
+        // Max = 0.5 * [sum(a_i choose 2) + sum(b_j choose 2)] = 0.5 * [2 + 2] = 2
+        // ARI = (0 - 2/3) / (2 - 2/3) = -2/3 / 4/3 = -0.5
         assert!(
-            ari < 0.0 && ari > -1.0,
-            "Partial overlap with negative correlation"
+            (ari - (-0.5)).abs() < 0.01,
+            "Cross-cutting clusters should have ARI ≈ -0.5, got {}",
+            ari
         );
     }
 
@@ -753,5 +790,149 @@ mod tests {
         );
         assert_eq!(sparse_table.compute_bcubed_precision(), 1.0);
         assert_eq!(sparse_table.compute_bcubed_recall(), 1.0);
+    }
+
+    #[test]
+    fn test_precision_recall_detailed_scenario() {
+        // Detailed test demonstrating EXACTLY what precision and recall measure
+        // Scenario: Predicted clustering vs ground truth
+        // Predicted (P1): {0,1,2} {3,4} {5}  (one large cluster, one medium, one single)
+        // Truth (P2): {0,1} {2,3} {4,5}      (three pairs)
+        let partition1 = create_test_partition(vec![vec![0, 1, 2], vec![3, 4], vec![5]]);
+        let partition2 = create_test_partition(vec![vec![0, 1], vec![2, 3], vec![4, 5]]);
+        let context = create_test_context(10);
+
+        let table = SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+
+        // Manual calculation of pairs:
+        // Pairs in P1 (predicted): (0,1), (0,2), (1,2), (3,4) = 4 pairs
+        // Pairs in P2 (truth): (0,1), (2,3), (4,5) = 3 pairs
+        // True Positives: (0,1) = 1 pair (only this pair is in both)
+        // False Positives: (0,2), (1,2), (3,4) = 3 pairs (predicted but not in truth)
+        // False Negatives: (2,3), (4,5) = 2 pairs (in truth but not predicted)
+
+        // Precision = TP/(TP+FP) = 1/(1+3) = 1/4 = 0.25
+        // Recall = TP/(TP+FN) = 1/(1+2) = 1/3 ≈ 0.333
+        // F1 = 2*P*R/(P+R) = 2*0.25*0.333/(0.25+0.333) ≈ 0.286
+
+        let precision = table.compute_precision();
+        let recall = table.compute_recall();
+        let f1 = table.compute_f1();
+
+        assert!(
+            (precision - 0.25).abs() < 1e-10,
+            "Precision should be 0.25, got {}",
+            precision
+        );
+        assert!(
+            (recall - 1.0 / 3.0).abs() < 1e-10,
+            "Recall should be 1/3, got {}",
+            recall
+        );
+        // F1 = 2 * (1/4 * 1/3) / (1/4 + 1/3) = 2 * (1/12) / (7/12) = 2/7 ≈ 0.2857
+        let expected_f1 = 2.0 / 7.0;
+        assert!(
+            (f1 - expected_f1).abs() < 1e-10,
+            "F1 should be 2/7 ≈ 0.286, got {}",
+            f1
+        );
+    }
+
+    #[test]
+    fn test_bcubed_metrics_detailed() {
+        // B-cubed metrics are entity-centric, not pair-centric
+        // They average precision/recall for each record, not for pairs
+
+        // Scenario: Simple case to demonstrate difference from pairwise metrics
+        // Predicted: {0,1,2} {3}
+        // Truth: {0} {1,2,3}
+        let partition1 = create_test_partition(vec![vec![0, 1, 2], vec![3]]);
+        let partition2 = create_test_partition(vec![vec![0], vec![1, 2, 3]]);
+        let context = create_test_context(10);
+
+        let table = SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+
+        // B-cubed Precision calculation (per record, then average):
+        // Record 0: In predicted cluster {0,1,2}, true cluster {0}
+        //   Intersection = {0}, precision = 1/3
+        // Record 1: In predicted cluster {0,1,2}, true cluster {1,2,3}
+        //   Intersection = {1,2}, precision = 2/3
+        // Record 2: In predicted cluster {0,1,2}, true cluster {1,2,3}
+        //   Intersection = {1,2}, precision = 2/3
+        // Record 3: In predicted cluster {3}, true cluster {1,2,3}
+        //   Intersection = {3}, precision = 1/1 = 1.0
+        // Average B³-Precision = (1/3 + 2/3 + 2/3 + 1) / 4 = 8/12 / 4 = 2/3
+
+        // B-cubed Recall calculation:
+        // Record 0: True cluster {0}, predicted finds {0}
+        //   Recall = 1/1 = 1.0
+        // Record 1: True cluster {1,2,3}, predicted finds {1,2}
+        //   Recall = 2/3
+        // Record 2: True cluster {1,2,3}, predicted finds {1,2}
+        //   Recall = 2/3
+        // Record 3: True cluster {1,2,3}, predicted finds {3}
+        //   Recall = 1/3
+        // Average B³-Recall = (1 + 2/3 + 2/3 + 1/3) / 4 = 8/12 / 4 = 2/3
+
+        let bcubed_precision = table.compute_bcubed_precision();
+        let bcubed_recall = table.compute_bcubed_recall();
+
+        // Using the contingency table formula:
+        // Cell (0,0): 1 overlap, cluster size 3, contrib = 1²/3 = 1/3
+        // Cell (0,1): 2 overlap, cluster size 3, contrib = 2²/3 = 4/3
+        // Cell (1,1): 1 overlap, cluster size 1, contrib = 1²/1 = 1
+        // Total B³-Precision = (1/3 + 4/3 + 1) / 4 = 8/3 / 4 = 2/3
+
+        // For B³-Recall:
+        // Cell (0,0): 1 overlap, true cluster size 1, contrib = 1²/1 = 1
+        // Cell (0,1): 2 overlap, true cluster size 3, contrib = 2²/3 = 4/3
+        // Cell (1,1): 1 overlap, true cluster size 3, contrib = 1²/3 = 1/3
+        // Total B³-Recall = (1 + 4/3 + 1/3) / 4 = 8/3 / 4 = 2/3
+        assert!(
+            (bcubed_precision - 2.0 / 3.0).abs() < 1e-10,
+            "B³-Precision should be 2/3, got {}",
+            bcubed_precision
+        );
+        assert!(
+            (bcubed_recall - 2.0 / 3.0).abs() < 1e-10,
+            "B³-Recall should be 2/3, got {}",
+            bcubed_recall
+        );
+    }
+
+    #[test]
+    fn test_nmi_calculation_manual() {
+        // Test NMI with manual calculation to verify formula
+        // Partition1: {0,1} {2,3,4}
+        // Partition2: {0,1,2} {3,4}
+        let partition1 = create_test_partition(vec![vec![0, 1], vec![2, 3, 4]]);
+        let partition2 = create_test_partition(vec![vec![0, 1, 2], vec![3, 4]]);
+        let context = create_test_context(10);
+
+        let table = SparseContingencyTable::from_partitions(&partition1, &partition2, &context);
+
+        // Manual NMI calculation:
+        // Contingency matrix:
+        //           P2:{0,1,2}  P2:{3,4}
+        // P1:{0,1}      2          0
+        // P1:{2,3,4}    1          2
+        //
+        // H(U) = -[2/5 * log2(2/5) + 3/5 * log2(3/5)]
+        //      = -[0.4 * (-1.32) + 0.6 * (-0.737)] = 0.529 + 0.442 = 0.971
+        // H(V) = -[3/5 * log2(3/5) + 2/5 * log2(2/5)]
+        //      = 0.971 (same distribution)
+        // I(U;V) = sum over cells of (n_ij/n) * log2(n*n_ij / (a_i*b_j))
+        //        = 2/5 * log2(5*2/(2*3)) + 1/5 * log2(5*1/(3*3)) + 2/5 * log2(5*2/(3*2))
+        //        = 2/5 * log2(5/3) + 1/5 * log2(5/9) + 2/5 * log2(5/3)
+        //        = 0.4 * 0.737 + 0.2 * (-0.848) + 0.4 * 0.737
+        //        = 0.295 - 0.170 + 0.295 = 0.420
+        // NMI = 2 * I(U;V) / (H(U) + H(V)) = 2 * 0.420 / (0.971 + 0.971) = 0.840 / 1.942 ≈ 0.433
+
+        let nmi = table.compute_nmi();
+        assert!(
+            (nmi - 0.433).abs() < 0.05,
+            "NMI should be ≈ 0.433, got {}",
+            nmi
+        );
     }
 }
