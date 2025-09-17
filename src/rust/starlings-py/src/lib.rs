@@ -869,11 +869,12 @@ impl PyEntityFrame {
     ///     )
     ///     # Returns: [{"splink_threshold": 0.85, "truth_threshold": 1.0, "f1": 0.92, ...}]
     ///     ```
-    #[pyo3(signature = (*expressions, metrics=None))]
+    #[pyo3(signature = (*expressions, metrics=None, progress_callback=None))]
     fn analyse(
         &mut self,
         expressions: &Bound<'_, pyo3::types::PyTuple>,
         metrics: Option<Vec<Bound<'_, PyAny>>>,
+        progress_callback: Option<Py<PyAny>>,
         py: Python,
     ) -> PyResult<Vec<std::collections::HashMap<String, f64>>> {
         use std::collections::HashMap;
@@ -907,6 +908,11 @@ impl PyEntityFrame {
                 vec![MetricType::EntityCount, MetricType::Entropy]
             }
         };
+
+        // Report initial progress
+        if let Some(ref callback) = progress_callback {
+            callback.call1(py, (0.05, "Preparing analysis"))?;
+        }
 
         // Generate all combinations of thresholds for cartesian product
         let threshold_combinations = generate_threshold_combinations(&parsed_expressions)?;
@@ -967,9 +973,18 @@ impl PyEntityFrame {
                 _ => unreachable!("Sweep × sweep case should only have Sweep expressions"),
             };
 
+            // Report progress for partition building
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.1, "Building partitions"))?;
+            }
+
             // Build all partitions upfront
             let partitions1 = self.build_partitions_for_thresholds(&col1, &thresholds1)?;
             let partitions2 = self.build_partitions_for_thresholds(&col2, &thresholds2)?;
+
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.4, "Partitions built"))?;
+            }
 
             // Get shared context
             let context = if let Some(hierarchy) = self.frame.get_collection(&col1) {
@@ -982,6 +997,10 @@ impl PyEntityFrame {
             };
 
             // Build all contingency tables in one pass
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.5, "Computing contingency tables"))?;
+            }
+
             // TODO: This is a temporary workaround - build_all_sweep_tables should accept Arc<PartitionLevel>
             // For now, we clone the PartitionLevel which is expensive but necessary for the current API
             let partitions1_derefs: Vec<PartitionLevel> =
@@ -991,7 +1010,13 @@ impl PyEntityFrame {
             let all_tables =
                 build_all_sweep_tables(&partitions1_derefs, &partitions2_derefs, &context);
 
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.7, "Computing metrics"))?;
+            }
+
             // Convert tables to results
+            let total_combinations = thresholds1.len() * thresholds2.len();
+            let mut completed = 0;
             for (i, threshold1) in thresholds1.iter().enumerate() {
                 for (j, threshold2) in thresholds2.iter().enumerate() {
                     let mut result = HashMap::new();
@@ -1016,13 +1041,36 @@ impl PyEntityFrame {
                     }
 
                     results.push(result);
+
+                    // Update progress
+                    completed += 1;
+                    if let Some(ref callback) = progress_callback {
+                        let progress = 0.7 + (0.3 * completed as f64 / total_combinations as f64);
+                        callback.call1(
+                            py,
+                            (
+                                progress,
+                                format!(
+                                    "Processing combination {}/{}",
+                                    completed, total_combinations
+                                ),
+                            ),
+                        )?;
+                    }
                 }
+            }
+
+            // Report completion
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (1.0, "Analysis complete"))?;
             }
 
             return Ok(results);
         }
 
         // For all other cases, use appropriate algorithm based on collection comparison
+        let total_combinations = threshold_combinations.len();
+        let mut combination_idx = 0;
 
         for combination in threshold_combinations {
             let mut result = HashMap::new();
@@ -1151,6 +1199,22 @@ impl PyEntityFrame {
 
             results.push(result);
 
+            // Update progress
+            combination_idx += 1;
+            if let Some(ref callback) = progress_callback {
+                let progress = 0.1 + (0.9 * combination_idx as f64 / total_combinations as f64);
+                callback.call1(
+                    py,
+                    (
+                        progress,
+                        format!(
+                            "Processing combination {}/{}",
+                            combination_idx, total_combinations
+                        ),
+                    ),
+                )?;
+            }
+
             // Progressive cache management based on collection sizes
             // Keep more cache for smaller collections, less for larger ones
             let max_entities = owned_partitions
@@ -1182,6 +1246,11 @@ impl PyEntityFrame {
                 // Simple strategy: clear half the cache when limit exceeded
                 contingency_cache.clear();
             }
+        }
+
+        // Report completion
+        if let Some(ref callback) = progress_callback {
+            callback.call1(py, (1.0, "Analysis complete"))?;
         }
 
         Ok(results)

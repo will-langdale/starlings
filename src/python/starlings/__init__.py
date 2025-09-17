@@ -551,7 +551,50 @@ class EntityFrame:
             >>> df = pl.from_dicts(result)
             ```
         """
-        return self._frame.analyse(*expressions, metrics=metrics)  # type: ignore[no-any-return]
+        # Calculate total operations for progress bar
+        # This requires introspecting the expressions to count threshold combinations
+        num_combinations = 1
+        for expr in expressions:
+            # Check if expression is a sweep by looking for _sweep attribute
+            if hasattr(expr, "_sweep") and expr._sweep:
+                # Calculate number of points in sweep
+                start, stop, step = expr._sweep
+                num_points = int((stop - start) / step) + 1
+                num_combinations *= num_points
+            else:
+                # Point expression contributes factor of 1
+                num_combinations *= 1
+
+        # Determine number of metrics (use defaults if None)
+        if metrics is not None:
+            num_metrics = len(metrics)
+        else:
+            # Default metrics based on number of expressions
+            num_metrics = 3 if len(expressions) >= 2 else 2
+
+        total_operations = num_combinations * num_metrics
+
+        # Create progress bar
+        progress_bar = tqdm(
+            total=total_operations,
+            desc="Analysing",
+            unit="ops",
+            unit_scale=True,
+        )
+
+        def progress_callback(progress: float, message: str) -> None:
+            progress_bar.set_description(f"Analysing - {message}")
+            progress_bar.n = int(progress * total_operations)
+            progress_bar.refresh()
+
+        try:
+            result = self._frame.analyse(
+                *expressions, metrics=metrics, progress_callback=progress_callback
+            )
+        finally:
+            progress_bar.close()
+
+        return result  # type: ignore[no-any-return]
 
     def __repr__(self) -> str:
         """String representation for debugging."""
