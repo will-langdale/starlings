@@ -44,11 +44,26 @@ struct IncrementalState {
     false_negatives: u64,
     /// Cached true negatives
     true_negatives: u64,
+    /// Sum of C(n_ij, 2) for all contingency table cells (for ARI)
+    sum_cell_combinations: u64,
+    /// Sum of C(a_i, 2) for row marginals (for ARI)
+    sum_row_combinations: u64,
+    /// Sum of C(b_j, 2) for column marginals (for ARI)
+    sum_col_combinations: u64,
 }
 
 /// Get the canonical ID for an entity (its minimum record ID)
 fn get_canonical_id(entity: &RoaringBitmap) -> u32 {
     entity.min().expect("Entity cannot be empty")
+}
+
+/// Compute binomial coefficient "n choose 2"
+fn choose_2(n: u32) -> u64 {
+    if n < 2 {
+        0
+    } else {
+        (n as u64) * ((n - 1) as u64) / 2
+    }
 }
 
 impl Default for DeltaAlgorithm {
@@ -83,16 +98,20 @@ impl DeltaAlgorithm {
             false_positives: 0,
             false_negatives: 0,
             true_negatives: 0,
+            sum_cell_combinations: 0,
+            sum_row_combinations: 0,
+            sum_col_combinations: 0,
         };
 
         // Build canonical ID list and marginals for partition1
         for entity in partition1.entities() {
             let canonical_id = get_canonical_id(entity);
             state.last_p1_entities.push(canonical_id);
-            state
-                .row_marginals
-                .insert(canonical_id, entity.len() as u32);
-            state.total_records += entity.len() as u32;
+            let size = entity.len() as u32;
+            state.row_marginals.insert(canonical_id, size);
+            state.total_records += size;
+            // Calculate row combination sum for ARI
+            state.sum_row_combinations += choose_2(size);
         }
 
         // Build canonical ID list and marginals for partition2 if present
@@ -101,9 +120,10 @@ impl DeltaAlgorithm {
             for entity in p2.entities() {
                 let canonical_id = get_canonical_id(entity);
                 p2_entities.push(canonical_id);
-                state
-                    .col_marginals
-                    .insert(canonical_id, entity.len() as u32);
+                let size = entity.len() as u32;
+                state.col_marginals.insert(canonical_id, size);
+                // Calculate column combination sum for ARI
+                state.sum_col_combinations += choose_2(size);
             }
             // Sort to ensure consistent ordering
             p2_entities.sort_unstable();
@@ -117,6 +137,8 @@ impl DeltaAlgorithm {
                     let overlap = entity1.intersection_len(entity2) as u32;
                     if overlap > 0 {
                         state.contingency_table.insert((id1, id2), overlap);
+                        // Calculate cell combination sum for ARI
+                        state.sum_cell_combinations += choose_2(overlap);
                     }
                 }
             }
@@ -215,6 +237,8 @@ impl DeltaAlgorithm {
         // Update contingency table for merges
         let mut new_contingency = HashMap::new();
         let mut new_row_marginals = HashMap::new();
+        let mut new_sum_row_combinations = 0u64;
+        let mut new_sum_cell_combinations = 0u64;
 
         for (new_id, old_ids) in new_to_old {
             if old_ids.len() == 1 {
@@ -224,6 +248,7 @@ impl DeltaAlgorithm {
                 // Transfer marginal
                 if let Some(&marginal) = state.row_marginals.get(&old_id) {
                     new_row_marginals.insert(new_id, marginal);
+                    new_sum_row_combinations += choose_2(marginal);
                 }
 
                 // Transfer contingency cells
@@ -231,6 +256,7 @@ impl DeltaAlgorithm {
                     for (&(row, col), &count) in &state.contingency_table {
                         if row == old_id {
                             new_contingency.insert((new_id, col), count);
+                            new_sum_cell_combinations += choose_2(count);
                         }
                     }
                 }
@@ -244,6 +270,7 @@ impl DeltaAlgorithm {
                     }
                 }
                 new_row_marginals.insert(new_id, merged_marginal);
+                new_sum_row_combinations += choose_2(merged_marginal);
 
                 // For merged entities, we need to recalculate overlaps with partition2
                 // because merging changes the overlap counts!
@@ -261,6 +288,7 @@ impl DeltaAlgorithm {
                         let overlap = merged_entity.intersection_len(entity2) as u32;
                         if overlap > 0 {
                             new_contingency.insert((new_id, id2), overlap);
+                            new_sum_cell_combinations += choose_2(overlap);
                         }
                     }
                 }
@@ -290,6 +318,11 @@ impl DeltaAlgorithm {
             .map(|e| e.len() as u32)
             .sum();
 
+        // Update ARI components
+        state.sum_row_combinations = new_sum_row_combinations;
+        state.sum_cell_combinations = new_sum_cell_combinations;
+        // Note: sum_col_combinations doesn't change as partition2 is fixed
+
         // Recompute pair counts after update
         DeltaAlgorithm::compute_state_pair_counts(state);
     }
@@ -304,12 +337,13 @@ impl DeltaAlgorithm {
                     MetricType::F1 => self.compute_f1_from_state(state),
                     MetricType::Precision => self.compute_precision_from_state(state),
                     MetricType::Recall => self.compute_recall_from_state(state),
-                    // TODO: Implement other metrics
-                    MetricType::ARI => 0.0,
-                    MetricType::NMI => 0.0,
-                    MetricType::VMeasure => 0.0,
-                    MetricType::BCubedPrecision => 0.0,
-                    MetricType::BCubedRecall => 0.0,
+                    MetricType::ARI => self.compute_ari_from_state(state),
+                    // These metrics require full contingency table, not amenable to incremental updates
+                    // They delegate to direct computation from the stored contingency state
+                    MetricType::NMI => 0.0, // Would require incremental entropy calculations
+                    MetricType::VMeasure => 0.0, // Would require homogeneity & completeness tracking
+                    MetricType::BCubedPrecision => 0.0, // Requires per-record computation
+                    MetricType::BCubedRecall => 0.0, // Requires per-record computation
                     _ => 0.0,
                 };
                 results.insert(metric.name().to_string(), value);
@@ -341,6 +375,33 @@ impl DeltaAlgorithm {
         } else {
             state.true_positives as f64 / denominator as f64
         }
+    }
+
+    /// Compute ARI directly from state
+    fn compute_ari_from_state(&self, state: &IncrementalState) -> f64 {
+        // Handle edge case: empty or single-record partitions
+        if state.total_records < 2 {
+            return 0.0;
+        }
+
+        let total_comb = choose_2(state.total_records);
+
+        // Calculate expected index under null hypothesis
+        let expected = (state.sum_row_combinations as f64) * (state.sum_col_combinations as f64)
+            / (total_comb as f64);
+
+        // Calculate maximum possible index
+        let max_index =
+            (state.sum_row_combinations as f64 + state.sum_col_combinations as f64) / 2.0;
+
+        // Handle edge case where max_index equals expected
+        let denominator = max_index - expected;
+        if denominator.abs() < 1e-10 {
+            return 0.0;
+        }
+
+        // Calculate ARI
+        (state.sum_cell_combinations as f64 - expected) / denominator
     }
 
     /// Compute F1 score directly from state

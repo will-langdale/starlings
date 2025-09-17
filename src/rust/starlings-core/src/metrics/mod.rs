@@ -246,4 +246,112 @@ mod tests {
         assert!(results.contains_key("precision"));
         assert!(results.contains_key("recall"));
     }
+
+    #[test]
+    fn test_ari_computation() {
+        let mut engine = MetricEngine::new();
+        let context = DataContext::new();
+
+        // Add records 0-5
+        for i in 0..6 {
+            context.ensure_record("test", Key::U32(i));
+        }
+        let context = Arc::new(context);
+
+        // Create two partitions with known ARI
+        // Partition1: {0,1}, {2,3}, {4,5}
+        let mut entities1 = Vec::new();
+        let mut e1 = RoaringBitmap::new();
+        e1.insert(0);
+        e1.insert(1);
+        entities1.push(e1);
+        let mut e2 = RoaringBitmap::new();
+        e2.insert(2);
+        e2.insert(3);
+        entities1.push(e2);
+        let mut e3 = RoaringBitmap::new();
+        e3.insert(4);
+        e3.insert(5);
+        entities1.push(e3);
+
+        // Partition2: {0,1}, {2,3}, {4,5} (identical, ARI should be 1.0)
+        let entities2 = entities1.clone();
+
+        let partition1 = PartitionLevel::new(0.8, entities1);
+        let partition2 = PartitionLevel::new(0.9, entities2);
+
+        // Test ARI computation
+        let metrics = vec![MetricType::ARI];
+        let results = engine.compute_single(&partition1, Some(&partition2), &metrics, &context);
+
+        assert!(results.contains_key("ari"));
+        let ari = results.get("ari").unwrap();
+        assert!(
+            (ari - 1.0).abs() < 1e-10,
+            "ARI for identical partitions should be 1.0, got {}",
+            ari
+        );
+    }
+
+    #[test]
+    fn test_ari_with_different_partitions() {
+        let mut engine = MetricEngine::new();
+        let context = DataContext::new();
+
+        // Add records 0-5
+        for i in 0..6 {
+            context.ensure_record("test", Key::U32(i));
+        }
+        let context = Arc::new(context);
+
+        // Create two different partitions
+        // Partition1: {0,1,2}, {3,4,5}
+        let mut entities1 = Vec::new();
+        let mut e1 = RoaringBitmap::new();
+        e1.insert(0);
+        e1.insert(1);
+        e1.insert(2);
+        entities1.push(e1);
+        let mut e2 = RoaringBitmap::new();
+        e2.insert(3);
+        e2.insert(4);
+        e2.insert(5);
+        entities1.push(e2);
+
+        // Partition2: {0,1}, {2,3}, {4,5}
+        let mut entities2 = Vec::new();
+        let mut e3 = RoaringBitmap::new();
+        e3.insert(0);
+        e3.insert(1);
+        entities2.push(e3);
+        let mut e4 = RoaringBitmap::new();
+        e4.insert(2);
+        e4.insert(3);
+        entities2.push(e4);
+        let mut e5 = RoaringBitmap::new();
+        e5.insert(4);
+        e5.insert(5);
+        entities2.push(e5);
+
+        let partition1 = PartitionLevel::new(0.8, entities1);
+        let partition2 = PartitionLevel::new(0.9, entities2);
+
+        // Test ARI computation
+        let metrics = vec![MetricType::ARI, MetricType::Precision, MetricType::Recall];
+        let results = engine.compute_single(&partition1, Some(&partition2), &metrics, &context);
+
+        assert!(results.contains_key("ari"));
+        let ari = results.get("ari").unwrap();
+        // ARI should be between -1 and 1, and for partial overlap should be between 0 and 1
+        assert!(
+            (-1.0..=1.0).contains(ari),
+            "ARI should be in [-1, 1], got {}",
+            ari
+        );
+        assert!(
+            *ari > 0.0 && *ari < 1.0,
+            "ARI for partial overlap should be between 0 and 1, got {}",
+            ari
+        );
+    }
 }
