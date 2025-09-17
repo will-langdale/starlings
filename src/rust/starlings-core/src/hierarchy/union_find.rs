@@ -147,6 +147,14 @@ impl UnionFind<MmapBackend> {
     }
 }
 
+impl<B: UnionFindBackend + Clone> Clone for UnionFind<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+        }
+    }
+}
+
 impl<B: UnionFindBackend> UnionFind<B> {
     /// Find the root of the set containing element x with path halving
     /// Path halving provides better cache behaviour than full path compression

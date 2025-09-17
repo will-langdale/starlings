@@ -1,4 +1,4 @@
-use lru::LruCache;
+use dashmap::DashMap;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -88,17 +88,16 @@ impl ComponentManager<'_> {
 pub struct PartitionHierarchy {
     pub context: Arc<DataContext>,
     storage: Box<dyn HierarchyStorage + Send + Sync>,
-    partition_cache: LruCache<u32, PartitionLevel>,
+    partition_cache: Arc<DashMap<u32, Arc<PartitionLevel>>>,
     bitmap_pool: BitmapPool,
 }
 
 impl Clone for PartitionHierarchy {
     fn clone(&self) -> Self {
-        use std::num::NonZeroUsize;
         PartitionHierarchy {
             context: self.context.clone(),
             storage: self.storage.clone_box(),
-            partition_cache: LruCache::new(NonZeroUsize::new(Self::CACHE_SIZE).unwrap()), // Fresh cache for cloned hierarchy
+            partition_cache: self.partition_cache.clone(), // Share cache across clones
             bitmap_pool: BitmapPool::new(),
         }
     }
@@ -140,7 +139,7 @@ impl PartitionHierarchy {
             return Ok(Self {
                 context,
                 storage: Box::new(InMemoryStorage::new()),
-                partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+                partition_cache: Arc::new(DashMap::with_capacity(Self::CACHE_SIZE)),
                 bitmap_pool: BitmapPool::new(),
             });
         }
@@ -213,7 +212,7 @@ impl PartitionHierarchy {
         let mut temp_hierarchy = Self {
             context: context.clone(),
             storage,
-            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            partition_cache: Arc::new(DashMap::with_capacity(Self::CACHE_SIZE)),
             bitmap_pool: BitmapPool::new_for_scale(num_edges),
         };
 
@@ -246,7 +245,7 @@ impl PartitionHierarchy {
         let result = Self {
             context,
             storage: temp_hierarchy.storage,
-            partition_cache: LruCache::new(cache_size.try_into().unwrap()),
+            partition_cache: Arc::new(DashMap::with_capacity(cache_size)),
             bitmap_pool: temp_hierarchy.bitmap_pool,
         };
 
@@ -433,13 +432,13 @@ impl PartitionHierarchy {
         Self {
             context,
             storage,
-            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            partition_cache: Arc::new(DashMap::with_capacity(Self::CACHE_SIZE)),
             bitmap_pool: BitmapPool::new(),
         }
     }
 
     /// Get a partition at a specific threshold
-    pub fn at_threshold(&mut self, threshold: f64) -> &PartitionLevel {
+    pub fn at_threshold(&self, threshold: f64) -> Arc<PartitionLevel> {
         // Validate threshold
         assert!(
             (0.0..=1.0).contains(&threshold),
@@ -449,9 +448,9 @@ impl PartitionHierarchy {
 
         let key = Self::threshold_to_key(threshold);
 
-        // Check if already cached
-        if self.partition_cache.contains(&key) {
-            return self.partition_cache.get(&key).unwrap();
+        // Check if already in cache (lock-free read)
+        if let Some(partition) = self.partition_cache.get(&key) {
+            return partition.clone();
         }
 
         // Reconstruct the partition
@@ -459,9 +458,11 @@ impl PartitionHierarchy {
             .reconstruct_at_threshold(threshold)
             .expect("Storage iteration failed during partition reconstruction");
 
-        // Store in cache and return reference
-        self.partition_cache.put(key, partition);
-        self.partition_cache.get(&key).unwrap()
+        // Wrap in Arc and store in cache (lock-free insert)
+        let partition_arc = Arc::new(partition);
+        self.partition_cache.insert(key, partition_arc.clone());
+
+        partition_arc
     }
 
     /// Reconstruct a partition at a specific threshold with streaming processing
@@ -596,6 +597,33 @@ impl PartitionHierarchy {
         let entities: Vec<RoaringBitmap> = entities_map.into_values().collect();
 
         Ok(PartitionLevel::new(threshold, entities))
+    }
+
+    /// Build multiple partitions using incremental reconstruction for efficiency
+    pub fn build_partitions_incrementally(&self, thresholds: &[f64]) -> Vec<Arc<PartitionLevel>> {
+        use super::incremental::IncrementalPartitionBuilder;
+
+        // Use incremental builder for multiple thresholds
+        let mut builder = IncrementalPartitionBuilder::new(self.context.clone());
+
+        // Build all partitions incrementally
+        let partitions = builder
+            .build_multiple(thresholds, self.storage.as_ref())
+            .expect("Incremental partition building failed");
+
+        // Store all partitions in cache
+        for (i, &threshold) in thresholds.iter().enumerate() {
+            let key = Self::threshold_to_key(threshold);
+            self.partition_cache.insert(key, partitions[i].clone());
+        }
+
+        partitions
+    }
+
+    /// Get a reference to the storage backend (for incremental builder)
+    #[cfg(test)]
+    pub(crate) fn storage(&self) -> &dyn HierarchyStorage {
+        self.storage.as_ref()
     }
 }
 
@@ -834,7 +862,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.0, all records should be in one entity
         let partition = hierarchy.at_threshold(0.0);
@@ -860,7 +888,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 1.0, each record should be a singleton
         let partition = hierarchy.at_threshold(1.0);
@@ -885,7 +913,7 @@ mod tests {
             (1, 2, 0.4), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.5, A-B should be merged but C separate
         let partition = hierarchy.at_threshold(0.5);
@@ -920,7 +948,7 @@ mod tests {
             (1, 2, 0.6), // Connect 1-2
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.5, should have:
         // - One entity with {0, 1, 2}
@@ -945,7 +973,7 @@ mod tests {
 
         let edges = vec![(0, 1, 0.8), (1, 2, 0.6)];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // First access - should reconstruct
         let partition1 = hierarchy.at_threshold(0.7);
@@ -973,7 +1001,7 @@ mod tests {
     fn test_invalid_threshold_negative() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should panic with negative threshold
         hierarchy.at_threshold(-0.1);
@@ -984,7 +1012,7 @@ mod tests {
     fn test_invalid_threshold_too_large() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should panic with threshold > 1.0
         hierarchy.at_threshold(1.1);
@@ -1007,7 +1035,7 @@ mod tests {
             (4, 5, 0.9), // E-F
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.9, should have 3 components (3 pairs)
         let partition = hierarchy.at_threshold(0.9);
@@ -1055,7 +1083,7 @@ mod tests {
             (6, 7, 0.7), // Pair 4 (lowest threshold)
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Test hierarchical behaviour
         let partition_high = hierarchy.at_threshold(0.95);
@@ -1110,7 +1138,7 @@ mod tests {
         ];
 
         // Test with quantise=2 (2 decimal places)
-        let mut hierarchy =
+        let hierarchy =
             PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 2, None).unwrap();
 
         let partition_high = hierarchy.at_threshold(0.9);

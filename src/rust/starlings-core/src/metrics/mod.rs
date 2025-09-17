@@ -150,13 +150,11 @@ impl MetricRequest {
 
 /// Helper function to build partitions for a set of thresholds
 pub fn build_partitions_for_thresholds(
-    hierarchy: &mut PartitionHierarchy,
+    hierarchy: &PartitionHierarchy,
     thresholds: &[f64],
-) -> Vec<PartitionLevel> {
-    thresholds
-        .iter()
-        .map(|&threshold| hierarchy.at_threshold(threshold).clone())
-        .collect()
+) -> Vec<Arc<PartitionLevel>> {
+    // Use incremental building for multiple thresholds
+    hierarchy.build_partitions_incrementally(thresholds)
 }
 
 #[cfg(test)]

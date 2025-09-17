@@ -6,6 +6,14 @@ use super::types::MetricType;
 use crate::{DataContext, PartitionLevel};
 use std::sync::Arc;
 
+/// Pre-computed marginals for a partition to avoid redundant computation
+struct PrecomputedMarginals {
+    /// Entity sizes indexed by entity_id
+    entity_sizes: Vec<u32>,
+    /// Total number of records in the partition
+    total_records: u32,
+}
+
 /// Generate all threshold values for a sweep expression
 /// Ensures step sizes are quantized to 0.05 increments for performance
 pub fn generate_sweep_thresholds(start: f64, stop: f64, step: f64) -> Vec<f64> {
@@ -35,6 +43,7 @@ pub fn build_all_sweep_tables(
     partitions2: &[PartitionLevel],
     context: &Arc<DataContext>,
 ) -> Vec<Vec<SparseContingencyTable>> {
+    #[cfg(debug_assertions)]
     use crate::debug_println;
 
     let num_records = context.len();
@@ -79,20 +88,60 @@ pub fn build_all_sweep_tables(
     let mut tables =
         vec![vec![SparseContingencyTable::new(); partitions2.len()]; partitions1.len()];
 
-    // Add marginals to all tables
+    // Pre-compute marginals once per partition
     #[cfg(debug_assertions)]
     let marginal_start = std::time::Instant::now();
 
-    for (i, partition1) in partitions1.iter().enumerate() {
-        for (j, partition2) in partitions2.iter().enumerate() {
-            let table = &mut tables[i][j];
-            table.total_records = partition1.entities().iter().map(|e| e.len() as u32).sum();
-
-            for (entity_id, entity) in partition1.entities().iter().enumerate() {
-                table.row_marginals.insert(entity_id, entity.len() as u32);
+    let marginals1: Vec<PrecomputedMarginals> = partitions1
+        .iter()
+        .map(|partition| {
+            let entity_sizes: Vec<u32> = partition
+                .entities()
+                .iter()
+                .map(|e| e.len() as u32)
+                .collect();
+            let total_records = entity_sizes.iter().sum();
+            PrecomputedMarginals {
+                entity_sizes,
+                total_records,
             }
-            for (entity_id, entity) in partition2.entities().iter().enumerate() {
-                table.col_marginals.insert(entity_id, entity.len() as u32);
+        })
+        .collect();
+
+    let marginals2: Vec<PrecomputedMarginals> = partitions2
+        .iter()
+        .map(|partition| {
+            let entity_sizes: Vec<u32> = partition
+                .entities()
+                .iter()
+                .map(|e| e.len() as u32)
+                .collect();
+            let total_records = entity_sizes.iter().sum();
+            PrecomputedMarginals {
+                entity_sizes,
+                total_records,
+            }
+        })
+        .collect();
+
+    // Initialize tables with pre-computed marginals
+    for (i, marginal1) in marginals1.iter().enumerate() {
+        for (j, marginal2) in marginals2.iter().enumerate() {
+            let table = &mut tables[i][j];
+            table.total_records = marginal1.total_records;
+
+            // Copy row marginals
+            for (entity_id, &size) in marginal1.entity_sizes.iter().enumerate() {
+                if size > 0 {
+                    table.row_marginals.insert(entity_id, size);
+                }
+            }
+
+            // Copy column marginals
+            for (entity_id, &size) in marginal2.entity_sizes.iter().enumerate() {
+                if size > 0 {
+                    table.col_marginals.insert(entity_id, size);
+                }
             }
         }
     }
@@ -102,7 +151,7 @@ pub fn build_all_sweep_tables(
         let marginal_time = marginal_start.elapsed();
         let num_tables = partitions1.len() * partitions2.len();
         debug_println!(
-            "      🔧 Marginal calculation: {:?} for {} tables",
+            "      🔧 Marginal pre-computation and table init: {:?} for {} tables",
             marginal_time,
             num_tables
         );

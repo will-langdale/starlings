@@ -187,7 +187,7 @@ impl EdgeGenerator {
 #[pyclass(name = "Partition")]
 #[derive(Clone)]
 pub struct PyPartition {
-    partition: PartitionLevel,
+    partition: Arc<PartitionLevel>,
 }
 
 #[pymethods]
@@ -584,9 +584,7 @@ impl PyCollection {
     ///     ```
     fn at(&mut self, threshold: f64) -> PyResult<PyPartition> {
         let partition = self.hierarchy.at_threshold(threshold);
-        Ok(PyPartition {
-            partition: partition.clone(),
-        })
+        Ok(PyPartition { partition })
     }
 
     /// Create a deep copy of this collection with independent context.
@@ -916,7 +914,7 @@ impl PyEntityFrame {
         let mut results = Vec::new();
 
         // Cache for partitions to avoid redundant reconstruction
-        let mut partition_cache: HashMap<(String, u64), PartitionLevel> = HashMap::new();
+        let mut partition_cache: HashMap<(String, u64), Arc<PartitionLevel>> = HashMap::new();
 
         // Cache for contingency tables to avoid redundant computation
         let mut contingency_cache: HashMap<(String, u64, String, u64), SparseContingencyTable> =
@@ -984,7 +982,14 @@ impl PyEntityFrame {
             };
 
             // Build all contingency tables in one pass
-            let all_tables = build_all_sweep_tables(&partitions1, &partitions2, &context);
+            // TODO: This is a temporary workaround - build_all_sweep_tables should accept Arc<PartitionLevel>
+            // For now, we clone the PartitionLevel which is expensive but necessary for the current API
+            let partitions1_derefs: Vec<PartitionLevel> =
+                partitions1.iter().map(|p| (**p).clone()).collect();
+            let partitions2_derefs: Vec<PartitionLevel> =
+                partitions2.iter().map(|p| (**p).clone()).collect();
+            let all_tables =
+                build_all_sweep_tables(&partitions1_derefs, &partitions2_derefs, &context);
 
             // Convert tables to results
             for (i, threshold1) in thresholds1.iter().enumerate() {
@@ -1032,7 +1037,7 @@ impl PyEntityFrame {
             }
 
             // Get partitions for this combination, using cache when possible
-            let mut owned_partitions = Vec::new();
+            let mut owned_partitions: Vec<Arc<PartitionLevel>> = Vec::new();
             let mut collection_names = Vec::new();
             for (expr, threshold) in &combination {
                 let collection_name = match expr {
@@ -1051,8 +1056,7 @@ impl PyEntityFrame {
                 } else {
                     // Reconstruct partition and cache it
                     if let Some(hierarchy) = self.frame.get_collection(collection_name) {
-                        let mut hierarchy_clone = hierarchy.clone();
-                        let partition = hierarchy_clone.at_threshold(*threshold).clone();
+                        let partition = hierarchy.at_threshold(*threshold);
                         partition_cache.insert(cache_key, partition.clone());
                         partition
                     } else {
@@ -1273,13 +1277,13 @@ impl PyEntityFrame {
         &self,
         collection_name: &str,
         thresholds: &[f64],
-    ) -> PyResult<Vec<PartitionLevel>> {
+    ) -> PyResult<Vec<Arc<PartitionLevel>>> {
+        #[cfg(debug_assertions)]
         use starlings_core::debug_println;
 
         #[cfg(debug_assertions)]
         let start = std::time::Instant::now();
 
-        let mut partitions = Vec::new();
         let hierarchy = self.frame.get_collection(collection_name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Collection '{}' not found",
@@ -1289,37 +1293,33 @@ impl PyEntityFrame {
 
         #[cfg(debug_assertions)]
         debug_println!(
-            "      🔧 Building {} partitions for {}",
+            "      🔧 Building {} partitions incrementally for {}",
             thresholds.len(),
             collection_name
         );
 
-        for (i, threshold) in thresholds.iter().enumerate() {
-            #[cfg(debug_assertions)]
-            let partition_start = std::time::Instant::now();
-
-            let mut h = hierarchy.clone();
-            let partition = h.at_threshold(*threshold).clone();
-
-            #[cfg(debug_assertions)]
-            {
-                let partition_time = partition_start.elapsed();
-                debug_println!(
-                    "         Partition {} at {:.2}: {:?} ({} entities)",
-                    i + 1,
-                    threshold,
-                    partition_time,
-                    partition.entities().len()
-                );
-            }
-
-            partitions.push(partition);
-        }
+        // Use incremental building for all partitions
+        let partitions = hierarchy.build_partitions_incrementally(thresholds);
 
         #[cfg(debug_assertions)]
         {
             let total_time = start.elapsed();
-            debug_println!("      🔧 Total partition building: {:?}", total_time);
+            debug_println!(
+                "      🔧 Total incremental partition building: {:?} ({} partitions)",
+                total_time,
+                partitions.len()
+            );
+
+            // Log some statistics about the partitions
+            for (i, (threshold, partition)) in thresholds.iter().zip(&partitions).enumerate() {
+                debug_println!(
+                    "         Partition {} at {:.2}: {} entities, {} records",
+                    i + 1,
+                    threshold,
+                    partition.entities().len(),
+                    partition.total_records()
+                );
+            }
         }
 
         Ok(partitions)

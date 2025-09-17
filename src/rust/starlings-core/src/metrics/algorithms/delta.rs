@@ -518,16 +518,19 @@ mod tests {
         let hierarchy = Arc::new(hierarchy);
 
         // Build partitions at different thresholds
-        let mut hierarchy_mut = (*hierarchy).clone();
+        let hierarchy_clone = (*hierarchy).clone();
         let thresholds = [0.4, 0.55, 0.65, 0.75, 0.85];
-        let partitions: Vec<_> = thresholds
+        let partitions: Vec<Arc<PartitionLevel>> = thresholds
             .iter()
-            .map(|&t| hierarchy_mut.at_threshold(t).clone())
+            .map(|&t| hierarchy_clone.at_threshold(t))
             .collect();
 
         // Test sweep computation
         let metrics = vec![MetricType::EntityCount];
-        let results = algo.compute_sweep(&partitions, None, &metrics, &context);
+        // Create a temporary vec of dereferenced partitions for the test
+        let partition_derefs: Vec<PartitionLevel> =
+            partitions.iter().map(|p| (**p).clone()).collect();
+        let results = algo.compute_sweep(&partition_derefs, None, &metrics, &context);
 
         // Should have results for each threshold
         assert_eq!(results.len(), 5);
@@ -610,22 +613,26 @@ mod tests {
 
         // Test sweep with multiple thresholds
         let thresholds = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95];
-        let mut hierarchy_mut = (*hierarchy).clone();
-        let mut hierarchy2_mut = hierarchy2.clone();
+        let hierarchy_clone = (*hierarchy).clone();
+        let hierarchy2_clone = hierarchy2.clone();
 
-        let partitions1: Vec<_> = thresholds
+        let partitions1: Vec<Arc<PartitionLevel>> = thresholds
             .iter()
-            .map(|&t| hierarchy_mut.at_threshold(t).clone())
+            .map(|&t| hierarchy_clone.at_threshold(t))
             .collect();
 
-        let partition2 = hierarchy2_mut.at_threshold(0.7);
+        let partition2 = hierarchy2_clone.at_threshold(0.7);
 
         let metrics = vec![MetricType::F1, MetricType::Precision, MetricType::Recall];
 
+        // Create temporary vecs of dereferenced partitions for the test
+        let partitions1_derefs: Vec<PartitionLevel> =
+            partitions1.iter().map(|p| (**p).clone()).collect();
+
         // Run incremental algorithm
         let incremental_results = incremental_algo.compute_sweep(
-            &partitions1,
-            Some(std::slice::from_ref(partition2)),
+            &partitions1_derefs,
+            Some(std::slice::from_ref(&*partition2)),
             &metrics,
             &context,
         );
@@ -635,7 +642,7 @@ mod tests {
         for p1 in partitions1.iter() {
             // Create fresh algorithm instance for each computation
             let mut fresh_algo = DeltaAlgorithm::new();
-            let result = fresh_algo.compute_single(p1, Some(partition2), &metrics, &context);
+            let result = fresh_algo.compute_single(p1, Some(&*partition2), &metrics, &context);
             rebuild_results.push(result);
         }
 
