@@ -35,10 +35,18 @@ pub fn build_all_sweep_tables(
     partitions2: &[PartitionLevel],
     context: &Arc<DataContext>,
 ) -> Vec<Vec<SparseContingencyTable>> {
+    use crate::debug_println;
+
     let num_records = context.len();
     let generation = context.generation();
 
+    #[cfg(debug_assertions)]
+    let start_time = std::time::Instant::now();
+
     // Build reverse indices for all partitions
+    #[cfg(debug_assertions)]
+    let index_start = std::time::Instant::now();
+
     let indices1: Vec<_> = partitions1
         .iter()
         .map(|p| p.get_record_to_entity_index(num_records, generation))
@@ -48,11 +56,33 @@ pub fn build_all_sweep_tables(
         .map(|p| p.get_record_to_entity_index(num_records, generation))
         .collect();
 
+    #[cfg(debug_assertions)]
+    {
+        let index_time = index_start.elapsed();
+        debug_println!(
+            "      🔧 Index building: {:?} for {} indices",
+            index_time,
+            indices1.len() + indices2.len()
+        );
+
+        // Report index statistics
+        let total_entities1: usize = partitions1.iter().map(|p| p.entities().len()).sum();
+        let total_entities2: usize = partitions2.iter().map(|p| p.entities().len()).sum();
+        debug_println!(
+            "         Entities: {} in set 1, {} in set 2",
+            total_entities1,
+            total_entities2
+        );
+    }
+
     // Initialise empty tables for all combinations
     let mut tables =
         vec![vec![SparseContingencyTable::new(); partitions2.len()]; partitions1.len()];
 
     // Add marginals to all tables
+    #[cfg(debug_assertions)]
+    let marginal_start = std::time::Instant::now();
+
     for (i, partition1) in partitions1.iter().enumerate() {
         for (j, partition2) in partitions2.iter().enumerate() {
             let table = &mut tables[i][j];
@@ -67,7 +97,24 @@ pub fn build_all_sweep_tables(
         }
     }
 
+    #[cfg(debug_assertions)]
+    {
+        let marginal_time = marginal_start.elapsed();
+        let num_tables = partitions1.len() * partitions2.len();
+        debug_println!(
+            "      🔧 Marginal calculation: {:?} for {} tables",
+            marginal_time,
+            num_tables
+        );
+    }
+
     // Process all records once, updating all tables
+    #[cfg(debug_assertions)]
+    let record_start = std::time::Instant::now();
+
+    #[cfg(debug_assertions)]
+    let mut cells_added = 0usize;
+
     for record_idx in 0..num_records {
         // For each record, check which entity it belongs to in each partition
         for (i, idx1) in indices1.iter().enumerate() {
@@ -79,10 +126,46 @@ pub fn build_all_sweep_tables(
                             .nonzero_cells
                             .entry((*entity1, *entity2))
                             .or_insert(0) += 1;
+
+                        #[cfg(debug_assertions)]
+                        {
+                            cells_added += 1;
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let record_time = record_start.elapsed();
+        debug_println!(
+            "      🔧 Record processing: {:?} for {} records",
+            record_time,
+            num_records
+        );
+        debug_println!(
+            "         Cells updated: {} ({:.1} per record)",
+            cells_added,
+            cells_added as f64 / num_records as f64
+        );
+
+        // Calculate table sparsity
+        let total_cells: usize = tables
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|t| t.nonzero_cells.len())
+            .sum();
+        let avg_cells_per_table =
+            total_cells as f64 / (partitions1.len() * partitions2.len()) as f64;
+        debug_println!(
+            "         Average nonzero cells per table: {:.1}",
+            avg_cells_per_table
+        );
+
+        let total_time = start_time.elapsed();
+        debug_println!("      🔧 Total build_all_sweep_tables: {:?}", total_time);
     }
 
     tables

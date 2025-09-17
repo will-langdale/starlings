@@ -40,7 +40,7 @@ class TestAnalysisBenchmarks:
         logger.info("=" * 60)
 
         # Create scaled dataset
-        n_entities = int(self.n * 100_000)
+        n_entities = int(self.n * 1_000_000)
         logger.info(f"\n🔍 Creating dataset with {n_entities:,} entities...")
 
         edge_generator = generators.edges(n_entities)
@@ -113,7 +113,7 @@ class TestAnalysisBenchmarks:
         logger.info("=" * 60)
 
         # Create two scaled datasets
-        n_entities = int(self.n * 100_000)
+        n_entities = int(self.n * 1_000_000)
         logger.info(f"\n🔍 Creating two datasets with {n_entities:,} entities each...")
 
         edge_gen_a = generators.edges(n_entities)
@@ -133,7 +133,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),  # Mark as ground truth
             metrics=[
                 sl.Metrics.eval.f1,
                 sl.Metrics.eval.precision,
@@ -155,7 +155,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),
             metrics=[sl.Metrics.eval.ari],
         )
         ari_time = time.perf_counter() - start
@@ -165,7 +165,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),
             metrics=[sl.Metrics.eval.nmi],
         )
         nmi_time = time.perf_counter() - start
@@ -175,7 +175,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),
             metrics=[sl.Metrics.eval.v_measure],
         )
         vmeasure_time = time.perf_counter() - start
@@ -186,7 +186,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),
             metrics=[sl.Metrics.eval.bcubed_precision, sl.Metrics.eval.bcubed_recall],
         )
         bcubed_time = time.perf_counter() - start
@@ -199,7 +199,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),
             metrics=[
                 sl.Metrics.eval.f1,
                 sl.Metrics.eval.precision,
@@ -228,7 +228,7 @@ class TestAnalysisBenchmarks:
         logger.info("=" * 60)
 
         # Create scaled datasets
-        n_entities = int(self.n * 500_000)  # 500k for sweep tests
+        n_entities = int(self.n * 1_000_000)  # 1M for sweep tests
         logger.info(f"\n🔍 Creating datasets with {n_entities:,} entities...")
 
         edge_gen_a = generators.edges(n_entities)
@@ -267,7 +267,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").at(0.8),
-            sl.col("col_b").sweep(0.5, 0.95, 0.05),
+            sl.col("col_b").sweep(0.5, 0.95, 0.05).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
         point_sweep_time = time.perf_counter() - start
@@ -284,7 +284,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("col_a").sweep(0.5, 0.95, 0.05),
-            sl.col("col_b").at(0.8),
+            sl.col("col_b").at(0.8).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
         sweep_point_time = time.perf_counter() - start
@@ -296,23 +296,71 @@ class TestAnalysisBenchmarks:
 
         # Test 4: Sweep × Sweep comparison (Cartesian product)
         logger.info("\n4️⃣ SWEEP × SWEEP COMPARISON (Cartesian product)")
+        logger.info(f"   Dataset size: {n_entities:,} entities per collection")
 
-        # Use smaller sweeps for reasonable time
-        start = time.perf_counter()
+        # Detailed timing for sweep×sweep analysis
+        logger.info("\n   📊 PHASE 1: Building partitions")
+        partition_start = time.perf_counter()
+
+        # Pre-build partitions to measure this phase
+        thresholds = [0.6, 0.7, 0.8, 0.9]
+        partitions_a = [collection_a.at(t) for t in thresholds]
+        partitions_b = [collection_b.at(t) for t in thresholds]
+
+        partition_time = time.perf_counter() - partition_start
+        logger.info(f"      Built 8 partitions (2×4) in {partition_time:.3f}s")
+        logger.info(f"      Average per partition: {partition_time / 8:.3f}s")
+
+        # Show partition sizes for both collections
+        entities_a = [len(p.entities) for p in partitions_a]
+        entities_b = [len(p.entities) for p in partitions_b]
+        logger.info(f"      Entity counts col_a: {entities_a}")
+        logger.info(f"      Entity counts col_b: {entities_b}")
+
+        # Memory check
+        process = psutil.Process()
+        memory_before = process.memory_info().rss / (1024 * 1024)  # MB
+        logger.info(f"      Memory usage: {memory_before:.1f}MB")
+
+        logger.info("\n   📊 PHASE 2: Running sweep×sweep analysis")
+        analysis_start = time.perf_counter()
+
         result = ef.analyse(
             sl.col("col_a").sweep(0.6, 0.9, 0.1),  # 4 points
-            sl.col("col_b").sweep(0.6, 0.9, 0.1),  # 4 points
+            sl.col("col_b").sweep(0.6, 0.9, 0.1).reference(),  # 4 points, reference
             metrics=[sl.Metrics.eval.f1],
         )
-        sweep_sweep_time = time.perf_counter() - start
+
+        analysis_time = time.perf_counter() - analysis_start
+        memory_after = process.memory_info().rss / (1024 * 1024)  # MB
+
+        logger.info(f"      Analysis completed in {analysis_time:.3f}s")
+        logger.info(f"      Memory delta: {memory_after - memory_before:.1f}MB")
+
+        # Total time including partition building
+        sweep_sweep_time = partition_time + analysis_time
         n_comparisons = len(result)
 
+        logger.info("\n   📈 PERFORMANCE SUMMARY")
         logger.info(
-            f"   {n_comparisons} comparisons (4×4 grid) in {sweep_sweep_time:.3f}s"
+            f"      {n_comparisons} comparisons (4×4 grid) total time: "
+            f"{sweep_sweep_time:.3f}s"
         )
-        throughput = n_comparisons / sweep_sweep_time
-        logger.info(f"   Throughput: {throughput:.1f} comparisons/second")
-        logger.info("   Algorithm: Record-based O(r) - massive advantage")
+        partition_pct = partition_time / sweep_sweep_time * 100
+        analysis_pct = analysis_time / sweep_sweep_time * 100
+        logger.info(
+            f"      - Partition building: {partition_time:.3f}s ({partition_pct:.1f}%)"
+        )
+        logger.info(
+            f"      - Analysis (tables + metrics): {analysis_time:.3f}s "
+            f"({analysis_pct:.1f}%)"
+        )
+
+        throughput = n_comparisons / analysis_time  # Throughput of actual analysis
+        logger.info(f"      Analysis throughput: {throughput:.1f} comparisons/second")
+        time_per_comparison = analysis_time / n_comparisons * 1000
+        logger.info(f"      Time per comparison: {time_per_comparison:.1f}ms")
+        logger.info("      Algorithm: Record-based O(r) - massive advantage")
 
         # Calculate theoretical speedup
         partition_a = collection_a.at(0.75)
@@ -336,8 +384,8 @@ class TestAnalysisBenchmarks:
         logger.info("=" * 60)
 
         # Create datasets of different sizes
-        n_entities_ref = int(self.n * 50_000)  # Smaller reference
-        n_entities_test = int(self.n * 200_000)  # Larger test set
+        n_entities_ref = int(self.n * 500_000)  # Half of base reference
+        n_entities_test = int(self.n * 1_000_000)  # Full base test set
 
         logger.info(
             f"\n🔍 Creating reference ({n_entities_ref:,}) and "
@@ -413,10 +461,10 @@ class TestAnalysisBenchmarks:
 
         # Test different dataset sizes
         sizes = [
-            int(self.n * 10_000),
-            int(self.n * 50_000),
-            int(self.n * 100_000),
-            int(self.n * 250_000),
+            int(self.n * 100_000),  # 10% of base
+            int(self.n * 500_000),  # 50% of base
+            int(self.n * 1_000_000),  # 100% of base
+            int(self.n * 2_500_000),  # 250% of base
         ]
 
         memory_results: list[dict[str, Any]] = []
@@ -565,7 +613,7 @@ class TestAnalysisBenchmarks:
         start = time.perf_counter()
         result = ef.analyse(
             sl.col("large").at(0.8),
-            sl.col("large_2").at(0.8),
+            sl.col("large_2").at(0.8).reference(),
             metrics=[
                 sl.Metrics.eval.f1,
                 sl.Metrics.eval.precision,

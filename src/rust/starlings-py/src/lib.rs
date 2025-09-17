@@ -1274,6 +1274,11 @@ impl PyEntityFrame {
         collection_name: &str,
         thresholds: &[f64],
     ) -> PyResult<Vec<PartitionLevel>> {
+        use starlings_core::debug_println;
+
+        #[cfg(debug_assertions)]
+        let start = std::time::Instant::now();
+
         let mut partitions = Vec::new();
         let hierarchy = self.frame.get_collection(collection_name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -1282,10 +1287,41 @@ impl PyEntityFrame {
             ))
         })?;
 
-        for threshold in thresholds {
+        #[cfg(debug_assertions)]
+        debug_println!(
+            "      🔧 Building {} partitions for {}",
+            thresholds.len(),
+            collection_name
+        );
+
+        for (i, threshold) in thresholds.iter().enumerate() {
+            #[cfg(debug_assertions)]
+            let partition_start = std::time::Instant::now();
+
             let mut h = hierarchy.clone();
-            partitions.push(h.at_threshold(*threshold).clone());
+            let partition = h.at_threshold(*threshold).clone();
+
+            #[cfg(debug_assertions)]
+            {
+                let partition_time = partition_start.elapsed();
+                debug_println!(
+                    "         Partition {} at {:.2}: {:?} ({} entities)",
+                    i + 1,
+                    threshold,
+                    partition_time,
+                    partition.entities().len()
+                );
+            }
+
+            partitions.push(partition);
         }
+
+        #[cfg(debug_assertions)]
+        {
+            let total_time = start.elapsed();
+            debug_println!("      🔧 Total partition building: {:?}", total_time);
+        }
+
         Ok(partitions)
     }
 }
