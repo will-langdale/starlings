@@ -1,39 +1,75 @@
 //! Delta algorithm for O(k) incremental metric computation
 //!
-//! This algorithm exploits the incremental nature of threshold changes to update
-//! contingency tables efficiently when moving between adjacent thresholds in the
-//! same hierarchy. Instead of recomputing everything, it tracks entity evolution
-//! through merges and updates only affected cells.
+//! ## Overview
+//! The Delta algorithm exploits temporal locality when sweeping through thresholds
+//! in the same hierarchy. It maintains incremental state and updates only the
+//! entities affected by merge events between thresholds.
+//!
+//! ## How it Works
+//! - **Input**: Sequence of thresholds in the same hierarchy
+//! - **Process**: Applies only the delta (change) between adjacent thresholds
+//! - **Output**: Metrics computed in O(k) where k = affected entities
+//!
+//! ## When to Use
+//! - ✅ Same-hierarchy threshold sweeps
+//! - ✅ Sequential threshold exploration
+//! - ✅ When thresholds are close together (< 0.1 apart)
+//! - ❌ Cross-collection comparisons (use Record algorithm)
+//! - ❌ Random threshold access patterns
+//!
+//! ## Complexity
+//! - Initial build: O(n) where n = number of entities
+//! - Incremental updates: O(k) where k = entities affected by merges
+//! - Memory: O(n) for maintaining state
+//!
+//! ## Relationship to Record Algorithm
+//! Delta and Record are the two fundamental approaches to partition reconstruction:
+//! - **Delta**: Exploits temporal locality (changes between thresholds)
+//! - **Record**: Exploits spatial locality (all records in one pass)
+//! Together they exhaustively cover all metric computation scenarios.
 
+use super::common::choose_2;
 use super::{ComparisonType, ComplexityEstimate, MetricAlgorithm, MetricResults, MetricType};
+use crate::metrics::contingency::{
+    compute_conditional_entropy, compute_entropy_from_sizes, ContingencyMetrics,
+};
 use crate::metrics::implementations::statistics::{compute_entity_count, compute_entropy};
 use crate::{DataContext, PartitionLevel};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Type alias for canonical entity ID (minimum record ID in entity)
+/// Used by Delta algorithm to track entity merges across thresholds
+type CanonicalId = u32;
+
 /// Delta-based algorithm that achieves O(k) complexity for incremental updates
+///
+/// This algorithm is one of two fundamental approaches (along with RecordAlgorithm)
+/// for computing metrics. It handles all same-hierarchy comparisons by tracking
+/// changes between thresholds rather than recomputing from scratch.
 pub struct DeltaAlgorithm {
     /// Current incremental state (if any)
-    state: Option<IncrementalState>,
+    state: Option<DeltaState>,
     /// Threshold for deciding when to rebuild vs update incrementally
+    /// If the threshold gap exceeds this value, a full rebuild is performed
     rebuild_threshold: f64,
 }
 
 /// State maintained between computations for incremental updates
-struct IncrementalState {
+struct DeltaState {
     /// Last threshold processed
     last_threshold: f64,
     /// Canonical IDs of entities in last partition1
-    last_p1_entities: Vec<u32>,
+    last_p1_entities: Vec<CanonicalId>,
     /// Canonical IDs of entities in last partition2 (if comparison)
-    last_p2_entities: Option<Vec<u32>>,
+    last_p2_entities: Option<Vec<CanonicalId>>,
     /// Contingency table using canonical IDs as keys
-    contingency_table: HashMap<(u32, u32), u32>,
+    contingency_table: HashMap<(CanonicalId, CanonicalId), u32>,
     /// Row marginals using canonical IDs
-    row_marginals: HashMap<u32, u32>,
+    row_marginals: HashMap<CanonicalId, u32>,
     /// Column marginals using canonical IDs
-    col_marginals: HashMap<u32, u32>,
+    col_marginals: HashMap<CanonicalId, u32>,
     /// Total number of records
     total_records: u32,
     /// Cached true positives
@@ -53,17 +89,8 @@ struct IncrementalState {
 }
 
 /// Get the canonical ID for an entity (its minimum record ID)
-fn get_canonical_id(entity: &RoaringBitmap) -> u32 {
+fn get_canonical_id(entity: &RoaringBitmap) -> CanonicalId {
     entity.min().expect("Entity cannot be empty")
-}
-
-/// Compute binomial coefficient "n choose 2"
-fn choose_2(n: u32) -> u64 {
-    if n < 2 {
-        0
-    } else {
-        (n as u64) * ((n - 1) as u64) / 2
-    }
 }
 
 impl Default for DeltaAlgorithm {
@@ -72,12 +99,184 @@ impl Default for DeltaAlgorithm {
     }
 }
 
+/// Implement ContingencyMetrics trait for DeltaState
+/// This allows direct metric computation without conversion, avoiding memory duplication
+impl ContingencyMetrics for DeltaState {
+    fn compute_precision(&self) -> f64 {
+        let denominator = self.true_positives + self.false_positives;
+        if denominator == 0 {
+            if self.false_negatives > 0 {
+                0.0
+            } else {
+                1.0
+            }
+        } else {
+            self.true_positives as f64 / denominator as f64
+        }
+    }
+
+    fn compute_recall(&self) -> f64 {
+        let denominator = self.true_positives + self.false_negatives;
+        if denominator == 0 {
+            1.0
+        } else {
+            self.true_positives as f64 / denominator as f64
+        }
+    }
+
+    fn compute_f1(&self) -> f64 {
+        let precision = self.compute_precision();
+        let recall = self.compute_recall();
+        if precision + recall == 0.0 {
+            0.0
+        } else {
+            2.0 * (precision * recall) / (precision + recall)
+        }
+    }
+
+    fn compute_ari(&self) -> f64 {
+        let n = self.total_records as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+
+        // We already maintain sum_cell_combinations, sum_row_combinations, sum_col_combinations
+        let index = self.sum_cell_combinations as f64;
+        let sum_ai_choose_2 = self.sum_row_combinations as f64;
+        let sum_bj_choose_2 = self.sum_col_combinations as f64;
+
+        let n_choose_2 = n * (n - 1.0) / 2.0;
+        let expected = (sum_ai_choose_2 * sum_bj_choose_2) / n_choose_2;
+        let max_value = (sum_ai_choose_2 + sum_bj_choose_2) / 2.0;
+
+        if max_value == expected {
+            0.0
+        } else {
+            (index - expected) / (max_value - expected)
+        }
+    }
+
+    fn compute_nmi(&self) -> f64 {
+        let n = self.total_records as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+
+        // Calculate entropy for partition 1 (rows)
+        let entropy_u = compute_entropy_from_sizes(self.row_marginals.values().copied(), n);
+
+        // Calculate entropy for partition 2 (columns)
+        let entropy_v = compute_entropy_from_sizes(self.col_marginals.values().copied(), n);
+
+        // Calculate mutual information I(U;V)
+        let mut mutual_info = 0.0;
+        for ((row_id, col_id), &overlap) in &self.contingency_table {
+            if overlap > 0 {
+                let p_uv = overlap as f64 / n;
+                let p_u = self.row_marginals[row_id] as f64 / n;
+                let p_v = self.col_marginals[col_id] as f64 / n;
+                mutual_info += p_uv * (p_uv / (p_u * p_v)).log2();
+            }
+        }
+
+        // Compute NMI
+        if entropy_u + entropy_v == 0.0 {
+            0.0
+        } else {
+            2.0 * mutual_info / (entropy_u + entropy_v)
+        }
+    }
+
+    fn compute_v_measure(&self) -> f64 {
+        let n = self.total_records as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+
+        // Calculate H(C|K) using our helper function
+        let h_c_given_k =
+            compute_conditional_entropy(&self.contingency_table, &self.col_marginals, n);
+
+        // Calculate H(K|C) - we need to flip the contingency table
+        let mut flipped_contingency = HashMap::new();
+        for ((row, col), count) in &self.contingency_table {
+            flipped_contingency.insert((*col, *row), *count);
+        }
+        let h_k_given_c = compute_conditional_entropy(&flipped_contingency, &self.row_marginals, n);
+
+        // Calculate H(C) and H(K)
+        let h_c = compute_entropy_from_sizes(self.row_marginals.values().copied(), n);
+        let h_k = compute_entropy_from_sizes(self.col_marginals.values().copied(), n);
+
+        // Compute homogeneity and completeness
+        let homogeneity = if h_c == 0.0 {
+            1.0
+        } else {
+            1.0 - h_k_given_c / h_c
+        };
+        let completeness = if h_k == 0.0 {
+            1.0
+        } else {
+            1.0 - h_c_given_k / h_k
+        };
+
+        // Compute V-measure
+        if homogeneity + completeness == 0.0 {
+            0.0
+        } else {
+            2.0 * homogeneity * completeness / (homogeneity + completeness)
+        }
+    }
+
+    fn compute_bcubed_precision(&self) -> f64 {
+        let n = self.total_records as f64;
+        if n == 0.0 {
+            return 0.0;
+        }
+
+        let mut total_precision = 0.0;
+        for ((row_id, _), &overlap) in &self.contingency_table {
+            if overlap > 0 {
+                let cluster_size = self.row_marginals[row_id] as f64;
+                let precision_contribution = (overlap as f64 * overlap as f64) / cluster_size;
+                total_precision += precision_contribution;
+            }
+        }
+        total_precision / n
+    }
+
+    fn compute_bcubed_recall(&self) -> f64 {
+        let n = self.total_records as f64;
+        if n == 0.0 {
+            return 0.0;
+        }
+
+        let mut total_recall = 0.0;
+        for ((_, col_id), &overlap) in &self.contingency_table {
+            if overlap > 0 {
+                let true_cluster_size = self.col_marginals[col_id] as f64;
+                let recall_contribution = (overlap as f64 * overlap as f64) / true_cluster_size;
+                total_recall += recall_contribution;
+            }
+        }
+        total_recall / n
+    }
+}
+
 impl DeltaAlgorithm {
-    /// Create a new delta-based algorithm instance
+    /// Create a new delta-based algorithm instance with default rebuild threshold
     pub fn new() -> Self {
+        Self::with_rebuild_threshold(0.1)
+    }
+
+    /// Create a new delta-based algorithm with specified rebuild threshold
+    ///
+    /// # Arguments
+    /// * `rebuild_threshold` - Maximum threshold gap before triggering full rebuild (default: 0.1)
+    pub fn with_rebuild_threshold(rebuild_threshold: f64) -> Self {
         Self {
             state: None,
-            rebuild_threshold: 0.1, // Rebuild if threshold gap > 0.1
+            rebuild_threshold,
         }
     }
 
@@ -85,8 +284,8 @@ impl DeltaAlgorithm {
     fn build_initial_state(
         partition1: &PartitionLevel,
         partition2: Option<&PartitionLevel>,
-    ) -> IncrementalState {
-        let mut state = IncrementalState {
+    ) -> DeltaState {
+        let mut state = DeltaState {
             last_threshold: partition1.threshold(),
             last_p1_entities: Vec::new(),
             last_p2_entities: None,
@@ -151,7 +350,7 @@ impl DeltaAlgorithm {
     }
 
     /// Compute pair counts for the current state
-    fn compute_state_pair_counts(state: &mut IncrementalState) {
+    fn compute_state_pair_counts(state: &mut DeltaState) {
         let mut true_positives = 0u64;
         let mut false_positives = 0u64;
         let mut false_negatives = 0u64;
@@ -208,12 +407,12 @@ impl DeltaAlgorithm {
 
     /// Perform incremental update from old state to new partition
     fn incremental_update(
-        state: &mut IncrementalState,
+        state: &mut DeltaState,
         new_partition1: &PartitionLevel,
         partition2: Option<&PartitionLevel>,
     ) {
         // Build mapping from old canonical IDs to new canonical IDs
-        let mut old_to_new: HashMap<u32, u32> = HashMap::new();
+        let mut old_to_new: HashMap<CanonicalId, CanonicalId> = HashMap::new();
 
         // For each old entity, find where its canonical record went
         for &old_id in &state.last_p1_entities {
@@ -229,7 +428,7 @@ impl DeltaAlgorithm {
         }
 
         // Identify merges: multiple old IDs mapping to same new ID
-        let mut new_to_old: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut new_to_old: HashMap<CanonicalId, Vec<CanonicalId>> = HashMap::new();
         for (&old_id, &new_id) in &old_to_new {
             new_to_old.entry(new_id).or_default().push(old_id);
         }
@@ -332,18 +531,17 @@ impl DeltaAlgorithm {
         let mut results = HashMap::new();
 
         if let Some(state) = &self.state {
+            // Now we can compute all metrics directly on DeltaState
             for metric in metrics {
                 let value = match metric {
-                    MetricType::F1 => self.compute_f1_from_state(state),
-                    MetricType::Precision => self.compute_precision_from_state(state),
-                    MetricType::Recall => self.compute_recall_from_state(state),
-                    MetricType::ARI => self.compute_ari_from_state(state),
-                    // These metrics require full contingency table, not amenable to incremental updates
-                    // They delegate to direct computation from the stored contingency state
-                    MetricType::NMI => 0.0, // Would require incremental entropy calculations
-                    MetricType::VMeasure => 0.0, // Would require homogeneity & completeness tracking
-                    MetricType::BCubedPrecision => 0.0, // Requires per-record computation
-                    MetricType::BCubedRecall => 0.0, // Requires per-record computation
+                    MetricType::F1 => state.compute_f1(),
+                    MetricType::Precision => state.compute_precision(),
+                    MetricType::Recall => state.compute_recall(),
+                    MetricType::ARI => state.compute_ari(),
+                    MetricType::NMI => state.compute_nmi(),
+                    MetricType::VMeasure => state.compute_v_measure(),
+                    MetricType::BCubedPrecision => state.compute_bcubed_precision(),
+                    MetricType::BCubedRecall => state.compute_bcubed_recall(),
                     _ => 0.0,
                 };
                 results.insert(metric.name().to_string(), value);
@@ -351,69 +549,6 @@ impl DeltaAlgorithm {
         }
 
         results
-    }
-
-    /// Compute precision directly from state
-    fn compute_precision_from_state(&self, state: &IncrementalState) -> f64 {
-        let denominator = state.true_positives + state.false_positives;
-        if denominator == 0 {
-            if state.false_negatives > 0 {
-                0.0
-            } else {
-                1.0
-            }
-        } else {
-            state.true_positives as f64 / denominator as f64
-        }
-    }
-
-    /// Compute recall directly from state
-    fn compute_recall_from_state(&self, state: &IncrementalState) -> f64 {
-        let denominator = state.true_positives + state.false_negatives;
-        if denominator == 0 {
-            1.0
-        } else {
-            state.true_positives as f64 / denominator as f64
-        }
-    }
-
-    /// Compute ARI directly from state
-    fn compute_ari_from_state(&self, state: &IncrementalState) -> f64 {
-        // Handle edge case: empty or single-record partitions
-        if state.total_records < 2 {
-            return 0.0;
-        }
-
-        let total_comb = choose_2(state.total_records);
-
-        // Calculate expected index under null hypothesis
-        let expected = (state.sum_row_combinations as f64) * (state.sum_col_combinations as f64)
-            / (total_comb as f64);
-
-        // Calculate maximum possible index
-        let max_index =
-            (state.sum_row_combinations as f64 + state.sum_col_combinations as f64) / 2.0;
-
-        // Handle edge case where max_index equals expected
-        let denominator = max_index - expected;
-        if denominator.abs() < 1e-10 {
-            return 0.0;
-        }
-
-        // Calculate ARI
-        (state.sum_cell_combinations as f64 - expected) / denominator
-    }
-
-    /// Compute F1 score directly from state
-    fn compute_f1_from_state(&self, state: &IncrementalState) -> f64 {
-        let precision = self.compute_precision_from_state(state);
-        let recall = self.compute_recall_from_state(state);
-
-        if precision + recall == 0.0 {
-            0.0
-        } else {
-            2.0 * (precision * recall) / (precision + recall)
-        }
     }
 }
 
@@ -493,7 +628,7 @@ impl MetricAlgorithm for DeltaAlgorithm {
                 (None, None) => true,
                 (Some(p2), Some(old_p2)) => {
                     // Check if partition2 has the same entities (by canonical IDs)
-                    let mut new_p2_ids: Vec<u32> =
+                    let mut new_p2_ids: Vec<CanonicalId> =
                         p2.entities().iter().map(get_canonical_id).collect();
                     new_p2_ids.sort_unstable(); // Sort to match the sorted order in build_initial_state
                     new_p2_ids == *old_p2

@@ -1,8 +1,30 @@
 //! Core trait and types for metric computation algorithms
 //!
-//! This module defines the fundamental abstraction for metric algorithms,
-//! allowing different computational strategies (delta, record, etc.) to be
-//! implemented as pluggable components with clear interfaces.
+//! This module defines the two fundamental algorithms for metric computation:
+//!
+//! ## The Two-Algorithm Design
+//!
+//! All partition reconstruction for metrics can be optimally handled by exactly
+//! two algorithms that partition the problem space:
+//!
+//! 1. **Delta Algorithm**: For same-hierarchy threshold sweeps
+//!    - Exploits temporal locality between adjacent thresholds
+//!    - Maintains incremental state for O(k) updates
+//!    - Optimal when moving monotonically through thresholds
+//!
+//! 2. **Record Algorithm**: For cross-collection comparisons
+//!    - Exploits spatial locality with single-pass iteration
+//!    - Builds contingency tables in O(r) time
+//!    - Optimal for independent partition comparisons
+//!
+//! ## Why Only Two Algorithms?
+//!
+//! These algorithms represent the two fundamental ways to build contingency tables:
+//! - **Incremental** (Delta): Update existing state with changes
+//! - **From scratch** (Record): Build new state with single pass
+//!
+//! Any other approach would be a variation of these two strategies.
+//! Together, they exhaustively cover all comparison scenarios with optimal complexity.
 
 use crate::{DataContext, PartitionLevel};
 use std::collections::HashMap;
@@ -12,7 +34,7 @@ use std::sync::Arc;
 pub type MetricResults = HashMap<String, f64>;
 
 /// Core trait that all metric computation algorithms must implement
-pub trait MetricAlgorithm: Send {
+pub trait MetricAlgorithm: Send + Sync {
     /// Human-readable name for this algorithm (used in logging)
     fn name(&self) -> &'static str;
 
@@ -55,6 +77,55 @@ pub trait MetricAlgorithm: Send {
             // Single-collection analysis
             for p1 in partitions1 {
                 results.push(self.compute_single(p1, None, metrics, context));
+            }
+        }
+
+        results
+    }
+
+    /// Compute metrics for a single partition comparison using Arc references
+    ///
+    /// Default implementation dereferences and calls compute_single.
+    /// Algorithms can override this to avoid dereferencing if beneficial.
+    fn compute_single_arc(
+        &mut self,
+        partition1: &Arc<PartitionLevel>,
+        partition2: Option<&Arc<PartitionLevel>>,
+        metrics: &[MetricType],
+        context: &Arc<DataContext>,
+    ) -> MetricResults {
+        self.compute_single(
+            partition1.as_ref(),
+            partition2.map(|p| p.as_ref()),
+            metrics,
+            context,
+        )
+    }
+
+    /// Compute metrics for a sweep comparison using Arc references
+    ///
+    /// Default implementation dereferences and calls compute_sweep.
+    /// Algorithms can override this for better Arc handling.
+    fn compute_sweep_arc(
+        &mut self,
+        partitions1: &[Arc<PartitionLevel>],
+        partitions2: Option<&[Arc<PartitionLevel>]>,
+        metrics: &[MetricType],
+        context: &Arc<DataContext>,
+    ) -> Vec<MetricResults> {
+        let mut results = Vec::new();
+
+        if let Some(partitions2) = partitions2 {
+            // Two-collection comparison
+            for p1 in partitions1 {
+                for p2 in partitions2 {
+                    results.push(self.compute_single_arc(p1, Some(p2), metrics, context));
+                }
+            }
+        } else {
+            // Single-collection analysis
+            for p1 in partitions1 {
+                results.push(self.compute_single_arc(p1, None, metrics, context));
             }
         }
 
@@ -127,9 +198,17 @@ impl MetricType {
     }
 }
 
-/// Re-export the algorithms
+/// Common utilities shared between algorithms
+pub mod common;
+
+/// The two fundamental algorithms for metric computation
 pub mod delta;
 pub mod record;
 
 pub use delta::DeltaAlgorithm;
 pub use record::RecordAlgorithm;
+
+// Note: These are the ONLY two algorithms needed. They partition the problem space:
+// - Delta handles same-hierarchy comparisons (temporal locality)
+// - Record handles cross-collection comparisons (spatial locality)
+// No third algorithm is needed or possible for optimal metric computation.

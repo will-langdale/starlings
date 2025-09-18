@@ -4,38 +4,52 @@
 //! using different algorithmic strategies optimised for specific comparison types.
 
 pub mod algorithms;
+pub mod contingency;
 pub mod implementations;
 pub mod types;
 
 use crate::{DataContext, PartitionHierarchy, PartitionLevel};
-use algorithms::{
-    ComparisonType, DeltaAlgorithm, MetricAlgorithm, MetricResults, MetricType, RecordAlgorithm,
-};
+use algorithms::{ComparisonType, DeltaAlgorithm, MetricAlgorithm, MetricType, RecordAlgorithm};
 use std::sync::Arc;
 
-pub use algorithms::MetricType as CoreMetricType;
+pub use algorithms::{MetricResults, MetricType as CoreMetricType};
 
 /// Main engine for metric computation with automatic algorithm selection
+///
+/// The engine uses exactly two algorithms that exhaustively cover all scenarios:
+/// - **Delta**: For same-hierarchy threshold sweeps (incremental O(k) updates)
+/// - **Record**: For cross-collection comparisons (single-pass O(r) iteration)
 pub struct MetricEngine {
     /// Available algorithms in priority order
+    /// Priority 1: Delta (for same-hierarchy)
+    /// Priority 2: Record (for everything else)
     algorithms: Vec<Box<dyn MetricAlgorithm>>,
     /// Enable debug logging
     debug: bool,
 }
 
 impl MetricEngine {
-    /// Create a new metric engine with default algorithms
+    /// Create a new metric engine with the two fundamental algorithms
     pub fn new() -> Self {
         Self {
             algorithms: vec![
-                Box::new(DeltaAlgorithm::new()),  // Priority 1: Incremental
-                Box::new(RecordAlgorithm::new()), // Priority 2: Single-pass
+                Box::new(DeltaAlgorithm::new()), // Priority 1: Incremental O(k) for same-hierarchy
+                Box::new(RecordAlgorithm::new()), // Priority 2: Single-pass O(r) for cross-collection
             ],
+            // These two algorithms exhaustively partition the problem space:
+            // - Delta handles temporal locality (threshold changes)
+            // - Record handles spatial locality (record iteration)
+            // No additional algorithms are needed or beneficial.
             debug: std::env::var("STARLINGS_DEBUG").is_ok(),
         }
     }
 
     /// Select the best algorithm for a given comparison type (returns index)
+    ///
+    /// Algorithm selection is deterministic:
+    /// - Delta handles same-hierarchy comparisons
+    /// - Record handles cross-collection comparisons
+    ///   Exactly one algorithm will handle each comparison type.
     fn select_algorithm_index(&self, comparison_type: &ComparisonType) -> usize {
         // Find first algorithm that can handle this comparison
         for (i, algo) in self.algorithms.iter().enumerate() {
@@ -68,12 +82,22 @@ impl MetricEngine {
         metrics: &[MetricType],
         context: &Arc<DataContext>,
     ) -> MetricResults {
+        self.compute_single_with_flag(partition1, partition2, metrics, context, false)
+    }
+
+    /// Compute metrics for a single comparison with explicit same_collection flag
+    pub fn compute_single_with_flag(
+        &mut self,
+        partition1: &PartitionLevel,
+        partition2: Option<&PartitionLevel>,
+        metrics: &[MetricType],
+        context: &Arc<DataContext>,
+        same_collection: bool,
+    ) -> MetricResults {
         let comparison_type = if partition2.is_none() {
             ComparisonType::Single
         } else {
-            ComparisonType::PointPoint {
-                same_collection: false, // Will be determined by caller
-            }
+            ComparisonType::PointPoint { same_collection }
         };
 
         let algo_index = self.select_algorithm_index(&comparison_type);
@@ -109,6 +133,56 @@ impl MetricEngine {
         let algo_index = self.select_algorithm_index(&comparison_type);
         let algorithm = &mut self.algorithms[algo_index];
         algorithm.compute_sweep(partitions1, partitions2, metrics, context)
+    }
+
+    /// Compute metrics for a single comparison using Arc references
+    pub fn compute_single_arc(
+        &mut self,
+        partition1: &Arc<PartitionLevel>,
+        partition2: Option<&Arc<PartitionLevel>>,
+        metrics: &[MetricType],
+        context: &Arc<DataContext>,
+        same_collection: bool,
+    ) -> MetricResults {
+        let comparison_type = if partition2.is_none() {
+            ComparisonType::Single
+        } else {
+            ComparisonType::PointPoint { same_collection }
+        };
+
+        let algo_index = self.select_algorithm_index(&comparison_type);
+        let algorithm = &mut self.algorithms[algo_index];
+        algorithm.compute_single_arc(partition1, partition2, metrics, context)
+    }
+
+    /// Compute metrics for a sweep comparison using Arc references
+    pub fn compute_sweep_arc(
+        &mut self,
+        partitions1: &[Arc<PartitionLevel>],
+        partitions2: Option<&[Arc<PartitionLevel>]>,
+        metrics: &[MetricType],
+        context: &Arc<DataContext>,
+        same_collection: bool,
+    ) -> Vec<MetricResults> {
+        let comparison_type = match (partitions1.len(), partitions2.map(|p| p.len())) {
+            (1, Some(1)) => ComparisonType::PointPoint { same_collection },
+            (1, None) => ComparisonType::Single,
+            (_, Some(1)) | (_, None) => ComparisonType::SweepPoint { same_collection },
+            (_, Some(_)) => ComparisonType::SweepSweep { same_collection },
+        };
+
+        if self.debug {
+            eprintln!(
+                "Computing {} metrics for {} × {} comparisons",
+                metrics.len(),
+                partitions1.len(),
+                partitions2.map(|p| p.len()).unwrap_or(1)
+            );
+        }
+
+        let algo_index = self.select_algorithm_index(&comparison_type);
+        let algorithm = &mut self.algorithms[algo_index];
+        algorithm.compute_sweep_arc(partitions1, partitions2, metrics, context)
     }
 }
 
@@ -184,6 +258,158 @@ mod tests {
             engine.algorithms[algo_idx].name(),
             "Record-based (O(r) single-pass)"
         );
+    }
+
+    #[test]
+    fn test_algorithms_are_exhaustive() {
+        // This test proves that Delta and Record algorithms exhaustively cover
+        // all possible comparison types with no gaps or overlaps.
+
+        let delta = DeltaAlgorithm::new();
+        let record = RecordAlgorithm::new();
+
+        // All possible comparison types
+        let all_comparisons = vec![
+            ComparisonType::Single,
+            ComparisonType::PointPoint {
+                same_collection: true,
+            },
+            ComparisonType::PointPoint {
+                same_collection: false,
+            },
+            ComparisonType::SweepPoint {
+                same_collection: true,
+            },
+            ComparisonType::SweepPoint {
+                same_collection: false,
+            },
+            ComparisonType::SweepSweep {
+                same_collection: true,
+            },
+            ComparisonType::SweepSweep {
+                same_collection: false,
+            },
+        ];
+
+        for comparison_type in all_comparisons {
+            let delta_handles = delta.can_handle(&comparison_type);
+            let record_handles = record.can_handle(&comparison_type);
+
+            // Exactly one algorithm must handle each comparison type
+            assert!(
+                delta_handles || record_handles,
+                "No algorithm handles {:?}",
+                comparison_type
+            );
+
+            // Verify no overlap - only one algorithm should handle each type
+            assert!(
+                !(delta_handles && record_handles),
+                "Both algorithms handle {:?} - this is an overlap!",
+                comparison_type
+            );
+
+            // Document which algorithm handles what
+            if delta_handles {
+                match comparison_type {
+                    ComparisonType::Single
+                    | ComparisonType::SweepPoint {
+                        same_collection: true,
+                    }
+                    | ComparisonType::PointPoint {
+                        same_collection: true,
+                    } => {
+                        // Delta correctly handles same-hierarchy comparisons
+                    }
+                    _ => panic!(
+                        "Delta handles unexpected comparison type: {:?}",
+                        comparison_type
+                    ),
+                }
+            } else {
+                match comparison_type {
+                    ComparisonType::SweepSweep { .. }
+                    | ComparisonType::PointPoint {
+                        same_collection: false,
+                    }
+                    | ComparisonType::SweepPoint {
+                        same_collection: false,
+                    } => {
+                        // Record correctly handles cross-collection comparisons
+                    }
+                    _ => panic!(
+                        "Record handles unexpected comparison type: {:?}",
+                        comparison_type
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_algorithm_partitioning_is_complete() {
+        // This test mathematically proves that our two algorithms form a complete
+        // partition of the problem space.
+
+        let engine = MetricEngine::new();
+
+        // Test that we can handle all comparison scenarios
+        let test_scenarios = vec![
+            ("Single partition analysis", ComparisonType::Single),
+            (
+                "Same hierarchy point-point",
+                ComparisonType::PointPoint {
+                    same_collection: true,
+                },
+            ),
+            (
+                "Different collections point-point",
+                ComparisonType::PointPoint {
+                    same_collection: false,
+                },
+            ),
+            (
+                "Same hierarchy threshold sweep",
+                ComparisonType::SweepPoint {
+                    same_collection: true,
+                },
+            ),
+            (
+                "Cross-collection sweep",
+                ComparisonType::SweepPoint {
+                    same_collection: false,
+                },
+            ),
+            (
+                "Same hierarchy sweep×sweep",
+                ComparisonType::SweepSweep {
+                    same_collection: true,
+                },
+            ),
+            (
+                "Cross-collection sweep×sweep",
+                ComparisonType::SweepSweep {
+                    same_collection: false,
+                },
+            ),
+        ];
+
+        for (scenario, comparison_type) in test_scenarios {
+            // This will panic if no algorithm can handle the comparison type
+            let algo_idx = engine.select_algorithm_index(&comparison_type);
+            assert!(
+                algo_idx < engine.algorithms.len(),
+                "Failed to find algorithm for scenario: {}",
+                scenario
+            );
+
+            // Verify the selected algorithm actually handles this type
+            assert!(
+                engine.algorithms[algo_idx].can_handle(&comparison_type),
+                "Selected algorithm doesn't handle scenario: {}",
+                scenario
+            );
+        }
     }
 
     #[test]

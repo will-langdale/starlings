@@ -5,10 +5,9 @@ use std::sync::Arc;
 mod expressions;
 use expressions::{parse_expression, parse_metric};
 use starlings_core::expressions::{
-    build_all_sweep_tables, compute_single_metric, generate_sweep_thresholds, ExpressionType,
-    MetricType, SparseContingencyTable,
+    compute_single_metric, generate_sweep_thresholds, ExpressionType, MetricType,
 };
-use starlings_core::metrics::CoreMetricType;
+use starlings_core::metrics::{CoreMetricType, MetricEngine, MetricResults};
 
 use starlings_core::core::ensure_memory_safety;
 use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
@@ -21,29 +20,6 @@ use starlings_core::{DataContext, EntityFrame, Key, PartitionHierarchy, Partitio
 #[inline]
 fn threshold_to_cache_key(threshold: f64) -> u64 {
     (threshold * 1_000_000.0).round() as u64
-}
-
-/// Check if we should use record-based algorithm (for backward compatibility)
-fn should_use_record_based_algorithm(
-    expressions: &[ExpressionType],
-    collection_names: &[String],
-) -> bool {
-    // Use record-based for sweep × sweep comparisons
-    if expressions.len() == 2
-        && matches!(
-            (&expressions[0], &expressions[1]),
-            (ExpressionType::Sweep { .. }, ExpressionType::Sweep { .. })
-        )
-    {
-        return true;
-    }
-
-    // Use record-based for cross-collection comparisons (different collections)
-    if collection_names.len() >= 2 && collection_names[0] != collection_names[1] {
-        return true;
-    }
-
-    false
 }
 
 /// Convert MetricType to CoreMetricType
@@ -741,6 +717,7 @@ fn metric_name(metric: &MetricType) -> &'static str {
 #[pyclass(name = "EntityFrame")]
 pub struct PyEntityFrame {
     frame: EntityFrame,
+    engine: MetricEngine,
 }
 
 #[pymethods]
@@ -750,6 +727,7 @@ impl PyEntityFrame {
     fn new() -> Self {
         PyEntityFrame {
             frame: EntityFrame::new(),
+            engine: MetricEngine::new(),
         }
     }
 
@@ -922,12 +900,11 @@ impl PyEntityFrame {
         // Cache for partitions to avoid redundant reconstruction
         let mut partition_cache: HashMap<(String, u64), Arc<PartitionLevel>> = HashMap::new();
 
-        // Cache for contingency tables to avoid redundant computation
-        let mut contingency_cache: HashMap<(String, u64, String, u64), SparseContingencyTable> =
-            HashMap::new();
+        // Cache for metric results to avoid redundant computation
+        let mut metrics_cache: HashMap<(String, u64, String, u64), MetricResults> = HashMap::new();
 
-        // Extract collection names for algorithm selection
-        let expr_collection_names: Vec<String> = parsed_expressions
+        // Extract collection names for potential future optimization
+        let _expr_collection_names: Vec<String> = parsed_expressions
             .iter()
             .map(|expr| match expr {
                 ExpressionType::Point { collection, .. } => collection.clone(),
@@ -935,15 +912,15 @@ impl PyEntityFrame {
             })
             .collect();
 
-        // Check if we should use the optimised record-based algorithm
-        if should_use_record_based_algorithm(&parsed_expressions, &expr_collection_names)
-            && parsed_expressions.len() == 2
+        // Special optimization for sweep × sweep comparisons
+        // This path uses efficient batch partition building and the MetricEngine's sweep methods
+        if parsed_expressions.len() == 2
             && matches!(
                 (&parsed_expressions[0], &parsed_expressions[1]),
                 (ExpressionType::Sweep { .. }, ExpressionType::Sweep { .. })
             )
         {
-            // Using optimised record-based algorithm for sweep × sweep comparison
+            // Using optimized sweep × sweep computation path
 
             // Extract sweep parameters
             let (col1, thresholds1) = match &parsed_expressions[0] {
@@ -996,49 +973,71 @@ impl PyEntityFrame {
                 )));
             };
 
-            // Build all contingency tables in one pass
+            // Use MetricEngine for efficient computation
             if let Some(ref callback) = progress_callback {
-                callback.call1(py, (0.5, "Computing contingency tables"))?;
+                callback.call1(py, (0.5, "Computing metrics"))?;
             }
 
-            // TODO: This is a temporary workaround - build_all_sweep_tables should accept Arc<PartitionLevel>
-            // For now, we clone the PartitionLevel which is expensive but necessary for the current API
-            let partitions1_derefs: Vec<PartitionLevel> =
-                partitions1.iter().map(|p| (**p).clone()).collect();
-            let partitions2_derefs: Vec<PartitionLevel> =
-                partitions2.iter().map(|p| (**p).clone()).collect();
-            let all_tables =
-                build_all_sweep_tables(&partitions1_derefs, &partitions2_derefs, &context);
+            // Convert expressions metrics to engine metrics
+            let engine_metrics: Vec<CoreMetricType> = parsed_metrics
+                .iter()
+                .map(|m| match m {
+                    MetricType::F1 => CoreMetricType::F1,
+                    MetricType::Precision => CoreMetricType::Precision,
+                    MetricType::Recall => CoreMetricType::Recall,
+                    MetricType::ARI => CoreMetricType::ARI,
+                    MetricType::NMI => CoreMetricType::NMI,
+                    MetricType::VMeasure => CoreMetricType::VMeasure,
+                    MetricType::BCubedPrecision => CoreMetricType::BCubedPrecision,
+                    MetricType::BCubedRecall => CoreMetricType::BCubedRecall,
+                    MetricType::EntityCount => CoreMetricType::EntityCount,
+                    MetricType::Entropy => CoreMetricType::Entropy,
+                })
+                .collect();
+
+            // Determine if this is a same-collection comparison
+            let same_collection = col1 == col2;
+
+            // Use MetricEngine to compute all metrics efficiently with Arc support
+            let metric_results_vec = if partitions1.len() == 1 && partitions2.len() == 1 {
+                // Single comparison - use compute_single_arc directly
+                vec![self.engine.compute_single_arc(
+                    &partitions1[0],
+                    Some(&partitions2[0]),
+                    &engine_metrics,
+                    &context,
+                    same_collection,
+                )]
+            } else {
+                // Sweep comparison - use the new Arc-aware method
+                self.engine.compute_sweep_arc(
+                    &partitions1,
+                    Some(&partitions2),
+                    &engine_metrics,
+                    &context,
+                    same_collection,
+                )
+            };
 
             if let Some(ref callback) = progress_callback {
-                callback.call1(py, (0.7, "Computing metrics"))?;
+                callback.call1(py, (0.7, "Processing results"))?;
             }
 
-            // Convert tables to results
+            // Convert results to the expected format
             let total_combinations = thresholds1.len() * thresholds2.len();
             let mut completed = 0;
-            for (i, threshold1) in thresholds1.iter().enumerate() {
-                for (j, threshold2) in thresholds2.iter().enumerate() {
+            let mut result_idx = 0;
+            for threshold1 in thresholds1.iter() {
+                for threshold2 in thresholds2.iter() {
                     let mut result = HashMap::new();
                     result.insert(format!("{}_threshold", col1), *threshold1);
                     result.insert(format!("{}_threshold", col2), *threshold2);
 
-                    let table = &all_tables[i][j];
-                    for metric in &parsed_metrics {
-                        let value = match metric {
-                            MetricType::F1 => table.compute_f1(),
-                            MetricType::Precision => table.compute_precision(),
-                            MetricType::Recall => table.compute_recall(),
-                            MetricType::ARI => table.compute_ari(),
-                            MetricType::NMI => table.compute_nmi(),
-                            MetricType::VMeasure => table.compute_v_measure(),
-                            MetricType::BCubedPrecision => table.compute_bcubed_precision(),
-                            MetricType::BCubedRecall => table.compute_bcubed_recall(),
-                            _ => 0.0, // Single collection metrics shouldn't be here
-                        };
-                        let metric_name = format!("{:?}", metric).to_lowercase();
-                        result.insert(metric_name, value);
+                    // Add all metrics from the engine results
+                    for (metric_name, value) in &metric_results_vec[result_idx] {
+                        result.insert(metric_name.clone(), *value);
                     }
+                    result_idx += 1;
 
                     results.push(result);
 
@@ -1068,7 +1067,7 @@ impl PyEntityFrame {
             return Ok(results);
         }
 
-        // For all other cases, use appropriate algorithm based on collection comparison
+        // General path for all other cases (point comparisons, mixed sweep/point, etc.)
         let total_combinations = threshold_combinations.len();
         let mut combination_idx = 0;
 
@@ -1087,6 +1086,8 @@ impl PyEntityFrame {
             // Get partitions for this combination, using cache when possible
             let mut owned_partitions: Vec<Arc<PartitionLevel>> = Vec::new();
             let mut collection_names = Vec::new();
+
+            // Build partitions efficiently using cache
             for (expr, threshold) in &combination {
                 let collection_name = match expr {
                     ExpressionType::Point { collection, .. } => collection,
@@ -1102,86 +1103,111 @@ impl PyEntityFrame {
                     // Use cached partition
                     cached.clone()
                 } else {
-                    // Reconstruct partition and cache it
-                    if let Some(hierarchy) = self.frame.get_collection(collection_name) {
-                        let partition = hierarchy.at_threshold(*threshold);
-                        partition_cache.insert(cache_key, partition.clone());
-                        partition
-                    } else {
-                        return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                            "Collection '{}' not found",
-                            collection_name
-                        )));
-                    }
+                    // Get hierarchy and build partition
+                    let hierarchy =
+                        self.frame.get_collection(collection_name).ok_or_else(|| {
+                            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                                "Collection '{}' not found",
+                                collection_name
+                            ))
+                        })?;
+
+                    let partition = hierarchy.at_threshold(*threshold);
+                    partition_cache.insert(cache_key, partition.clone());
+                    partition
                 };
                 owned_partitions.push(partition);
             }
 
-            // Compute metrics using owned partitions
-            for metric in &parsed_metrics {
-                let metric_value = if metric.requires_comparison() {
-                    if owned_partitions.len() < 2 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                            "Metric {} requires at least 2 collections",
-                            metric_name(metric)
-                        )));
-                    }
+            // Compute comparison metrics efficiently (all at once to avoid cache issues)
+            let comparison_metrics: Vec<&MetricType> = parsed_metrics
+                .iter()
+                .filter(|m| m.requires_comparison())
+                .collect();
 
-                    // Check contingency table cache for comparison metrics
-                    let threshold_key1 = threshold_to_cache_key(combination[0].1);
-                    let threshold_key2 = threshold_to_cache_key(combination[1].1);
-                    let cont_cache_key = (
-                        collection_names[0].clone(),
-                        threshold_key1,
-                        collection_names[1].clone(),
-                        threshold_key2,
-                    );
+            let mut metric_values = HashMap::new();
 
-                    let sparse_table =
-                        if let Some(cached) = contingency_cache.get(&cont_cache_key) {
-                            cached
+            if !comparison_metrics.is_empty() {
+                if owned_partitions.len() < 2 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Comparison metrics require at least 2 collections".to_string(),
+                    ));
+                }
+
+                // Check contingency table cache
+                let threshold_key1 = threshold_to_cache_key(combination[0].1);
+                let threshold_key2 = threshold_to_cache_key(combination[1].1);
+                let cont_cache_key = (
+                    collection_names[0].clone(),
+                    threshold_key1,
+                    collection_names[1].clone(),
+                    threshold_key2,
+                );
+
+                // Check cache first
+                let cached_results = if let Some(cached) = metrics_cache.get(&cont_cache_key) {
+                    cached.clone()
+                } else {
+                    // Get shared context
+                    let context =
+                        if let Some(hierarchy) = self.frame.get_collection(&collection_names[0]) {
+                            hierarchy.context.clone()
                         } else {
-                            // ALWAYS use record-based algorithm - O(r) beats O(k²)
-                            // Get shared context from first collection
-                            let context = if let Some(hierarchy) =
-                                self.frame.get_collection(&collection_names[0])
-                            {
-                                hierarchy.context.clone()
-                            } else {
-                                return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(
-                                    format!("Collection '{}' not found", collection_names[0]),
-                                ));
-                            };
-
-                            // Always use the fast record-based algorithm
-                            let table = SparseContingencyTable::from_partitions(
-                                &owned_partitions[0],
-                                &owned_partitions[1],
-                                &context,
-                            );
-
-                            contingency_cache.insert(cont_cache_key.clone(), table);
-                            contingency_cache.get(&cont_cache_key).unwrap()
+                            return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                                "Collection '{}' not found",
+                                collection_names[0]
+                            )));
                         };
 
-                    // Compute metric from cached contingency table
-                    match metric {
-                        MetricType::F1 => sparse_table.compute_f1(),
-                        MetricType::Precision => sparse_table.compute_precision(),
-                        MetricType::Recall => sparse_table.compute_recall(),
-                        MetricType::ARI => sparse_table.compute_ari(),
-                        MetricType::NMI => sparse_table.compute_nmi(),
-                        MetricType::VMeasure => sparse_table.compute_v_measure(),
-                        MetricType::BCubedPrecision => sparse_table.compute_bcubed_precision(),
-                        MetricType::BCubedRecall => sparse_table.compute_bcubed_recall(),
-                        _ => {
-                            // Single collection metrics shouldn't be here
-                            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                                "Metric {:?} is not a comparison metric",
-                                metric
-                            )));
-                        }
-                    }
+                    // Convert all comparison metrics to engine metric types
+                    let engine_metrics: Vec<CoreMetricType> = comparison_metrics
+                        .iter()
+                        .map(|m| match m {
+                            MetricType::F1 => CoreMetricType::F1,
+                            MetricType::Precision => CoreMetricType::Precision,
+                            MetricType::Recall => CoreMetricType::Recall,
+                            MetricType::ARI => CoreMetricType::ARI,
+                            MetricType::NMI => CoreMetricType::NMI,
+                            MetricType::VMeasure => CoreMetricType::VMeasure,
+                            MetricType::BCubedPrecision => CoreMetricType::BCubedPrecision,
+                            MetricType::BCubedRecall => CoreMetricType::BCubedRecall,
+                            _ => CoreMetricType::F1, // Shouldn't happen
+                        })
+                        .collect();
+
+                    // Compute all metrics at once using Arc method
+                    let same_collection = collection_names[0] == collection_names[1];
+                    let metric_results = self.engine.compute_single_arc(
+                        &owned_partitions[0],
+                        Some(&owned_partitions[1]),
+                        &engine_metrics,
+                        &context,
+                        same_collection,
+                    );
+
+                    // Cache the results
+                    metrics_cache.insert(cont_cache_key.clone(), metric_results.clone());
+
+                    metric_results
+                };
+
+                // Extract values for comparison metrics
+                for metric in &comparison_metrics {
+                    let value = cached_results
+                        .get(metric_name(metric))
+                        .copied()
+                        .unwrap_or(0.0);
+                    metric_values.insert(metric_name(metric), value);
+                }
+            }
+
+            // Now add all metric values to the result
+            for metric in &parsed_metrics {
+                let metric_value = if metric.requires_comparison() {
+                    metric_values
+                        .get(metric_name(metric))
+                        .copied()
+                        .unwrap_or(0.0)
                 } else {
                     if owned_partitions.is_empty() {
                         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -1242,9 +1268,9 @@ impl PyEntityFrame {
                 // Simple strategy: clear half the cache when limit exceeded
                 partition_cache.clear();
             }
-            if contingency_cache.len() > contingency_limit {
+            if metrics_cache.len() > contingency_limit {
                 // Simple strategy: clear half the cache when limit exceeded
-                contingency_cache.clear();
+                metrics_cache.clear();
             }
         }
 
