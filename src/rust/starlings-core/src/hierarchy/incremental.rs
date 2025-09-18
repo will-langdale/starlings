@@ -42,12 +42,10 @@ impl IncrementalPartitionBuilder {
         threshold: f64,
         storage: &dyn HierarchyStorage,
     ) -> Result<Arc<PartitionLevel>, String> {
-        // If this is the first build or we're going backwards, start fresh
-        if self.last_threshold.is_none() || self.last_threshold.unwrap() < threshold {
-            self.build_from_scratch(threshold, storage)
-        } else {
-            // Apply incremental updates
-            self.apply_incremental_updates(threshold, storage)
+        // Use incremental updates when moving to lower thresholds, otherwise rebuild
+        match self.last_threshold {
+            Some(last) if last >= threshold => self.apply_incremental_updates(threshold, storage),
+            _ => self.build_from_scratch(threshold, storage),
         }
     }
 
@@ -162,24 +160,26 @@ impl IncrementalPartitionBuilder {
         merge: &MergeEvent,
     ) {
         // Collect all records from all merging groups
-        let mut all_records = Vec::new();
-        for group in &merge.merging_groups {
-            for record in group.iter() {
-                all_records.push(record);
-            }
-        }
+        let all_records: Vec<u32> = merge
+            .merging_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .collect();
+
+        // Early return if no records to merge
+        let Some(&first) = all_records.first() else {
+            return;
+        };
 
         // Union all records together (using first as representative)
-        if let Some(&first) = all_records.first() {
-            for &record in all_records.iter().skip(1) {
-                uf.union(first as usize, record as usize);
-            }
-
-            // Update canonical ID for the new root
-            let root = uf.find(first as usize);
-            let min_record = all_records.iter().copied().min().unwrap_or(first);
-            self.canonical_ids.insert(root, min_record);
+        for &record in &all_records[1..] {
+            uf.union(first as usize, record as usize);
         }
+
+        // Update canonical ID for the new root
+        let root = uf.find(first as usize);
+        let min_record = all_records.into_iter().min().unwrap_or(first);
+        self.canonical_ids.insert(root, min_record);
     }
 
     /// Build a PartitionLevel from the current union-find state
@@ -218,7 +218,6 @@ mod tests {
     use crate::core::Key;
     use crate::hierarchy::PartitionHierarchy;
 
-    #[allow(dead_code)]
     fn create_test_hierarchy() -> (Arc<DataContext>, PartitionHierarchy) {
         let ctx = DataContext::new();
 
