@@ -113,7 +113,7 @@ class TestExpressionIntegration:
         # Test that analyse method exists and can be called
         result = ef.analyse(
             sl.col("a").at(0.8),
-            sl.col("b").at(0.8),
+            sl.col("b").at(0.8).reference(),
             metrics=[
                 sl.Metrics.eval.f1,
                 sl.Metrics.eval.precision,
@@ -206,7 +206,9 @@ class TestExpressionIntegration:
         ef = entity_frame_with_collections
 
         # Test multiple collections get comparison metrics by default
-        result_comparison = ef.analyse(sl.col("a").at(0.8), sl.col("b").at(0.8))
+        result_comparison = ef.analyse(
+            sl.col("a").at(0.8), sl.col("b").at(0.8).reference()
+        )
 
         assert len(result_comparison) == 1
         result_dict = result_comparison[0]
@@ -401,7 +403,7 @@ class TestNewMetricsIntegration:
         perfect_ef = perfect_match_collections
         result = perfect_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[sl.Metrics.eval.ari],
         )
 
@@ -413,7 +415,7 @@ class TestNewMetricsIntegration:
         mismatch_ef = mismatch_collections
         result = mismatch_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[sl.Metrics.eval.ari],
         )
 
@@ -427,7 +429,7 @@ class TestNewMetricsIntegration:
         perfect_ef = perfect_match_collections
         result = perfect_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[sl.Metrics.eval.nmi],
         )
 
@@ -439,7 +441,7 @@ class TestNewMetricsIntegration:
         mismatch_ef = mismatch_collections
         result = mismatch_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[sl.Metrics.eval.nmi],
         )
 
@@ -453,7 +455,7 @@ class TestNewMetricsIntegration:
         perfect_ef = perfect_match_collections
         result = perfect_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[sl.Metrics.eval.v_measure],
         )
 
@@ -467,7 +469,7 @@ class TestNewMetricsIntegration:
         mismatch_ef = mismatch_collections
         result = mismatch_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[sl.Metrics.eval.v_measure],
         )
 
@@ -481,7 +483,7 @@ class TestNewMetricsIntegration:
         perfect_ef = perfect_match_collections
         result = perfect_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[
                 sl.Metrics.eval.bcubed_precision,
                 sl.Metrics.eval.bcubed_recall,
@@ -502,7 +504,7 @@ class TestNewMetricsIntegration:
         mismatch_ef = mismatch_collections
         result = mismatch_ef.analyse(
             sl.col("predicted").at(0.85),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[
                 sl.Metrics.eval.bcubed_precision,
                 sl.Metrics.eval.bcubed_recall,
@@ -531,7 +533,7 @@ class TestNewMetricsIntegration:
         # Test sweep with all new metrics
         results = ef.analyse(
             sl.col("predicted").sweep(0.7, 0.9, 0.1),
-            sl.col("reference").at(0.85),
+            sl.col("reference").at(0.85).reference(),
             metrics=[
                 sl.Metrics.eval.ari,
                 sl.Metrics.eval.nmi,
@@ -572,7 +574,7 @@ class TestNewMetricsIntegration:
         # Test sweep × sweep with new metrics
         results = ef.analyse(
             sl.col("method_a").sweep(0.7, 0.8, 0.1),
-            sl.col("method_b").sweep(0.8, 0.9, 0.1),
+            sl.col("method_b").sweep(0.8, 0.9, 0.1).reference(),
             metrics=[sl.Metrics.eval.ari, sl.Metrics.eval.nmi],
         )
 
@@ -619,7 +621,7 @@ class TestLargeScaleExpressions:
         start = time.time()
         result = ef.analyse(
             sl.col("a").at(0.8),
-            sl.col("b").at(0.8),
+            sl.col("b").at(0.8).reference(),
             metrics=[
                 sl.Metrics.eval.f1,
                 sl.Metrics.eval.precision,
@@ -688,7 +690,7 @@ class TestLargeScaleExpressions:
         start = time.time()
         result = ef.analyse(
             sl.col("a").sweep(0.8, 0.9, 0.05),  # 3 thresholds
-            sl.col("b").at(0.85),  # Single point
+            sl.col("b").at(0.85).reference(),  # Single point
             metrics=[sl.Metrics.eval.f1],
         )
         duration = time.time() - start

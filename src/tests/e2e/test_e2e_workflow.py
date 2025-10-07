@@ -188,7 +188,7 @@ def test_user_eda_workflow():
     start_time = time.monotonic()
     comparison_result = frame.analyse(
         sl.col("full_dataset").at(0.8),
-        sl.col("compare_1m").at(0.8),
+        sl.col("compare_1m").at(0.8).reference(),
         metrics=[
             sl.Metrics.eval.f1,
             sl.Metrics.eval.precision,
@@ -231,7 +231,7 @@ def test_user_eda_workflow():
     start_time = time.monotonic()
     sweep_point_result = frame.analyse(
         sl.col("full_dataset").sweep(0.7, 0.9, 0.1),  # 3 thresholds
-        sl.col("compare_1m").at(0.8),  # Single point
+        sl.col("compare_1m").at(0.8).reference(),  # Single point
         metrics=[sl.Metrics.eval.f1],
     )
     sweep_point_time = time.monotonic() - start_time
@@ -284,7 +284,7 @@ def test_user_eda_workflow():
     start_time = time.monotonic()
     sweep_sweep_result = frame.analyse(
         sl.col("full_dataset").sweep(0.8, 0.9, 0.1),  # 2 thresholds
-        sl.col("compare_1m").sweep(0.8, 0.9, 0.1),  # 2 thresholds
+        sl.col("compare_1m").sweep(0.8, 0.9, 0.1).reference(),  # 2 thresholds
         metrics=[sl.Metrics.eval.f1],
     )
     sweep_sweep_time = time.monotonic() - start_time

@@ -644,12 +644,6 @@ impl PartitionHierarchy {
     ///
     /// # Returns
     /// Vector of MergeEvents that occur between the thresholds
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Get merges that happen when moving from 0.9 to 0.8
-    /// let merges = hierarchy.get_merge_events_between(0.9, 0.8)?;
-    /// ```
     pub fn get_merge_events_between(
         &self,
         from_threshold: f64,

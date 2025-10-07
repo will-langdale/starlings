@@ -942,7 +942,7 @@ impl MetricAlgorithm for DeltaAlgorithm {
             _ => ComplexityEstimate {
                 notation: "N/A".to_string(),
                 expected_ops: 0,
-                description: "Not optimized for this comparison type".to_string(),
+                description: "Not optimised for this comparison type".to_string(),
             },
         }
     }

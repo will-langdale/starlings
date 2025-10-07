@@ -1,4 +1,4 @@
-"""Test large-scale cross-collection comparisons with record-based optimization.
+"""Test large-scale cross-collection comparisons with record-based optimisation.
 
 This module tests the O(r) algorithm for cross-collection comparisons that
 leverages shared DataContext between collections in an EntityFrame, reducing
@@ -108,8 +108,8 @@ def generate_test_edges(n: int, seed: int = 42) -> list[tuple[str, str, float]]:
     return edges[:n]
 
 
-class TestRecordBasedOptimization:
-    """Test the record-based contingency table optimization.
+class TestRecordBasedOptimisation:
+    """Test the record-based contingency table optimisation.
 
     These tests validate both correctness and performance of the O(r) algorithm
     that replaces the O(k₁ × k₂) entity-based comparison.
@@ -135,7 +135,7 @@ class TestRecordBasedOptimization:
             # Same collections at same threshold should have perfect agreement
             result = ef.analyse(
                 sl.col("col_a").at(threshold),
-                sl.col("col_b").at(threshold),
+                sl.col("col_b").at(threshold).reference(),
                 metrics=[
                     sl.Metrics.eval.f1,
                     sl.Metrics.eval.precision,
@@ -160,7 +160,7 @@ class TestRecordBasedOptimization:
         # Compare different thresholds
         result = ef.analyse(
             sl.col("test").at(0.8),
-            sl.col("test2").at(0.7),
+            sl.col("test2").at(0.7).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
 
@@ -194,7 +194,7 @@ class TestRecordBasedOptimization:
         # Perform a 3x3 sweep comparison
         results = ef.analyse(
             sl.col("test1").sweep(0.6, 0.8, 0.1),
-            sl.col("test2").sweep(0.6, 0.8, 0.1),
+            sl.col("test2").sweep(0.6, 0.8, 0.1).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
 
@@ -225,7 +225,7 @@ class TestRecordBasedOptimization:
 
         result = ef.analyse(
             sl.col("large1").at(0.75),
-            sl.col("large2").at(0.75),
+            sl.col("large2").at(0.75).reference(),
             metrics=[
                 sl.Metrics.eval.f1,
                 sl.Metrics.eval.precision,
@@ -259,7 +259,7 @@ class TestRecordBasedOptimization:
         # This should use optimised algorithm (both in same frame)
         result = ef.analyse(
             sl.col("shared1").at(0.7),
-            sl.col("shared2").at(0.7),
+            sl.col("shared2").at(0.7).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
         assert len(result) == 1
@@ -276,7 +276,7 @@ class TestRecordBasedOptimization:
         start_time = time.time()
         result1 = ef.analyse(
             sl.col("cache_test").at(0.75),
-            sl.col("cache_test").at(0.75),
+            sl.col("cache_test").at(0.75).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
         first_run_time = time.time() - start_time
@@ -285,7 +285,7 @@ class TestRecordBasedOptimization:
         start_time = time.time()
         result2 = ef.analyse(
             sl.col("cache_test").at(0.75),
-            sl.col("cache_test").at(0.75),
+            sl.col("cache_test").at(0.75).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
         second_run_time = time.time() - start_time
@@ -305,7 +305,7 @@ class TestRecordBasedOptimization:
         ],
     )
     def test_scaling_correctness(self, num_edges: int, expected_f1: float):
-        """Test that optimization works correctly at different scales."""
+        """Test that optimisation works correctly at different scales."""
         edges = generate_test_edges(num_edges)
 
         ef = sl.EntityFrame()
@@ -315,7 +315,7 @@ class TestRecordBasedOptimization:
         # Same collection at same threshold should always have F1=1.0
         result = ef.analyse(
             sl.col("scale_test").at(0.75),
-            sl.col("scale_test").at(0.75),
+            sl.col("scale_test").at(0.75).reference(),
             metrics=[sl.Metrics.eval.f1],
         )
 

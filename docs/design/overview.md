@@ -60,21 +60,20 @@ ef.add_collection_from_entities("truth", truth_entities)
 
 # Analyse with composable expressions
 results = ef.analyse(
-    sl.col("splink").sweep(0.5, 0.95, 0.01),
+    sl.col("splink").sweep(0.5, 0.95, 0.05),
     sl.col("truth").at(1.0).reference(),  # Explicit reference for asymmetric metrics
     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision, sl.Metrics.eval.recall]
 )
-# Returns tidy-row format: [{"collection": "splink", "collection_threshold": 0.5,
-#                            "reference": "truth", "reference_threshold": 1.0,
-#                            "metric_name": "f1", "metric_value": 0.72}, ...]
+# Returns DataFrame-friendly format:
+# [{"splink_threshold": 0.5, "truth_threshold": 1.0,
+#   "f1": 0.72, "precision": 0.68, "recall": 0.76}, ...]
 
 # Convert to polars for analysis
 df = pl.from_dicts(results)
-f1_results = df.filter(pl.col("metric_name") == "f1")
-optimal = f1_results.filter(pl.col("metric_value") == pl.col("metric_value").max()).row(0, named=True)
+optimal = df.filter(pl.col("f1") == pl.col("f1").max()).row(0, named=True)
 
 # Direct access for simple operations
-partition = ef["splink"].at(optimal["collection_threshold"])
+partition = ef["splink"].at(optimal["splink_threshold"])
 entities = partition.to_list()  # List of sets of (source, key) pairs
 
 # Apply operations to entities

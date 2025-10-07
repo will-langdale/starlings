@@ -128,8 +128,11 @@ class ColExpression:
     def sweep(self, start: float, stop: float, step: float = 0.05) -> Expression:
         """Specify a threshold range for sweeping analysis.
 
-        For performance at scale, step sizes are constrained to multiples of 0.05.
-        Smaller steps will be rounded up to 0.05.
+        For performance at production scale (1M+ edges), step sizes are constrained:
+        - Minimum step: 0.05
+        - Steps are rounded to nearest 0.05 multiple
+        - Example: step=0.01 becomes step=0.05, step=0.07 becomes step=0.05
+        - Rationale: Prevents excessive threshold points in large-scale sweeps
 
         Args:
             start: Starting threshold (inclusive)
@@ -141,13 +144,13 @@ class ColExpression:
 
         Example:
             ```python
-            sl.col("splink").sweep(0.5, 0.95, 0.05)  # Recommended
-            sl.col("splink").sweep(0.5, 0.95, 0.1)  # Faster, coarser
+            sl.col("splink").sweep(0.5, 0.95, 0.05)  # Recommended for large datasets
+            sl.col("splink").sweep(0.5, 0.95, 0.1)  # Faster, coarser granularity
             ```
 
         Note:
-            For 1M-scale datasets, use step >= 0.05 to ensure reasonable performance.
-            Steps smaller than 0.05 will be automatically adjusted to 0.05.
+            Steps smaller than 0.05 are automatically rounded up to 0.05.
+            This ensures reasonable performance at scale without excessive computations.
         """
         # Enforce minimum step for performance
         if step < MIN_SWEEP_STEP:

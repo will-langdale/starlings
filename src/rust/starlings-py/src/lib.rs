@@ -816,7 +816,7 @@ impl PyEntityFrame {
                     merge_events_between.push(merges);
                 }
 
-                // 3. Call the optimized sweep function in the metric engine
+                // 3. Call the optimised sweep function in the metric engine
                 let engine_metrics: Vec<CoreMetricType> =
                     parsed_metrics.iter().map(convert_metric_type).collect();
                 let metric_results_vec = self.engine.compute_single_sweep_with_merges(
@@ -853,7 +853,7 @@ impl PyEntityFrame {
         // Cache for metric results to avoid redundant computation
         let mut metrics_cache: HashMap<(String, u64, String, u64), MetricResults> = HashMap::new();
 
-        // Extract collection names for potential future optimization
+        // Extract collection names for potential future optimisation
         let _expr_collection_names: Vec<String> = parsed_expressions
             .iter()
             .map(|expr| match expr {
@@ -862,7 +862,7 @@ impl PyEntityFrame {
             })
             .collect();
 
-        // Special optimization for sweep × sweep comparisons
+        // Special optimisation for sweep × sweep comparisons
         // This path uses efficient batch partition building and the MetricEngine's sweep methods
         if parsed_expressions.len() == 2
             && matches!(
@@ -870,7 +870,7 @@ impl PyEntityFrame {
                 (ExpressionType::Sweep { .. }, ExpressionType::Sweep { .. })
             )
         {
-            // Using optimized sweep × sweep computation path
+            // Using optimised sweep × sweep computation path
 
             // Extract sweep parameters
             let (col1, thresholds1) = match &parsed_expressions[0] {
