@@ -146,6 +146,17 @@ impl PartitionLevel {
             .iter()
             .position(|entity| entity.contains(record_id))
     }
+
+    /// Estimate memory usage in bytes
+    pub fn memory_usage_bytes(&self) -> u64 {
+        let base_size = std::mem::size_of::<PartitionLevel>() as u64;
+        let entities_size: u64 = self
+            .entities
+            .iter()
+            .map(|b| b.serialized_size() as u64)
+            .sum();
+        base_size + entities_size
+    }
 }
 
 impl fmt::Debug for PartitionLevel {

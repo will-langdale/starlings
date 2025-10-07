@@ -403,17 +403,11 @@ mod tests {
             context.ensure_record("test", Key::U32(i as u32));
         }
 
-        println!("Generated {} edges for {} entities", edges.len(), n);
         let hierarchy = PartitionHierarchy::from_edges(edges, Arc::new(context), 6, None).unwrap();
 
         // Test entity counts at key thresholds
         let entities_at_1_0 = hierarchy.at_threshold(1.0).entities().len();
         let entities_at_0_0 = hierarchy.at_threshold(0.0).entities().len();
-
-        println!(
-            "Entities at 1.0: {}, Entities at 0.0: {}",
-            entities_at_1_0, entities_at_0_0
-        );
 
         // Should have exactly n entities at 1.0 and n/2 entities at 0.0
         assert_eq!(

@@ -3,6 +3,7 @@ set working-directory := "../.."
 # Environment variables
 set export
 STARLINGS_DEBUG := "1"
+STARLINGS_MEMORY_LIMIT := "50%"
 
 # Run all tests (Python + Rust) - SAFE BY DEFAULT with safety validation
 default: python rust
@@ -15,38 +16,24 @@ list:
 # Run Python tests (safe tests + e2e safety validation)
 python:
     @echo "Running Python tests (unit tests + e2e safety validation)..."
-    STARLINGS_DEBUG=1 STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest -m "not stress and not safety and not benchmark and not integration and not performance"
+    uv run pytest -m "not stress and not safety and not benchmark and not integration and not performance"
 
 # Run only Rust tests
 rust:
     @echo "Running Rust core tests..."
     cargo test -p starlings-core
 
-# Run safety tests (circuit breaker, resource limits)
+# Run safety tests (memory limits, production scenarios)
 safety:
     @echo "Running safety mechanism tests..."
-    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/test_safety.py -v -m safety
-
-# Run stress tests (resource pressure, concurrent operations)  
-stress:
-    @echo "Running stress tests..."
-    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/test_stress.py -v -m stress
-
-# Run all safety-related tests
-safety-all: safety stress
-    @echo "✅ All safety tests completed"
-
-# Run performance impact tests
-performance:
-    @echo "Running performance impact tests..."
-    uv run pytest src/tests/test_safety.py::TestPerformanceImpact -v
+    STARLINGS_MEMORY_LIMIT=1GB uv run pytest src/tests/test_safety.py -v -m safety
 
 # Run end-to-end tests (large datasets, use with caution)
 e2e:
     @echo "Running end-to-end tests (large datasets)..."
     @echo "⚠️  WARNING: These tests use large datasets and may consume significant resources"
-    STARLINGS_SAFETY_LEVEL=${STARLINGS_SAFETY_LEVEL:-conservative} uv run pytest src/tests/e2e/ -v -m e2e
+    uv run pytest src/tests/e2e/ -v -m e2e
 
-# Run all dangerous tests (stress, safety, e2e)
-dangerous: safety stress e2e
+# Run all dangerous tests (e2e large datasets)
+dangerous: safety e2e
     @echo "✅ All dangerous tests completed"

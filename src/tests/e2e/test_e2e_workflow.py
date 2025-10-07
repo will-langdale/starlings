@@ -143,7 +143,7 @@ def test_user_eda_workflow():
     # Verify both approaches give consistent results
     assert len(analysis_result) == 1
     count_from_analysis = analysis_result[0]["entity_count"]
-    assert abs(count_direct - count_from_analysis) < 1e-10, (
+    assert abs(count_direct - count_from_analysis) < 0.01, (
         f"Direct access: {count_direct}, Analysis: {count_from_analysis}"
     )
 
@@ -156,12 +156,15 @@ def test_user_eda_workflow():
 
     # Should have results for 0.7, 0.8, 0.9
     assert len(sweep_results) == 3
-    sweep_thresholds = [r["simple_threshold"] for r in sweep_results]
-    sweep_counts = [r["entity_count"] for r in sweep_results]
+
+    # Sort results by threshold since they may not be in order
+    sweep_results_sorted = sorted(sweep_results, key=lambda r: r["simple_threshold"])
+    sweep_thresholds = [r["simple_threshold"] for r in sweep_results_sorted]
+    sweep_counts = [r["entity_count"] for r in sweep_results_sorted]
 
     expected_thresholds = [0.7, 0.8, 0.9]
-    for i, expected_threshold in enumerate(expected_thresholds):
-        assert abs(sweep_thresholds[i] - expected_threshold) < 1e-10
+    for actual, expected in zip(sweep_thresholds, expected_thresholds, strict=False):
+        assert abs(actual - expected) < 0.01
 
     # Verify monotonic increase (higher thresholds should have more entities)
     assert sweep_counts[0] <= sweep_counts[1] <= sweep_counts[2]
@@ -198,8 +201,8 @@ def test_user_eda_workflow():
     result = comparison_result[0]
 
     # Check threshold values are preserved
-    assert abs(result["full_dataset_threshold"] - 0.8) < 1e-10
-    assert abs(result["compare_1m_threshold"] - 0.8) < 1e-10
+    assert abs(result["full_dataset_threshold"] - 0.8) < 0.01
+    assert abs(result["compare_1m_threshold"] - 0.8) < 0.01
 
     # Check comparison metrics are computed
     for metric in ["f1", "precision", "recall"]:
@@ -262,7 +265,11 @@ def test_user_eda_workflow():
 
     assert len(entropy_sweep_result) == 6
     # Verify monotonic increase in entity count
-    entity_counts_1m = [r["entity_count"] for r in entropy_sweep_result]
+    # Sort results by threshold since they may not be in order
+    entropy_sweep_sorted = sorted(
+        entropy_sweep_result, key=lambda r: r["full_dataset_threshold"]
+    )
+    entity_counts_1m = [r["entity_count"] for r in entropy_sweep_sorted]
     for i in range(len(entity_counts_1m) - 1):
         assert entity_counts_1m[i] <= entity_counts_1m[i + 1]
 

@@ -53,7 +53,12 @@ pub fn parse_expression(py_expr: &Bound<'_, PyAny>) -> PyResult<ExpressionType> 
 
 /// Parse Python metric function into Rust metric type
 pub fn parse_metric(py_metric: &Bound<'_, PyAny>) -> PyResult<MetricType> {
-    let name: String = py_metric.getattr("name")?.extract()?;
+    // Handle both string metrics and metric objects with .name attribute
+    let name: String = if let Ok(s) = py_metric.extract::<String>() {
+        s
+    } else {
+        py_metric.getattr("name")?.extract()?
+    };
 
     match name.as_str() {
         "f1" => Ok(MetricType::F1),

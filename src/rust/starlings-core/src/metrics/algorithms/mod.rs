@@ -44,6 +44,9 @@ pub trait MetricAlgorithm: Send + Sync {
     /// Estimate the computational complexity for this comparison
     fn complexity(&self, comparison_type: &ComparisonType) -> ComplexityEstimate;
 
+    /// Allow downcasting to concrete types for optimized paths
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
     /// Compute metrics for a single partition comparison
     fn compute_single(
         &mut self,

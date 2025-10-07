@@ -10,7 +10,7 @@ use starlings_core::expressions::{
 use starlings_core::metrics::{CoreMetricType, MetricEngine, MetricResults};
 
 use starlings_core::core::ensure_memory_safety;
-use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
+use starlings_core::core::resource_monitor::SafetyError;
 use starlings_core::debug_println;
 use starlings_core::test_utils;
 use starlings_core::{DataContext, EntityFrame, Key, PartitionHierarchy, PartitionLevel};
@@ -53,28 +53,6 @@ fn create_progress_wrapper(callback: Py<pyo3::PyAny>) -> ProgressCallback {
     })
 }
 
-/// Helper function to get strategy message with thread information
-fn get_strategy_message(strategy: &ProcessingStrategy) -> String {
-    let thread_count = rayon::current_num_threads();
-    let base_msg = match strategy {
-        ProcessingStrategy::InMemory { .. } => "In-memory processing",
-        ProcessingStrategy::MemoryAware { should_spill, .. } => {
-            if *should_spill {
-                "Memory-aware processing with disk spilling"
-            } else {
-                "Memory-aware processing"
-            }
-        }
-        ProcessingStrategy::Streaming { .. } => "Streaming with aggressive disk spilling",
-        ProcessingStrategy::Insufficient { .. } => {
-            unreachable!(
-                "ProcessingStrategy::Insufficient should have been caught earlier in safety checks"
-            )
-        }
-    };
-    format!("{} ({} threads)", base_msg, thread_count)
-}
-
 /// Helper function to map storage errors to Python exceptions
 fn map_storage_error(error: String) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error)
@@ -83,52 +61,14 @@ fn map_storage_error(error: String) -> PyErr {
 /// Helper function to map safety errors to Python exceptions
 fn map_safety_error(error: SafetyError) -> PyErr {
     match error {
-        SafetyError::CircuitOpen(msg) => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            format!("Circuit breaker tripped: {}", msg),
-        ),
-        SafetyError::InsufficientResources(msg) => {
-            PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
-                "Insufficient resources: {}",
-                msg
-            ))
-        }
-        SafetyError::OperationTooLarge(msg) => {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Operation too large: {}", msg))
-        }
-    }
-}
-
-/// Extract batch size from any processing strategy
-fn extract_batch_size(strategy: &ProcessingStrategy) -> usize {
-    match strategy {
-        ProcessingStrategy::InMemory { batch_size, .. }
-        | ProcessingStrategy::MemoryAware { batch_size, .. }
-        | ProcessingStrategy::Streaming { batch_size, .. } => *batch_size,
-        ProcessingStrategy::Insufficient { .. } => {
-            unreachable!("ProcessingStrategy::Insufficient has no batch_size")
-        }
-    }
-}
-
-/// Check if strategy requires streaming processing
-fn requires_streaming(strategy: &ProcessingStrategy) -> bool {
-    matches!(strategy, ProcessingStrategy::Streaming { .. })
-}
-
-/// Report resource warnings if present
-fn report_resource_warnings(
-    adaptive_limits: &AdaptiveLimits,
-    progress_callback: &Option<ProgressCallback>,
-) {
-    if let Some(warning) = &adaptive_limits.memory_warning {
-        if let Some(ref callback) = progress_callback {
-            callback(0.25, warning);
-        }
-    }
-    if let Some(warning) = &adaptive_limits.disk_warning {
-        if let Some(ref callback) = progress_callback {
-            callback(0.26, warning);
-        }
+        SafetyError::InsufficientMemory {
+            required_mb,
+            available_mb,
+            limit_mb,
+        } => PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
+            "Operation requires {}MB but only {}MB available (limit: {}MB). Consider: 1) Smaller dataset, 2) Free memory, 3) Increase STARLINGS_MEMORY_LIMIT",
+            required_mb, available_mb, limit_mb
+        )),
     }
 }
 
@@ -261,8 +201,9 @@ impl PyCollection {
         let source_name = source.unwrap_or_else(|| "default".to_string());
 
         // Pre-flight safety check using global safety system
-        let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
-        let estimated_mb = (edges.len() * 750) / (1024 * 1024); // 750 bytes per edge estimate
+        let _num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
+                                             // Ensure at least 1MB for small datasets to avoid integer division to 0
+        let estimated_mb = ((edges.len() * 100) / (1024 * 1024)).max(1); // 100 bytes per edge estimate
 
         // Global safety check replaces context.resource_monitor
         ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
@@ -271,32 +212,21 @@ impl PyCollection {
         let estimated_records = (edges.len() * 14) / 10; // 1.4x edges for safety
         let context = DataContext::with_capacity(estimated_records);
 
-        // Determine processing strategy based on dataset size and system resources
-        use starlings_core::core::safety::global_resource_monitor;
-        let strategy = global_resource_monitor().determine_processing_strategy(num_entities);
-
-        // Handle insufficient resources case
-        if let ProcessingStrategy::Insufficient {
-            required_memory_mb,
-            available_memory_mb,
-            ..
-        } = &strategy
-        {
-            return Err(PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
-                "Insufficient system resources for {} entities. Need ~{}MB memory, have {}MB available. \
-                 Try: 1) Smaller dataset, 2) Free system memory, 3) Set STARLINGS_SAFETY_LEVEL=performance",
-                num_entities, required_memory_mb, available_memory_mb
-            )));
-        }
-
         // Create progress callback wrapper for Rust use
         let progress_callback: Option<ProgressCallback> =
             progress_callback.map(create_progress_wrapper);
 
-        // Report initial progress with processing strategy info
+        // Report initial progress
         if let Some(ref callback) = progress_callback {
-            let strategy_message = get_strategy_message(&strategy);
-            callback(0.0, &strategy_message);
+            let thread_count = rayon::current_num_threads();
+            callback(
+                0.0,
+                &format!(
+                    "Processing {} edges ({} threads)",
+                    edges.len(),
+                    thread_count
+                ),
+            );
         }
 
         // Efficiently convert all Python keys to Rust edges with optimised bulk processing
@@ -347,31 +277,21 @@ impl PyCollection {
             keys_set.into_keys().collect()
         };
 
-        // Extract batch size and processing parameters from strategy
-        let batch_size = extract_batch_size(&strategy);
-
-        // Get adaptive limits for current conditions
-        let adaptive_limits = global_resource_monitor().get_adaptive_limits(batch_size);
-
-        // Show resource warnings if present
-        report_resource_warnings(&adaptive_limits, &progress_callback);
+        // Determine batch size based on memory status
+        use starlings_core::core::safety::global_resource_monitor;
+        let usage = global_resource_monitor().get_usage();
+        let batch_size = if !usage.memory_under_limit {
+            10_000 // Small batches when at limit
+        } else if usage.memory_percent > 60.0 {
+            50_000 // Medium batches when getting close
+        } else {
+            100_000 // Large batches when plenty of headroom
+        };
 
         let key_to_id_mutex = Mutex::new(key_to_id);
 
-        // Helper closure for batch processing with safety checks
+        // Helper closure for batch processing
         let process_batch = |batch: &[Key]| {
-            // Check circuit breaker before each batch
-            if global_resource_monitor().is_circuit_open() {
-                // Circuit breaker open - aborting batch processing
-                return;
-            }
-
-            // Apply throttling if needed
-            let throttle_delay = global_resource_monitor().throttle_if_needed();
-            if throttle_delay.as_millis() > 0 {
-                std::thread::sleep(throttle_delay);
-            }
-
             let ids = context.ensure_records_batch(&source_name, batch);
             let mut local_map = FxHashMap::default();
             for (key, id) in batch.iter().zip(ids.iter()) {
@@ -380,52 +300,16 @@ impl PyCollection {
             key_to_id_mutex.lock().unwrap().extend(local_map);
         };
 
-        // Process batches based on strategy and current system pressure
-        let should_use_streaming = requires_streaming(&strategy)
-            || adaptive_limits.should_throttle
-            || adaptive_limits.should_spill_to_disk;
+        // Normal parallel processing
+        unique_keys.par_chunks(batch_size).for_each(process_batch);
 
-        if should_use_streaming {
-            // Sequential streaming processing with memory management
-            let delay_msg = if adaptive_limits.delay_between_batches_ms > 0 {
-                format!(
-                    " ({}ms delay between batches)",
-                    adaptive_limits.delay_between_batches_ms
-                )
-            } else {
-                String::new()
-            };
-
-            for batch in unique_keys.chunks(adaptive_limits.batch_size) {
-                process_batch(batch);
-
-                // Add delay if under resource pressure
-                if adaptive_limits.delay_between_batches_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        adaptive_limits.delay_between_batches_ms,
-                    ));
-                }
-            }
-
-            if let Some(ref callback) = progress_callback {
-                let msg = format!(
-                    "Streaming mode: batch size {}, resource throttling active{}",
-                    adaptive_limits.batch_size, delay_msg
-                );
-                callback(0.35, &msg);
-            }
-        } else {
-            // Normal parallel processing when resources are abundant
-            unique_keys.par_chunks(batch_size).for_each(process_batch);
-
-            if let Some(ref callback) = progress_callback {
-                let msg = format!(
-                    "Parallel processing: batch size {}, {} threads active",
-                    batch_size,
-                    rayon::current_num_threads()
-                );
-                callback(0.35, &msg);
-            }
+        if let Some(ref callback) = progress_callback {
+            let msg = format!(
+                "Parallel processing: batch size {}, {} threads active",
+                batch_size,
+                rayon::current_num_threads()
+            );
+            callback(0.35, &msg);
         }
 
         let key_to_id = key_to_id_mutex.into_inner().unwrap();
@@ -620,7 +504,8 @@ fn generate_entity_resolution_edges(
     _py: Python<'_>,
 ) -> PyResult<EdgeGenerator> {
     // CRITICAL FIX: Add pre-flight safety check BEFORE generating edges
-    let estimated_mb = (n * 5 * 150) / (1024 * 1024); // n entities * 5 edges * 150 bytes per edge
+    // Ensure at least 1MB for small datasets to avoid integer division to 0
+    let estimated_mb = ((n * 5 * 100) / (1024 * 1024)).max(1); // n entities * 5 edges * 100 bytes per edge
     ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
 
     let edges = test_utils::generate_entity_resolution_edges(n, num_thresholds);
@@ -890,6 +775,71 @@ impl PyEntityFrame {
         // Report initial progress
         if let Some(ref callback) = progress_callback {
             callback.call1(py, (0.05, "Preparing analysis"))?;
+        }
+
+        // OPTIMIZED PATH for single-collection sweeps
+        if parsed_expressions.len() == 1 {
+            if let ExpressionType::Sweep {
+                collection,
+                start,
+                stop,
+                step,
+                ..
+            } = &parsed_expressions[0]
+            {
+                debug_println!("🚀 Optimized path: single collection sweep");
+
+                let hierarchy = self.frame.get_collection(collection).ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                        "Collection '{}' not found",
+                        collection
+                    ))
+                })?;
+
+                // Thresholds are generated HIGH to LOW for Delta algorithm
+                let thresholds = generate_sweep_thresholds(*start, *stop, *step);
+                if thresholds.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                // 1. Build ONLY the first partition (highest threshold)
+                let first_partition = hierarchy.at_threshold(thresholds[0]);
+
+                // 2. Get merge events between all subsequent thresholds
+                let mut merge_events_between = Vec::new();
+                for i in 0..thresholds.len() - 1 {
+                    let from = thresholds[i];
+                    let to = thresholds[i + 1];
+                    let merges = hierarchy
+                        .get_merge_events_between(from, to)
+                        .map_err(map_storage_error)?;
+                    merge_events_between.push(merges);
+                }
+
+                // 3. Call the optimized sweep function in the metric engine
+                let engine_metrics: Vec<CoreMetricType> =
+                    parsed_metrics.iter().map(convert_metric_type).collect();
+                let metric_results_vec = self.engine.compute_single_sweep_with_merges(
+                    &first_partition,
+                    &thresholds,
+                    &merge_events_between,
+                    &engine_metrics,
+                    &hierarchy.context,
+                );
+
+                // 4. Format results
+                let mut results = Vec::new();
+                for (i, threshold) in thresholds.iter().enumerate() {
+                    let mut result_map = HashMap::new();
+                    result_map.insert(format!("{}_threshold", collection), *threshold);
+                    for (metric_name, value) in &metric_results_vec[i] {
+                        result_map.insert(metric_name.clone(), *value);
+                    }
+                    results.push(result_map);
+                }
+
+                return Ok(results);
+            }
         }
 
         // Generate all combinations of thresholds for cartesian product

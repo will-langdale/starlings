@@ -184,6 +184,44 @@ impl MetricEngine {
         let algorithm = &mut self.algorithms[algo_index];
         algorithm.compute_sweep_arc(partitions1, partitions2, metrics, context)
     }
+
+    /// Optimized single-collection sweep using only merge events (no partition building)
+    /// This method builds ONLY the first partition and uses merge events for all others
+    pub fn compute_single_sweep_with_merges(
+        &mut self,
+        first_partition: &Arc<PartitionLevel>,
+        thresholds: &[f64],
+        merge_events_between: &[Vec<crate::hierarchy::MergeEvent>],
+        metrics: &[MetricType],
+        context: &Arc<DataContext>,
+    ) -> Vec<MetricResults> {
+        use algorithms::delta::DeltaAlgorithm;
+
+        if self.debug {
+            eprintln!(
+                "Computing {} metrics for single-collection sweep with {} thresholds using merge events",
+                metrics.len(),
+                thresholds.len()
+            );
+        }
+
+        // For single collection sweeps, use the Delta algorithm with merge events
+        // This achieves TRUE O(k) complexity by never building intermediate partitions
+        if let Some(algorithm) = self.algorithms.get_mut(0) {
+            if let Some(delta) = algorithm.as_any_mut().downcast_mut::<DeltaAlgorithm>() {
+                return delta.compute_sweep_with_merges(
+                    first_partition,
+                    thresholds,
+                    merge_events_between,
+                    metrics,
+                    context,
+                );
+            }
+        }
+
+        // This should never happen - Delta algorithm is always available
+        panic!("Delta algorithm not available - this indicates a critical engine misconfiguration")
+    }
 }
 
 impl Default for MetricEngine {

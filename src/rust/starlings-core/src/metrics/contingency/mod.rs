@@ -63,8 +63,56 @@ where
     entropy
 }
 
-/// Compute conditional entropy H(X|Y)
+/// Compute conditional entropy H(X|Y) for nested HashMap structure (used by DeltaAlgorithm)
 pub fn compute_conditional_entropy<K1, K2>(
+    contingency: &HashMap<K1, HashMap<K2, u32>>,
+    col_marginals: &HashMap<K2, u32>,
+    total: f64,
+) -> f64
+where
+    K1: Eq + std::hash::Hash + Copy,
+    K2: Eq + std::hash::Hash + Copy,
+{
+    if total <= 0.0 {
+        return 0.0;
+    }
+
+    let mut conditional_entropy = 0.0;
+
+    // Group contingency cells by column (partition2)
+    let mut cells_by_col: HashMap<K2, Vec<(K1, u32)>> = HashMap::new();
+    for (&k1, row) in contingency {
+        for (&k2, &count) in row {
+            if count > 0 {
+                cells_by_col.entry(k2).or_default().push((k1, count));
+            }
+        }
+    }
+
+    // Compute conditional entropy
+    for (col_id, cells) in cells_by_col {
+        if let Some(&col_size) = col_marginals.get(&col_id) {
+            if col_size > 0 {
+                let p_y = col_size as f64 / total;
+                let mut h_x_given_y = 0.0;
+
+                for (_, count) in cells {
+                    let p_x_given_y = count as f64 / col_size as f64;
+                    if p_x_given_y > 0.0 {
+                        h_x_given_y -= p_x_given_y * p_x_given_y.log2();
+                    }
+                }
+
+                conditional_entropy += p_y * h_x_given_y;
+            }
+        }
+    }
+
+    conditional_entropy
+}
+
+/// Compute conditional entropy H(X|Y) for flat HashMap structure (used by RecordAlgorithm)
+pub fn compute_conditional_entropy_flat<K1, K2>(
     contingency: &HashMap<(K1, K2), u32>,
     col_marginals: &HashMap<K2, u32>,
     total: f64,

@@ -5,6 +5,11 @@
 //! exactly once to build contingency tables. This single-pass approach is optimal
 //! for cross-collection comparisons where incremental updates aren't possible.
 //!
+//! ## Direction
+//! **Direction-agnostic**: The Record algorithm processes all records in a single pass
+//! regardless of threshold order. It can handle sweeps in any direction (high to low,
+//! low to high, or random access) with identical O(r) performance.
+//!
 //! ## How it Works
 //! - **Input**: Any two partitions (possibly from different collections)
 //! - **Process**: Single pass through all records, building contingency tables
@@ -30,7 +35,7 @@
 
 use super::{ComparisonType, ComplexityEstimate, MetricAlgorithm, MetricResults, MetricType};
 use crate::metrics::contingency::{
-    choose_2, compute_conditional_entropy, compute_entropy_from_sizes, ContingencyMetrics,
+    choose_2, compute_conditional_entropy_flat, compute_entropy_from_sizes, ContingencyMetrics,
 };
 use crate::metrics::implementations::statistics::{compute_entity_count, compute_entropy};
 use crate::{DataContext, PartitionLevel};
@@ -336,7 +341,8 @@ impl ContingencyMetrics for RecordState {
         }
 
         // Calculate H(C|K) using our helper function
-        let h_c_given_k = compute_conditional_entropy(&self.nonzero_cells, &self.col_marginals, n);
+        let h_c_given_k =
+            compute_conditional_entropy_flat(&self.nonzero_cells, &self.col_marginals, n);
 
         // Calculate H(K|C) using our helper function
         // Note: we need to flip the contingency table for this
@@ -344,7 +350,8 @@ impl ContingencyMetrics for RecordState {
         for ((row, col), count) in &self.nonzero_cells {
             flipped_contingency.insert((*col, *row), *count);
         }
-        let h_k_given_c = compute_conditional_entropy(&flipped_contingency, &self.row_marginals, n);
+        let h_k_given_c =
+            compute_conditional_entropy_flat(&flipped_contingency, &self.row_marginals, n);
 
         // Calculate H(C) - entropy of clusters
         let h_c = compute_entropy_from_sizes(self.row_marginals.values().copied(), n);
@@ -535,6 +542,10 @@ impl RecordAlgorithm {
 impl MetricAlgorithm for RecordAlgorithm {
     fn name(&self) -> &'static str {
         "Record-based (O(r) single-pass)"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn can_handle(&self, comparison_type: &ComparisonType) -> bool {

@@ -199,29 +199,24 @@ impl DataContext {
     /// # Errors
     /// Returns an error if the operation would exceed available system resources
     pub fn check_operation_safety(&self, estimated_records: usize) -> Result<(), String> {
-        use crate::core::safety::global_resource_monitor;
-        global_resource_monitor()
-            .check_operation_safety(estimated_records)
-            .map(|_| ())
+        use crate::core::safety::ensure_memory_safety;
+        // Estimate ~1MB per 1000 records as a rough approximation
+        let estimated_mb = (estimated_records / 1000).max(1) as u64;
+        ensure_memory_safety(estimated_mb).map_err(|e| e.to_string())
     }
 
     /// Check current memory pressure and return true if we should throttle
     pub fn should_throttle(&self) -> bool {
         use crate::core::safety::global_resource_monitor;
         let usage = global_resource_monitor().get_usage();
-        usage.is_memory_pressure || usage.is_cpu_pressure
+        !usage.memory_under_limit
     }
 
     /// Wait for resources if under pressure, with exponential backoff
     pub fn wait_for_resources(&self) {
         if self.should_throttle() {
-            use crate::core::safety::global_resource_monitor;
-            let limits = global_resource_monitor().get_adaptive_limits(1000);
-            if limits.delay_between_batches_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    limits.delay_between_batches_ms,
-                ));
-            }
+            // Simple delay when near memory limit
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
@@ -280,8 +275,19 @@ impl DataContext {
     /// Get adaptive batch size for current resource conditions
     pub fn get_adaptive_batch_size(&self, default_size: usize) -> usize {
         use crate::core::safety::global_resource_monitor;
-        let limits = global_resource_monitor().get_adaptive_limits(default_size);
-        limits.batch_size
+        let usage = global_resource_monitor().get_usage();
+
+        // Simple adaptive sizing: reduce batch size if near limit
+        // Always ensure at least 1 to avoid step_by(0) panic
+        let size = if !usage.memory_under_limit {
+            default_size / 4 // Quarter size when at limit
+        } else if usage.memory_percent > 60.0 {
+            default_size / 2 // Half size when getting close
+        } else {
+            default_size // Full size when plenty of headroom
+        };
+
+        size.max(1) // Never return 0
     }
 
     pub fn get_source_name(&self, source_id: u32) -> Option<String> {

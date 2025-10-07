@@ -5,7 +5,10 @@ use super::types::MetricType;
 use crate::PartitionLevel;
 
 /// Generate all threshold values for a sweep expression
-/// Ensures step sizes are quantized to 0.05 increments for performance
+///
+/// Generates thresholds from HIGH to LOW (e.g., 0.9 → 0.6) for optimal performance
+/// with the Delta algorithm, which can incrementally track entity merges as thresholds decrease.
+/// Ensures step sizes are quantized to 0.05 increments for performance.
 pub fn generate_sweep_thresholds(start: f64, stop: f64, step: f64) -> Vec<f64> {
     // Enforce minimum step of 0.05 and round to nearest 0.05
     let step = if step < 0.05 {
@@ -15,12 +18,14 @@ pub fn generate_sweep_thresholds(start: f64, stop: f64, step: f64) -> Vec<f64> {
     };
 
     let mut thresholds = Vec::new();
-    let mut current = start;
 
-    while current <= stop + f64::EPSILON {
-        // Add small epsilon to handle floating-point precision issues
+    // ALWAYS generate from HIGH to LOW for Delta algorithm
+    // This allows incremental tracking as entities merge with decreasing thresholds
+    let mut current = stop;
+
+    while current >= start - f64::EPSILON {
         thresholds.push(current);
-        current += step;
+        current -= step;
     }
 
     thresholds

@@ -27,6 +27,7 @@ libc = "0.2"
 thiserror = "1.0"
 tempfile = "3.0"
 memmap2 = "0.9"
+quick_cache = "0.6"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -90,11 +90,12 @@ The project uses a **three-layer testing approach** that achieves comprehensive 
 - Run via: `cargo test -p starlings-core`
 
 **Layer 2: Python integration tests** (19 tests)
-- Unit tests with small datasets (< 1000 entities) for basic functionality 
+- Unit tests with small datasets (< 1000 entities) for basic functionality
 - E2E tests with production-scale datasets (100k-1M entities) for safety validation
 - Tests PyO3 wrapper functionality, type conversions, error handling
-- **SAFE**: All tests run with `STARLINGS_SAFETY_LEVEL=conservative`
+- **SAFE**: All tests run with `STARLINGS_MEMORY_LIMIT=50%`
 - Run via: `just test` (safe by default with production validation)
+- **IMPORTANT**: When running Python tests directly (not via `just`), always use `uv run pytest` to ensure correct virtual environment
 
 **Layer 3: Stress testing** (12+ tests)  
 - Memory pressure simulation, resource exhaustion scenarios
@@ -179,6 +180,23 @@ Comprehensive design documents are available in `docs/design/`:
 - **roadmap.md**: Detailed implementation plan with specific tasks
 
 These documents provide the complete technical specification for implementing Starlings from scratch.
+
+## Environment Variables
+
+Starlings supports several environment variables for configuration:
+
+- **`STARLINGS_MEMORY_LIMIT`**: Memory limit for all operations (default: 80% of RAM)
+  - Controls the maximum memory Starlings will use
+  - Can be specified as:
+    - Percentage: `50%`, `80%` (percentage of total system RAM)
+    - Absolute size: `10GB`, `4096MB`, `4096` (MB assumed if no unit)
+  - The partition cache has its own memory bounds (25% of total limit) with LRU eviction
+  - Cache memory is managed independently from operation memory limits
+  - This follows the DuckDB model where cache and query memory are separate
+  - Example: `STARLINGS_MEMORY_LIMIT=10GB` limits total usage to 10GB
+
+- **`STARLINGS_DEBUG`**: Enable debug output (0 or 1, default: 0)
+  - Set to 1 to enable detailed debug information during processing
 
 ## API Design
 
