@@ -33,7 +33,7 @@ pub fn generate_entity_resolution_edges(
     num_thresholds: Option<usize>,
 ) -> Vec<(u32, u32, f64)> {
     let mut rng = Rng::new();
-    let effective_n = if n % 2 == 0 { n } else { n - 1 };
+    let effective_n = if n.is_multiple_of(2) { n } else { n - 1 };
     let num_final_clusters = effective_n / 2;
 
     // Step 1: Design final cluster structure at threshold 0.0

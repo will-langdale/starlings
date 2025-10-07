@@ -597,7 +597,7 @@ impl PartitionHierarchy {
             }
 
             // Report progress for large datasets
-            if num_records > 1_000_000 && batch_end % 500_000 == 0 {
+            if num_records > 1_000_000 && batch_end.is_multiple_of(500_000) {
                 let progress = batch_end as f64 / num_records as f64;
                 eprintln!(
                     "      🔄 Reconstructing partition: {:.1}% ({:.1}M/{:.1}M records)",
