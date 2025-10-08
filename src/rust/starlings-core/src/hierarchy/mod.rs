@@ -1,5 +1,7 @@
 pub mod bitmap_pool;
 pub mod builder;
+pub mod incremental;
+pub mod memory_cache;
 pub mod merge_event;
 pub mod partition;
 pub mod storage;

@@ -16,6 +16,10 @@ rust:
 collection N="1":
     uv run python src/tests/benchmarks/test_bench_collections.py {{N}}
 
+# Benchmarks for analysis methods on EntityFrame
+analysis N="1":
+    uv run python src/tests/benchmarks/test_bench_analysis.py {{N}}
+
 # Randomised benchmarks for PGO training (prevents overfitting)
 pgo:
     uv run python src/tests/benchmarks/test_pgo_training.py

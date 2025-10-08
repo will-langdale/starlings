@@ -7,7 +7,7 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHasher;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 type FxDashMap<K, V> = DashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -19,6 +19,9 @@ pub struct DataContext {
     pub identity_map: FxDashMap<InternedRecord, u32>,
     pub source_index: FxDashMap<u32, RoaringBitmap>,
     next_record_id: AtomicU32,
+    /// Generation counter for cache invalidation
+    /// Incremented on any structural change (compaction, record addition, etc.)
+    generation: AtomicU64,
 }
 
 impl DataContext {
@@ -33,6 +36,16 @@ impl DataContext {
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(0)
+    }
+
+    /// Get the current generation for cache validation
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Increment generation to invalidate caches
+    pub fn increment_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Create DataContext with pre-allocated capacity for better performance
@@ -54,6 +67,7 @@ impl DataContext {
             identity_map: DashMap::with_capacity_and_hasher(estimated_records, hasher.clone()),
             source_index: DashMap::with_hasher(hasher),
             next_record_id: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -185,29 +199,24 @@ impl DataContext {
     /// # Errors
     /// Returns an error if the operation would exceed available system resources
     pub fn check_operation_safety(&self, estimated_records: usize) -> Result<(), String> {
-        use crate::core::safety::global_resource_monitor;
-        global_resource_monitor()
-            .check_operation_safety(estimated_records)
-            .map(|_| ())
+        use crate::core::safety::ensure_memory_safety;
+        // Estimate ~1MB per 1000 records as a rough approximation
+        let estimated_mb = (estimated_records / 1000).max(1) as u64;
+        ensure_memory_safety(estimated_mb).map_err(|e| e.to_string())
     }
 
     /// Check current memory pressure and return true if we should throttle
     pub fn should_throttle(&self) -> bool {
         use crate::core::safety::global_resource_monitor;
         let usage = global_resource_monitor().get_usage();
-        usage.is_memory_pressure || usage.is_cpu_pressure
+        !usage.memory_under_limit
     }
 
     /// Wait for resources if under pressure, with exponential backoff
     pub fn wait_for_resources(&self) {
         if self.should_throttle() {
-            use crate::core::safety::global_resource_monitor;
-            let limits = global_resource_monitor().get_adaptive_limits(1000);
-            if limits.delay_between_batches_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    limits.delay_between_batches_ms,
-                ));
-            }
+            // Simple delay when near memory limit
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
@@ -257,14 +266,28 @@ impl DataContext {
             .next_record_id
             .store(self.len() as u32, Ordering::Relaxed);
 
+        // Start with a fresh generation for the new context
+        new_context.generation.store(0, Ordering::Relaxed);
+
         new_context
     }
 
     /// Get adaptive batch size for current resource conditions
     pub fn get_adaptive_batch_size(&self, default_size: usize) -> usize {
         use crate::core::safety::global_resource_monitor;
-        let limits = global_resource_monitor().get_adaptive_limits(default_size);
-        limits.batch_size
+        let usage = global_resource_monitor().get_usage();
+
+        // Simple adaptive sizing: reduce batch size if near limit
+        // Always ensure at least 1 to avoid step_by(0) panic
+        let size = if !usage.memory_under_limit {
+            default_size / 4 // Quarter size when at limit
+        } else if usage.memory_percent > 60.0 {
+            default_size / 2 // Half size when getting close
+        } else {
+            default_size // Full size when plenty of headroom
+        };
+
+        size.max(1) // Never return 0
     }
 
     pub fn get_source_name(&self, source_id: u32) -> Option<String> {

@@ -60,11 +60,13 @@ ef.add_collection_from_entities("truth", truth_entities)
 
 # Analyse with composable expressions
 results = ef.analyse(
-    sl.col("splink").sweep(0.5, 0.95, 0.01),
-    sl.col("truth").at(1.0),
+    sl.col("splink").sweep(0.5, 0.95, 0.05),
+    sl.col("truth").at(1.0).reference(),  # Explicit reference for asymmetric metrics
     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision, sl.Metrics.eval.recall]
 )
-# Returns List[Dict]: [{"splink_threshold": 0.5, "truth_threshold": 1.0, "f1": 0.72, ...}, ...]
+# Returns DataFrame-friendly format:
+# [{"splink_threshold": 0.5, "truth_threshold": 1.0,
+#   "f1": 0.72, "precision": 0.68, "recall": 0.76}, ...]
 
 # Convert to polars for analysis
 df = pl.from_dicts(results)

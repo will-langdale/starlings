@@ -10,6 +10,7 @@ import time
 
 import pytest
 import starlings as sl
+from starlings import generators
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +26,6 @@ class TestPGOTrainingBenchmarks:
         """Set up debug logging for PGO profiling instrumentation."""
         logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
-    def _validate_jitter_diversity(
-        self, edges: list[tuple[int, int, float]], workload_desc: str
-    ) -> None:
-        """No longer needed - PGO focuses on interning and union-find."""
-        # PGO training exercises the actual collection building code paths
-        # Threshold diversity isn't relevant for optimising interning/union-find
-        pass
-
     def run_randomised_workload(
         self, seed: int | None, entity_count: int, size_desc: str
     ) -> None:
@@ -41,12 +34,10 @@ class TestPGOTrainingBenchmarks:
 
         start_time = time.perf_counter()
         # Use unified generator with automatic jitter for PGO
-        # (seed affects internal randomness)
-        edges = sl.generate_entity_resolution_edges(entity_count, num_thresholds=None)
+        # When num_thresholds=None (default), adds ±0.001 random jitter to thresholds
+        # This creates diverse threshold distributions for comprehensive PGO profiling
+        edges = generators.edges(entity_count)
         generation_time = time.perf_counter() - start_time
-
-        # Validate jitter diversity for PGO training effectiveness
-        self._validate_jitter_diversity(edges, size_desc)
 
         logger.info(
             f"   Generated ~{entity_count * 5:,} edges, {entity_count:,} entities "
@@ -120,9 +111,7 @@ class TestPGOTrainingBenchmarks:
 
             # Generate multiple samples to exercise diverse code paths
             for sample_idx in range(3):
-                edge_generator = sl.generate_entity_resolution_edges(
-                    entity_count, num_thresholds=None
-                )
+                edge_generator = generators.edges(entity_count)
 
                 # Build collection to exercise interning and union-find paths
                 start = time.monotonic()
@@ -169,9 +158,7 @@ class TestPGOTrainingBenchmarks:
             logger.info(f"\n🔍 Testing {description} (~{actual_edges:,} edges)")
 
             # Generate randomised graph using unified generator
-            edges = sl.generate_entity_resolution_edges(
-                entity_count, num_thresholds=None
-            )
+            edges = generators.edges(entity_count)
 
             start = time.perf_counter()
             sl.Collection.from_edges(edges, show_progress=False)

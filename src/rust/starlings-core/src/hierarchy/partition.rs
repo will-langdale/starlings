@@ -1,4 +1,15 @@
+use once_cell::sync::OnceCell;
 use roaring::RoaringBitmap;
+use std::fmt;
+use std::sync::Arc;
+
+/// Cached reverse index from record to entity
+pub struct RecordToEntityIndex {
+    /// Maps record index to entity index (None if record not in any entity)
+    pub index: Vec<Option<usize>>,
+    /// Generation when this index was built (for cache invalidation)
+    pub generation: u64,
+}
 
 /// Represents a partition at a specific threshold level
 ///
@@ -8,7 +19,7 @@ use roaring::RoaringBitmap;
 ///
 /// This structure includes pre-computed statistics like entity sizes for efficient access
 /// to common metrics without recomputation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PartitionLevel {
     /// The threshold value for this partition
     threshold: f64,
@@ -20,6 +31,10 @@ pub struct PartitionLevel {
     /// Pre-computed entity sizes for quick access
     /// Corresponds 1:1 with the entities vector
     entity_sizes: Vec<u32>,
+
+    /// Cached reverse index for O(1) record->entity lookup
+    /// Built lazily on first access
+    record_to_entity_cache: Arc<OnceCell<RecordToEntityIndex>>,
 }
 
 impl PartitionLevel {
@@ -37,7 +52,60 @@ impl PartitionLevel {
             threshold,
             entities,
             entity_sizes,
+            record_to_entity_cache: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Build reverse index mapping record indices to entity indices
+    fn build_record_to_entity_index(
+        &self,
+        num_records: usize,
+        generation: u64,
+    ) -> RecordToEntityIndex {
+        let mut index = vec![None; num_records];
+
+        for (entity_idx, entity_bitmap) in self.entities.iter().enumerate() {
+            for record_idx in entity_bitmap.iter() {
+                // Bounds check for safety after potential compaction
+                if (record_idx as usize) < num_records {
+                    index[record_idx as usize] = Some(entity_idx);
+                }
+            }
+        }
+
+        RecordToEntityIndex { index, generation }
+    }
+
+    /// Get the entity index for a given record (with generation tracking)
+    /// Returns None if record not in any entity or if cache is stale
+    pub fn get_entity_for_record_with_generation(
+        &self,
+        record_idx: usize,
+        num_records: usize,
+        current_generation: u64,
+    ) -> Option<usize> {
+        let cache = self
+            .record_to_entity_cache
+            .get_or_init(|| self.build_record_to_entity_index(num_records, current_generation));
+
+        // Check if cache is still valid
+        if cache.generation != current_generation {
+            // Cache is stale, would need to rebuild
+            // In production, we'd clear and rebuild here
+            return None;
+        }
+
+        cache.index.get(record_idx).copied().flatten()
+    }
+
+    /// Get or build the reverse index for this partition
+    pub fn get_record_to_entity_index(
+        &self,
+        num_records: usize,
+        generation: u64,
+    ) -> &RecordToEntityIndex {
+        self.record_to_entity_cache
+            .get_or_init(|| self.build_record_to_entity_index(num_records, generation))
     }
 
     /// Get the threshold for this partition
@@ -77,6 +145,31 @@ impl PartitionLevel {
         self.entities
             .iter()
             .position(|entity| entity.contains(record_id))
+    }
+
+    /// Estimate memory usage in bytes
+    pub fn memory_usage_bytes(&self) -> u64 {
+        let base_size = std::mem::size_of::<PartitionLevel>() as u64;
+        let entities_size: u64 = self
+            .entities
+            .iter()
+            .map(|b| b.serialized_size() as u64)
+            .sum();
+        base_size + entities_size
+    }
+}
+
+impl fmt::Debug for PartitionLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartitionLevel")
+            .field("threshold", &self.threshold)
+            .field("entities", &self.entities)
+            .field("entity_sizes", &self.entity_sizes)
+            .field(
+                "has_cached_index",
+                &self.record_to_entity_cache.get().is_some(),
+            )
+            .finish()
     }
 }
 

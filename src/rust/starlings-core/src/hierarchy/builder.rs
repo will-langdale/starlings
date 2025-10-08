@@ -1,4 +1,3 @@
-use lru::LruCache;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -7,11 +6,11 @@ use std::sync::Arc;
 type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
 
 use super::bitmap_pool::BitmapPool;
+use super::memory_cache::MemoryBoundedCache;
 use super::merge_event::MergeEvent;
 use super::partition::PartitionLevel;
 use super::storage::{DiskStorage, HierarchyStorage, HybridStorage, InMemoryStorage};
 use super::union_find::UnionFind;
-use crate::core::resource_monitor::ProcessingStrategy;
 use crate::core::DataContext;
 use crate::debug_println;
 
@@ -88,17 +87,16 @@ impl ComponentManager<'_> {
 pub struct PartitionHierarchy {
     pub context: Arc<DataContext>,
     storage: Box<dyn HierarchyStorage + Send + Sync>,
-    partition_cache: LruCache<u32, PartitionLevel>,
+    partition_cache: Arc<MemoryBoundedCache>,
     bitmap_pool: BitmapPool,
 }
 
 impl Clone for PartitionHierarchy {
     fn clone(&self) -> Self {
-        use std::num::NonZeroUsize;
         PartitionHierarchy {
             context: self.context.clone(),
             storage: self.storage.clone_box(),
-            partition_cache: LruCache::new(NonZeroUsize::new(Self::CACHE_SIZE).unwrap()), // Fresh cache for cloned hierarchy
+            partition_cache: self.partition_cache.clone(), // Share cache across clones
             bitmap_pool: BitmapPool::new(),
         }
     }
@@ -107,8 +105,6 @@ impl Clone for PartitionHierarchy {
 impl PartitionHierarchy {
     /// Fixed-point precision factor - supports up to 6 decimal places
     pub const PRECISION_FACTOR: f64 = 1_000_000.0;
-    /// Default LRU cache size
-    pub const CACHE_SIZE: usize = 10;
 
     /// Convert f64 threshold to u32 key for exact comparison and caching
     fn threshold_to_key(threshold: f64) -> u32 {
@@ -135,38 +131,55 @@ impl PartitionHierarchy {
             quantise
         );
 
+        // Calculate cache size based on global memory limit
+        let cache_size_bytes = {
+            use crate::core::safety::global_resource_monitor;
+            let monitor = global_resource_monitor();
+            let memory_limit_mb = monitor.get_memory_limit_mb();
+            // Use 25% of memory limit for cache, convert to bytes
+            (memory_limit_mb / 4) * 1024 * 1024
+        };
+
         if edges.is_empty() {
             // For empty edges, use simple in-memory storage regardless of strategy
             return Ok(Self {
                 context,
                 storage: Box::new(InMemoryStorage::new()),
-                partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+                partition_cache: Arc::new(MemoryBoundedCache::new(cache_size_bytes)),
                 bitmap_pool: BitmapPool::new(),
             });
         }
 
         let num_records = context.len();
 
-        // Determine storage strategy based on global ResourceMonitor
+        // Determine storage strategy based on dataset size and memory limit
         let storage: Box<dyn HierarchyStorage + Send + Sync> = {
             use crate::core::safety::global_resource_monitor;
-            match global_resource_monitor().determine_processing_strategy(num_records) {
-                ProcessingStrategy::InMemory { .. } => Box::new(InMemoryStorage::new()),
-                ProcessingStrategy::MemoryAware {
-                    spill_threshold_mb, ..
-                } => Box::new(HybridStorage::new(spill_threshold_mb * 1024 * 1024)),
-                ProcessingStrategy::Streaming { max_memory_mb, .. } => {
-                    // Use hybrid storage with very low threshold for streaming
-                    Box::new(HybridStorage::new(max_memory_mb * 1024 * 1024))
-                }
-                ProcessingStrategy::Insufficient { .. } => {
-                    // This should have been caught earlier, but fallback to disk storage
-                    debug_println!("   ⚠️  Insufficient resources detected, using disk storage");
-                    Box::new(
-                        DiskStorage::new()
-                            .map_err(|e| format!("Failed to create disk storage: {}", e))?,
-                    )
-                }
+            let monitor = global_resource_monitor();
+            let memory_limit_mb = monitor.get_memory_limit_mb();
+
+            // Estimate memory needed for the full hierarchy construction.
+            // This is a rough heuristic. A more accurate estimate would be based on
+            // the number of edges and records.
+            // Let's use ~150 bytes per edge as a conservative estimate for the hierarchy.
+            let estimated_mb = (edges.len() as u64 * 150) / (1024 * 1024);
+
+            if estimated_mb < memory_limit_mb / 4 {
+                // Use in-memory storage if estimate is < 25% of limit
+                debug_println!("   ✅ Small dataset detected, using in-memory storage");
+                Box::new(InMemoryStorage::new())
+            } else if estimated_mb < memory_limit_mb / 2 {
+                // Use hybrid storage if estimate is < 50% of limit
+                let spill_threshold_bytes = (memory_limit_mb / 4) * 1024 * 1024;
+                debug_println!("   🔶 Medium dataset detected, using hybrid storage");
+                Box::new(HybridStorage::new(spill_threshold_bytes))
+            } else {
+                // Use disk storage for large datasets
+                debug_println!("   ⚠️  Large dataset detected, using disk storage");
+                Box::new(
+                    DiskStorage::new()
+                        .map_err(|e| format!("Failed to create disk storage: {}", e))?,
+                )
             }
         };
 
@@ -213,7 +226,7 @@ impl PartitionHierarchy {
         let mut temp_hierarchy = Self {
             context: context.clone(),
             storage,
-            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            partition_cache: Arc::new(MemoryBoundedCache::new(cache_size_bytes)),
             bitmap_pool: BitmapPool::new_for_scale(num_edges),
         };
 
@@ -235,18 +248,10 @@ impl PartitionHierarchy {
         let union_find_time = union_find_start.elapsed();
 
         // Reuse the bitmap pool from temporary instance for efficiency
-        // Calculate adaptive cache size based on available memory from global monitor
-        let cache_size = {
-            use crate::core::safety::global_resource_monitor;
-            let usage = global_resource_monitor().get_usage();
-            // 1 cache entry per 100MB available memory, bounded between 5 and 100
-            (usage.memory_available_mb / 100).clamp(5, 100) as usize
-        };
-
         let result = Self {
             context,
             storage: temp_hierarchy.storage,
-            partition_cache: LruCache::new(cache_size.try_into().unwrap()),
+            partition_cache: Arc::new(MemoryBoundedCache::new(cache_size_bytes)),
             bitmap_pool: temp_hierarchy.bitmap_pool,
         };
 
@@ -430,16 +435,25 @@ impl PartitionHierarchy {
             storage.push(event).unwrap();
         }
 
+        // Calculate cache size based on global memory limit
+        let cache_size_bytes = {
+            use crate::core::safety::global_resource_monitor;
+            let monitor = global_resource_monitor();
+            let memory_limit_mb = monitor.get_memory_limit_mb();
+            // Use 25% of memory limit for cache, convert to bytes
+            (memory_limit_mb / 4) * 1024 * 1024
+        };
+
         Self {
             context,
             storage,
-            partition_cache: LruCache::new(Self::CACHE_SIZE.try_into().unwrap()),
+            partition_cache: Arc::new(MemoryBoundedCache::new(cache_size_bytes)),
             bitmap_pool: BitmapPool::new(),
         }
     }
 
     /// Get a partition at a specific threshold
-    pub fn at_threshold(&mut self, threshold: f64) -> &PartitionLevel {
+    pub fn at_threshold(&self, threshold: f64) -> Arc<PartitionLevel> {
         // Validate threshold
         assert!(
             (0.0..=1.0).contains(&threshold),
@@ -449,9 +463,9 @@ impl PartitionHierarchy {
 
         let key = Self::threshold_to_key(threshold);
 
-        // Check if already cached
-        if self.partition_cache.contains(&key) {
-            return self.partition_cache.get(&key).unwrap();
+        // Check if already in cache (lock-free read)
+        if let Some(partition) = self.partition_cache.get(&key) {
+            return partition;
         }
 
         // Reconstruct the partition
@@ -459,9 +473,11 @@ impl PartitionHierarchy {
             .reconstruct_at_threshold(threshold)
             .expect("Storage iteration failed during partition reconstruction");
 
-        // Store in cache and return reference
-        self.partition_cache.put(key, partition);
-        self.partition_cache.get(&key).unwrap()
+        // Wrap in Arc and store in cache (lock-free insert)
+        let partition_arc = Arc::new(partition);
+        self.partition_cache.insert(key, partition_arc.clone());
+
+        partition_arc
     }
 
     /// Reconstruct a partition at a specific threshold with streaming processing
@@ -581,7 +597,7 @@ impl PartitionHierarchy {
             }
 
             // Report progress for large datasets
-            if num_records > 1_000_000 && batch_end % 500_000 == 0 {
+            if num_records > 1_000_000 && batch_end.is_multiple_of(500_000) {
                 let progress = batch_end as f64 / num_records as f64;
                 eprintln!(
                     "      🔄 Reconstructing partition: {:.1}% ({:.1}M/{:.1}M records)",
@@ -596,6 +612,79 @@ impl PartitionHierarchy {
         let entities: Vec<RoaringBitmap> = entities_map.into_values().collect();
 
         Ok(PartitionLevel::new(threshold, entities))
+    }
+
+    /// Build multiple partitions using incremental reconstruction for efficiency
+    pub fn build_partitions_incrementally(&self, thresholds: &[f64]) -> Vec<Arc<PartitionLevel>> {
+        use super::incremental::IncrementalPartitionBuilder;
+
+        // Use incremental builder for multiple thresholds
+        let mut builder = IncrementalPartitionBuilder::new(self.context.clone());
+
+        // Build all partitions incrementally
+        let partitions = builder
+            .build_multiple(thresholds, self.storage.as_ref())
+            .expect("Incremental partition building failed");
+
+        // Store all partitions in cache
+        for (i, &threshold) in thresholds.iter().enumerate() {
+            let key = Self::threshold_to_key(threshold);
+            self.partition_cache.insert(key, partitions[i].clone());
+        }
+
+        partitions
+    }
+
+    /// Get merge events between two thresholds (exclusive of start, inclusive of end)
+    /// Returns events in descending threshold order (HIGH to LOW)
+    ///
+    /// # Arguments
+    /// * `from_threshold` - Starting threshold (higher value, exclusive)
+    /// * `to_threshold` - Ending threshold (lower value, inclusive)
+    ///
+    /// # Returns
+    /// Vector of MergeEvents that occur between the thresholds
+    pub fn get_merge_events_between(
+        &self,
+        from_threshold: f64,
+        to_threshold: f64,
+    ) -> Result<Vec<MergeEvent>, String> {
+        assert!(
+            from_threshold >= to_threshold,
+            "from_threshold ({}) must be >= to_threshold ({})",
+            from_threshold,
+            to_threshold
+        );
+
+        let mut events = Vec::new();
+
+        // Iterate through merge events (they're in descending threshold order)
+        for merge in self
+            .storage
+            .iter()
+            .map_err(|e| format!("Storage iteration error: {}", e))?
+        {
+            // Skip events at or above the starting threshold (exclusive)
+            if merge.threshold >= from_threshold {
+                continue;
+            }
+
+            // Include events above the ending threshold (inclusive of end)
+            if merge.threshold > to_threshold {
+                events.push(merge);
+            } else {
+                // We've passed the ending threshold, can stop
+                break;
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Get a reference to the storage backend (for incremental builder)
+    #[cfg(test)]
+    pub(crate) fn storage(&self) -> &dyn HierarchyStorage {
+        self.storage.as_ref()
     }
 }
 
@@ -834,7 +923,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.0, all records should be in one entity
         let partition = hierarchy.at_threshold(0.0);
@@ -860,7 +949,7 @@ mod tests {
             (1, 2, 0.6), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 1.0, each record should be a singleton
         let partition = hierarchy.at_threshold(1.0);
@@ -885,7 +974,7 @@ mod tests {
             (1, 2, 0.4), // B-C
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.5, A-B should be merged but C separate
         let partition = hierarchy.at_threshold(0.5);
@@ -920,7 +1009,7 @@ mod tests {
             (1, 2, 0.6), // Connect 1-2
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.5, should have:
         // - One entity with {0, 1, 2}
@@ -945,7 +1034,7 @@ mod tests {
 
         let edges = vec![(0, 1, 0.8), (1, 2, 0.6)];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // First access - should reconstruct
         let partition1 = hierarchy.at_threshold(0.7);
@@ -973,7 +1062,7 @@ mod tests {
     fn test_invalid_threshold_negative() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should panic with negative threshold
         hierarchy.at_threshold(-0.1);
@@ -984,7 +1073,7 @@ mod tests {
     fn test_invalid_threshold_too_large() {
         let ctx = create_test_context();
         let edges = vec![(0, 1, 0.5)];
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Should panic with threshold > 1.0
         hierarchy.at_threshold(1.1);
@@ -1007,7 +1096,7 @@ mod tests {
             (4, 5, 0.9), // E-F
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // At threshold 0.9, should have 3 components (3 pairs)
         let partition = hierarchy.at_threshold(0.9);
@@ -1055,7 +1144,7 @@ mod tests {
             (6, 7, 0.7), // Pair 4 (lowest threshold)
         ];
 
-        let mut hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
 
         // Test hierarchical behaviour
         let partition_high = hierarchy.at_threshold(0.95);
@@ -1110,7 +1199,7 @@ mod tests {
         ];
 
         // Test with quantise=2 (2 decimal places)
-        let mut hierarchy =
+        let hierarchy =
             PartitionHierarchy::from_edges(edges.clone(), ctx.clone(), 2, None).unwrap();
 
         let partition_high = hierarchy.at_threshold(0.9);

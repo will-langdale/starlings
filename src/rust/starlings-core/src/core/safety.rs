@@ -1,39 +1,33 @@
 //! Global resource safety module for all public API functions.
 //!
-//! Provides a single, globally-accessible safety barrier that prevents
-//! dangerous memory allocations across the entire Starlings API surface.
-//! Uses the same conservative safety levels and DuckDB-style error messages
-//! as the original DataContext-based safety system.
+//! Provides a simple memory limit check following DuckDB's approach.
+//! Uses a single STARLINGS_MEMORY_LIMIT environment variable that defaults
+//! to 80% of total system RAM.
 
 use crate::core::resource_monitor::{ResourceMonitor, SafetyError};
 use std::sync::OnceLock;
 
 /// Global resource monitor singleton.
-///
-/// This is initialized lazily on first access using ResourceMonitor::from_env(),
-/// which respects STARLINGS_SAFETY_LEVEL environment variable for configuration.
 static GLOBAL_RESOURCE_MONITOR: OnceLock<ResourceMonitor> = OnceLock::new();
 
 /// Global memory safety check for all public API functions.
 ///
-/// Ensures operations respect system resource limits using the same
-/// conservative safety levels as Collection.from_edges(). This provides
-/// a universal safety barrier that prevents system crashes from memory
-/// exhaustion across all public functions.
+/// Ensures operations respect the memory limit using a simple DuckDB-style
+/// approach. This provides a universal safety barrier that prevents system
+/// crashes from memory exhaustion.
 ///
 /// # Arguments
 /// * `estimated_mb` - Estimated memory consumption in megabytes
 ///
 /// # Returns
 /// * `Ok(())` if operation is safe to proceed
-/// * `Err(SafetyError)` if operation would exceed safety limits
+/// * `Err(SafetyError)` if operation would exceed memory limit
 ///
-/// # Safety Levels
-/// Respects STARLINGS_SAFETY_LEVEL environment variable:
-/// * Conservative (default): Max 50% RAM usage
-/// * Balanced: Max 70% RAM usage  
-/// * Performance: Max 85% RAM usage
-/// * Unsafe: Max 95% RAM usage (requires STARLINGS_UNSAFE=1)
+/// # Memory Limit
+/// Respects STARLINGS_MEMORY_LIMIT environment variable:
+/// * Can be a percentage: "50%", "80%"
+/// * Can be absolute: "10GB", "4096MB", "4096" (MB assumed)
+/// * Default: 80% of total system RAM
 ///
 /// # Example
 /// ```rust
@@ -46,21 +40,24 @@ static GLOBAL_RESOURCE_MONITOR: OnceLock<ResourceMonitor> = OnceLock::new();
 ///         let data = vec![0u8; 100 * 1024 * 1024];
 ///     },
 ///     Err(e) => {
-///         // Operation would exceed safety limits
-///         eprintln!("Safety check failed: {}", e);
+///         // Operation would exceed memory limit
+///         eprintln!("Memory check failed: {}", e);
 ///     }
 /// }
 /// ```
 pub fn ensure_memory_safety(estimated_mb: u64) -> Result<(), SafetyError> {
-    let monitor = GLOBAL_RESOURCE_MONITOR.get_or_init(ResourceMonitor::from_env);
-    monitor.can_proceed(estimated_mb).map(|_| ())
+    let monitor = GLOBAL_RESOURCE_MONITOR.get_or_init(|| {
+        crate::debug_println!("🔧 Initializing global ResourceMonitor from environment");
+        ResourceMonitor::from_env()
+    });
+    monitor.can_proceed(estimated_mb)
 }
 
 /// Get global resource monitor for advanced usage.
 ///
 /// Provides access to the global ResourceMonitor instance for operations
 /// that need more detailed resource information beyond simple safety checks.
-/// The monitor is initialized lazily on first access.
+/// The monitor is initialised lazily on first access.
 ///
 /// # Returns
 /// Reference to the global ResourceMonitor singleton
@@ -72,15 +69,18 @@ pub fn ensure_memory_safety(estimated_mb: u64) -> Result<(), SafetyError> {
 /// let monitor = global_resource_monitor();
 /// let usage = monitor.get_usage();
 /// println!("Current memory usage: {}MB", usage.memory_used_mb);
+/// println!("Memory limit: {}MB", usage.memory_limit_mb);
 /// ```
 pub fn global_resource_monitor() -> &'static ResourceMonitor {
-    GLOBAL_RESOURCE_MONITOR.get_or_init(ResourceMonitor::from_env)
+    GLOBAL_RESOURCE_MONITOR.get_or_init(|| {
+        crate::debug_println!("🔧 Initializing global ResourceMonitor from environment");
+        ResourceMonitor::from_env()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_ensure_memory_safety_small_allocation() {
@@ -97,28 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn test_safety_respects_environment() {
-        // Test that safety level is read from environment
-        env::set_var("STARLINGS_SAFETY_LEVEL", "performance");
-
-        // This should not fail with a fresh monitor
-        // (Note: This test may be flaky depending on system resources)
-        let result = ensure_memory_safety(100);
-
-        // Clean up
-        env::remove_var("STARLINGS_SAFETY_LEVEL");
-
-        // We can't assert success/failure as it depends on system state,
-        // but we can verify the function doesn't panic
-        drop(result);
-    }
-
-    #[test]
     fn test_massive_allocation_rejected() {
         // Allocation larger than any reasonable system should be rejected
         let result = ensure_memory_safety(1_000_000); // 1TB
         match result {
-            Err(SafetyError::InsufficientResources { .. }) => {
+            Err(SafetyError::InsufficientMemory { .. }) => {
                 // Expected - this should be rejected
             }
             _ => {

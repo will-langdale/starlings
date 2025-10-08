@@ -13,6 +13,10 @@ pyo3 = { version = "0.26", features = ["extension-module"] }
 rustc-hash = "2.0"
 rayon = "1.10"
 num_cpus = "1.16"
+roaring = "0.10"
+
+[dev-dependencies]
+roaring = "0.10"
 
 [features]
 # Extension module is always enabled for this crate

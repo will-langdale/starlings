@@ -33,7 +33,7 @@ pub fn generate_entity_resolution_edges(
     num_thresholds: Option<usize>,
 ) -> Vec<(u32, u32, f64)> {
     let mut rng = Rng::new();
-    let effective_n = if n % 2 == 0 { n } else { n - 1 };
+    let effective_n = if n.is_multiple_of(2) { n } else { n - 1 };
     let num_final_clusters = effective_n / 2;
 
     // Step 1: Design final cluster structure at threshold 0.0
@@ -403,18 +403,11 @@ mod tests {
             context.ensure_record("test", Key::U32(i as u32));
         }
 
-        println!("Generated {} edges for {} entities", edges.len(), n);
-        let mut hierarchy =
-            PartitionHierarchy::from_edges(edges, Arc::new(context), 6, None).unwrap();
+        let hierarchy = PartitionHierarchy::from_edges(edges, Arc::new(context), 6, None).unwrap();
 
         // Test entity counts at key thresholds
         let entities_at_1_0 = hierarchy.at_threshold(1.0).entities().len();
         let entities_at_0_0 = hierarchy.at_threshold(0.0).entities().len();
-
-        println!(
-            "Entities at 1.0: {}, Entities at 0.0: {}",
-            entities_at_1_0, entities_at_0_0
-        );
 
         // Should have exactly n entities at 1.0 and n/2 entities at 0.0
         assert_eq!(

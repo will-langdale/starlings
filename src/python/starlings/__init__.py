@@ -48,12 +48,11 @@ from typing import Any, cast
 from tqdm import tqdm
 
 from .config import DEBUG_ENABLED
+from .expressions import col
+from .metrics import Metrics
 from .starlings import Collection as PyCollection
 from .starlings import EntityFrame as PyEntityFrame
 from .starlings import Partition as PyPartition
-from .starlings import (
-    generate_entity_resolution_edges as _generate_entity_resolution_edges,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -61,71 +60,16 @@ logger = logging.getLogger(__name__)
 _DEBUG_ENABLED = DEBUG_ENABLED
 
 
-def generate_entity_resolution_edges(
-    n: int, num_thresholds: int | None = None
-) -> list[tuple[int, int, float]]:
-    """Generate entity resolution edges using the unified constructive algorithm.
-
-    ⚠️  **Memory Warning**: This function pre-allocates ~n*5 edges in memory
-    (approximately n*750 bytes). Large values of n may be rejected by the
-    safety system to prevent system crashes.
-
-    Creates realistic entity resolution test data following a constructive approach
-    that produces exactly n/2 entities at threshold 0.0 through systematic pair
-    construction, with realistic hierarchical patterns for benchmarking.
-
-    **Safety**: Respects STARLINGS_SAFETY_LEVEL environment variable:
-    - Conservative (default): Max 50% RAM usage
-    - Performance: Max 85% RAM usage
-
-    Args:
-        n: Target number of entities for sizing. Large values (>1M) may require
-            STARLINGS_SAFETY_LEVEL=performance or more system memory.
-            Algorithm uses effective_n where effective_n = n if n is even, n-1 if
-            n is odd.
-        num_thresholds: If provided, snap thresholds to discrete values;
-            if None, add continuous jitter for PGO training diversity
-
-    Returns:
-        List of (entity_id1, entity_id2, threshold) tuples with entity IDs as integers
-        and thresholds between 0.0 and 1.0
-
-    Raises:
-        MemoryError: If estimated memory usage exceeds safety limits
-
-    Algorithm:
-        Implements the 5-step constructive approach:
-        1. Create n/2 pairs of entities with high thresholds (>0.9) for merging
-        2. Add noise edges within pairs for density and realistic patterns
-        3. Apply jitter (continuous) or discrete threshold snapping
-        4. Remove duplicate edges and shuffle for randomization
-
-        Guarantees: exactly effective_n/2 entities at threshold 0.0
-
-    Example:
-        ```python
-        # Generate dataset with PGO jitter for training
-        edges = generate_entity_resolution_edges(100_000)
-        collection = Collection.from_edges(edges)
-
-        # Key guarantee: exactly n/2 entities at threshold 0.0
-        assert collection.at(0.0).num_entities == 50_000
-
-        # Generate dataset with discrete thresholds for testing
-        edges = generate_entity_resolution_edges(100_000, num_thresholds=10)
-
-        # For large datasets, you may need performance mode
-        import os
-
-        os.environ["STARLINGS_SAFETY_LEVEL"] = "performance"
-        edges = generate_entity_resolution_edges(5_000_000)  # 5M entities
-        ```
-    """
-    result = _generate_entity_resolution_edges(n, num_thresholds)
-    return result  # type: ignore[no-any-return]
-
-
 __version__ = version("starlings")
+
+__all__ = [
+    "Collection",
+    "EntityFrame",
+    "Partition",
+    "Metrics",
+    "col",
+    "Key",
+]
 
 Key = Any
 
@@ -556,6 +500,101 @@ class EntityFrame:
         """
         rust_collection = self._frame.__getitem__(name)
         return Collection(rust_collection)
+
+    def analyse(
+        self, *expressions: Any, metrics: list[Any] | None = None
+    ) -> list[dict[str, float]]:
+        """Universal analysis method using expressions.
+
+        Always returns List[Dict[str, float]] where each dict represents one
+        measurement.
+
+        This uniform format works seamlessly with DataFrame libraries.
+
+        Args:
+            *expressions: One or more sl.col() expressions
+            metrics: List of metrics to compute. If None, defaults are:
+                    - For comparisons (2+ collections): f1, precision, recall
+                    - For single collection: entity_count, entropy
+
+        Returns:
+            List[Dict[str, float]]: Uniform format regardless of operation:
+            - Point comparisons: Single dict in list
+            - Sweeps: One dict per threshold point
+            - Mixed operations: Cartesian product of sweep points
+
+            Dictionary keys:
+            - "{collection}_threshold" for all threshold values
+            - Direct metric names ("f1", "precision", "recall", etc.)
+
+        Example:
+            ```python
+            # Point comparison
+            >>> result = ef.analyse(
+            ...     sl.col("splink").at(0.85),
+            ...     sl.col("truth").at(1.0),
+            ...     metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision]
+            ... )
+            [{"splink_threshold": 0.85, "truth_threshold": 1.0, "f1": 0.92, ...}]
+
+            # Single collection sweep
+            >>> result = ef.analyse(
+            ...     sl.col("splink").sweep(0.7, 0.9, 0.1),
+            ...     metrics=[sl.Metrics.stats.entity_count]
+            ... )
+            [{"splink_threshold": 0.7, "entity_count": 1250},
+             {"splink_threshold": 0.8, "entity_count": 980},
+             {"splink_threshold": 0.9, "entity_count": 750}]
+
+            # Easy DataFrame conversion
+            >>> import polars as pl
+            >>> df = pl.from_dicts(result)
+            ```
+        """
+        # Calculate total operations for progress bar
+        # This requires introspecting the expressions to count threshold combinations
+        num_combinations = 1
+        for expr in expressions:
+            # Check if expression is a sweep by looking for _sweep attribute
+            if hasattr(expr, "_sweep") and expr._sweep:
+                # Calculate number of points in sweep
+                start, stop, step = expr._sweep
+                num_points = int((stop - start) / step) + 1
+                num_combinations *= num_points
+            else:
+                # Point expression contributes factor of 1
+                num_combinations *= 1
+
+        # Determine number of metrics (use defaults if None)
+        if metrics is not None:
+            num_metrics = len(metrics)
+        else:
+            # Default metrics based on number of expressions
+            num_metrics = 3 if len(expressions) >= 2 else 2
+
+        total_operations = num_combinations * num_metrics
+
+        # Create progress bar
+        progress_bar = tqdm(
+            total=total_operations,
+            desc="Analysing",
+            unit="ops",
+            unit_scale=True,
+        )
+
+        def progress_callback(progress: float, message: str) -> None:
+            progress_bar.set_description(f"Analysing - {message}")
+            progress_bar.n = int(progress * total_operations)
+            progress_bar.refresh()
+
+        try:
+            result = self._frame.analyse(
+                *expressions, metrics=metrics, progress_callback=progress_callback
+            )
+        finally:
+            progress_bar.close()
+
+        return result  # type: ignore[no-any-return]
 
     def __repr__(self) -> str:
         """String representation for debugging."""

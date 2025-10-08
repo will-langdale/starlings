@@ -808,6 +808,96 @@ pub struct SparseEdgeList {
 }
 ```
 
+## Cross-collection comparison algorithms
+
+### Algorithm selection strategy
+
+When comparing collections, we have two distinct algorithms optimised for different scenarios.
+
+**Reference collection handling for asymmetric metrics**:
+When computing asymmetric metrics (precision, recall, F1), one collection must be designated as the reference (ground truth). The algorithms handle this by:
+- Building the contingency table with reference collection as rows, predictions as columns
+- Computing metrics with correct directionality based on this structure
+- The API layer determines which collection is the reference (explicit via `.reference()` or implicit as last expression)
+
+**Delta-based algorithm** (incremental updates)
+- **Complexity**: O(k) updates between adjacent thresholds where k = affected entities
+- **Best for**: Single collection operations and single-dimension changes
+- **Use cases**:
+  - Single collection sweep: Incremental updates between thresholds
+  - Sweep × point comparison: One collection fixed, one sweeping
+
+**Record-based algorithm** (full record iteration)
+- **Complexity**: O(r) where r = number of records
+- **Best for**: Cartesian product comparisons (sweep × sweep)
+- **Key insight**: Collections in an EntityFrame share the same underlying record space
+- **Performance**: 1000-10000× speedup for large-scale comparisons
+
+### The shared record space insight
+
+Collections in an EntityFrame partition the exact same set of records:
+- Each record appears in exactly one entity in collection A
+- The same record appears in exactly one entity in collection B
+- We're comparing different ways of partitioning the same space
+
+This enables building contingency tables by iterating records rather than comparing entity pairs.
+
+### Complexity analysis
+
+For cross-collection comparison at single thresholds:
+
+**Entity-based approach** (traditional):
+- Time: O(k₁ × k₂) entity comparisons
+- Example: 800k × 800k entities = 640 billion operations
+
+**Record-based approach** (optimised):
+- Time: O(r) record iterations + O(k₁ + k₂) marginals
+- Example: 1M records = 1 million operations
+- Speedup: 640,000× theoretical, 1000-10000× practical
+
+### Record-based algorithm structure
+
+```rust
+pub fn from_partitions_via_records(
+    prediction: &PartitionLevel,
+    reference: &PartitionLevel,
+    context: &DataContext,
+) -> SparseContingencyTable {
+    // Build reverse indices: record → entity
+    let record_to_entity_pred = build_reverse_index(prediction);
+    let record_to_entity_ref = build_reverse_index(reference);
+
+    // Single pass over records (parallelisable)
+    let pairs: Vec<(EntityId, EntityId)> = (0..num_records)
+        .into_par_iter()
+        .filter_map(|record_idx| {
+            match (record_to_entity_pred[record_idx], record_to_entity_ref[record_idx]) {
+                (Some(pred_entity), Some(ref_entity)) => Some((pred_entity, ref_entity)),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Aggregate into contingency table
+    // Reference is rows, prediction is columns for correct metric computation
+    build_contingency_table(pairs, prediction, reference)
+}
+```
+
+### When to use each algorithm
+
+```
+if both expressions are sweeps:
+    use record-based  # O(r) beats O(k₁ × k₂ × n₁ × n₂)
+else:
+    use delta-based   # O(k) incremental updates sufficient
+```
+
+For a 5×5 sweep comparison (25 total comparisons):
+- Delta-based: 80k × 80k × 25 = 160 billion operations
+- Record-based: 1M records × 1 pass = 1 million operations
+- Speedup: 160,000×
+
 ## Dual processing for entity operations
 
 ### Built-in operations with parallel Rust execution

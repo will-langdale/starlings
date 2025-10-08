@@ -39,8 +39,6 @@ jobs:
   test-os:
     name: test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    env:
-      STARLINGS_SAFETY_LEVEL: performance
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -69,6 +67,9 @@ jobs:
 
     - name: Run Python tests
       run: just test python
+      env:
+        STARLINGS_MEMORY_LIMIT: ${{ matrix.os == 'macos-latest' && '2GB' || '50%' }}
+        STARLINGS_DEBUG: '1'
     
     - name: Run Rust tests
       run: just test rust

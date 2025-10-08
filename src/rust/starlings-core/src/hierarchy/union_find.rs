@@ -25,8 +25,8 @@ pub struct MmapBackend {
     _file: std::fs::File, // Keep file handle alive
 }
 
-/// Union-Find (Disjoint Set Union) data structure with pluggable backends
-/// Optimised for cache locality and performance
+/// Union-Find (Disjoint Set Union) data structure with pluggable backends.
+/// Optimised for cache locality and performance with path halving and union by rank.
 #[derive(Debug)]
 pub struct UnionFind<B: UnionFindBackend> {
     backend: B,
@@ -147,9 +147,17 @@ impl UnionFind<MmapBackend> {
     }
 }
 
+impl<B: UnionFindBackend + Clone> Clone for UnionFind<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+        }
+    }
+}
+
 impl<B: UnionFindBackend> UnionFind<B> {
-    /// Find the root of the set containing element x with path halving
-    /// Path halving provides better cache behaviour than full path compression
+    /// Find the root of the set containing element x with path halving.
+    /// Path halving provides better cache behaviour than full path compression.
     #[inline(always)]
     pub fn find(&mut self, mut x: usize) -> usize {
         debug_assert!(x < self.backend.size());

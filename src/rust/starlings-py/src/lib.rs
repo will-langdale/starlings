@@ -2,11 +2,42 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyType};
 use std::sync::Arc;
 
+mod expressions;
+use expressions::{parse_expression, parse_metric};
+use starlings_core::expressions::{
+    compute_single_metric, generate_sweep_thresholds, ExpressionType, MetricType,
+};
+use starlings_core::metrics::{CoreMetricType, MetricEngine, MetricResults};
+
 use starlings_core::core::ensure_memory_safety;
-use starlings_core::core::resource_monitor::{AdaptiveLimits, ProcessingStrategy, SafetyError};
+use starlings_core::core::resource_monitor::SafetyError;
 use starlings_core::debug_println;
 use starlings_core::test_utils;
 use starlings_core::{DataContext, EntityFrame, Key, PartitionHierarchy, PartitionLevel};
+
+/// Convert threshold to cache key using fixed-point representation
+/// This ensures consistent cache keys for floating point thresholds
+#[inline]
+fn threshold_to_cache_key(threshold: f64) -> u64 {
+    (threshold * 1_000_000.0).round() as u64
+}
+
+/// Convert MetricType to CoreMetricType
+#[allow(dead_code)]
+fn convert_metric_type(metric: &MetricType) -> CoreMetricType {
+    match metric {
+        MetricType::F1 => CoreMetricType::F1,
+        MetricType::Precision => CoreMetricType::Precision,
+        MetricType::Recall => CoreMetricType::Recall,
+        MetricType::ARI => CoreMetricType::ARI,
+        MetricType::NMI => CoreMetricType::NMI,
+        MetricType::VMeasure => CoreMetricType::VMeasure,
+        MetricType::BCubedPrecision => CoreMetricType::BCubedPrecision,
+        MetricType::BCubedRecall => CoreMetricType::BCubedRecall,
+        MetricType::EntityCount => CoreMetricType::EntityCount,
+        MetricType::Entropy => CoreMetricType::Entropy,
+    }
+}
 
 /// Progress callback type for Rust-level progress reporting
 type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
@@ -15,31 +46,11 @@ type ProgressCallback = Arc<dyn Fn(f64, &str) + Send + Sync>;
 fn create_progress_wrapper(callback: Py<pyo3::PyAny>) -> ProgressCallback {
     Arc::new(move |progress: f64, message: &str| {
         Python::attach(|py| {
-            if let Err(e) = callback.call1(py, (progress, message)) {
-                eprintln!("Progress callback error: {}", e);
+            if let Err(_e) = callback.call1(py, (progress, message)) {
+                // Progress callback error - silently continue
             }
         });
     })
-}
-
-/// Helper function to get strategy message with thread information
-fn get_strategy_message(strategy: &ProcessingStrategy) -> String {
-    let thread_count = rayon::current_num_threads();
-    let base_msg = match strategy {
-        ProcessingStrategy::InMemory { .. } => "In-memory processing",
-        ProcessingStrategy::MemoryAware { should_spill, .. } => {
-            if *should_spill {
-                "Memory-aware processing with disk spilling"
-            } else {
-                "Memory-aware processing"
-            }
-        }
-        ProcessingStrategy::Streaming { .. } => "Streaming with aggressive disk spilling",
-        ProcessingStrategy::Insufficient { .. } => {
-            unreachable!("Should have been caught earlier")
-        }
-    };
-    format!("{} ({} threads)", base_msg, thread_count)
 }
 
 /// Helper function to map storage errors to Python exceptions
@@ -50,50 +61,14 @@ fn map_storage_error(error: String) -> PyErr {
 /// Helper function to map safety errors to Python exceptions
 fn map_safety_error(error: SafetyError) -> PyErr {
     match error {
-        SafetyError::CircuitOpen(msg) => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            format!("Circuit breaker tripped: {}", msg),
-        ),
-        SafetyError::InsufficientResources(msg) => {
-            PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
-                "Insufficient resources: {}",
-                msg
-            ))
-        }
-        SafetyError::OperationTooLarge(msg) => {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Operation too large: {}", msg))
-        }
-    }
-}
-
-/// Extract batch size from any processing strategy
-fn extract_batch_size(strategy: &ProcessingStrategy) -> usize {
-    match strategy {
-        ProcessingStrategy::InMemory { batch_size, .. }
-        | ProcessingStrategy::MemoryAware { batch_size, .. }
-        | ProcessingStrategy::Streaming { batch_size, .. } => *batch_size,
-        ProcessingStrategy::Insufficient { .. } => unreachable!(),
-    }
-}
-
-/// Check if strategy requires streaming processing
-fn requires_streaming(strategy: &ProcessingStrategy) -> bool {
-    matches!(strategy, ProcessingStrategy::Streaming { .. })
-}
-
-/// Report resource warnings if present
-fn report_resource_warnings(
-    adaptive_limits: &AdaptiveLimits,
-    progress_callback: &Option<ProgressCallback>,
-) {
-    if let Some(warning) = &adaptive_limits.memory_warning {
-        if let Some(ref callback) = progress_callback {
-            callback(0.25, warning);
-        }
-    }
-    if let Some(warning) = &adaptive_limits.disk_warning {
-        if let Some(ref callback) = progress_callback {
-            callback(0.26, warning);
-        }
+        SafetyError::InsufficientMemory {
+            required_mb,
+            available_mb,
+            limit_mb,
+        } => PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
+            "Operation requires {}MB but only {}MB available (limit: {}MB). Consider: 1) Smaller dataset, 2) Free memory, 3) Increase STARLINGS_MEMORY_LIMIT",
+            required_mb, available_mb, limit_mb
+        )),
     }
 }
 
@@ -128,7 +103,7 @@ impl EdgeGenerator {
 #[pyclass(name = "Partition")]
 #[derive(Clone)]
 pub struct PyPartition {
-    partition: PartitionLevel,
+    partition: Arc<PartitionLevel>,
 }
 
 #[pymethods]
@@ -226,8 +201,9 @@ impl PyCollection {
         let source_name = source.unwrap_or_else(|| "default".to_string());
 
         // Pre-flight safety check using global safety system
-        let num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
-        let estimated_mb = (edges.len() * 750) / (1024 * 1024); // 750 bytes per edge estimate
+        let _num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
+                                             // Ensure at least 1MB for small datasets to avoid integer division to 0
+        let estimated_mb = ((edges.len() * 100) / (1024 * 1024)).max(1); // 100 bytes per edge estimate
 
         // Global safety check replaces context.resource_monitor
         ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
@@ -236,32 +212,21 @@ impl PyCollection {
         let estimated_records = (edges.len() * 14) / 10; // 1.4x edges for safety
         let context = DataContext::with_capacity(estimated_records);
 
-        // Determine processing strategy based on dataset size and system resources
-        use starlings_core::core::safety::global_resource_monitor;
-        let strategy = global_resource_monitor().determine_processing_strategy(num_entities);
-
-        // Handle insufficient resources case
-        if let ProcessingStrategy::Insufficient {
-            required_memory_mb,
-            available_memory_mb,
-            ..
-        } = &strategy
-        {
-            return Err(PyErr::new::<pyo3::exceptions::PyMemoryError, _>(format!(
-                "Insufficient system resources for {} entities. Need ~{}MB memory, have {}MB available. \
-                 Try: 1) Smaller dataset, 2) Free system memory, 3) Set STARLINGS_SAFETY_LEVEL=performance",
-                num_entities, required_memory_mb, available_memory_mb
-            )));
-        }
-
         // Create progress callback wrapper for Rust use
         let progress_callback: Option<ProgressCallback> =
             progress_callback.map(create_progress_wrapper);
 
-        // Report initial progress with processing strategy info
+        // Report initial progress
         if let Some(ref callback) = progress_callback {
-            let strategy_message = get_strategy_message(&strategy);
-            callback(0.0, &strategy_message);
+            let thread_count = rayon::current_num_threads();
+            callback(
+                0.0,
+                &format!(
+                    "Processing {} edges ({} threads)",
+                    edges.len(),
+                    thread_count
+                ),
+            );
         }
 
         // Efficiently convert all Python keys to Rust edges with optimised bulk processing
@@ -312,31 +277,21 @@ impl PyCollection {
             keys_set.into_keys().collect()
         };
 
-        // Extract batch size and processing parameters from strategy
-        let batch_size = extract_batch_size(&strategy);
-
-        // Get adaptive limits for current conditions
-        let adaptive_limits = global_resource_monitor().get_adaptive_limits(batch_size);
-
-        // Show resource warnings if present
-        report_resource_warnings(&adaptive_limits, &progress_callback);
+        // Determine batch size based on memory status
+        use starlings_core::core::safety::global_resource_monitor;
+        let usage = global_resource_monitor().get_usage();
+        let batch_size = if !usage.memory_under_limit {
+            10_000 // Small batches when at limit
+        } else if usage.memory_percent > 60.0 {
+            50_000 // Medium batches when getting close
+        } else {
+            100_000 // Large batches when plenty of headroom
+        };
 
         let key_to_id_mutex = Mutex::new(key_to_id);
 
-        // Helper closure for batch processing with safety checks
+        // Helper closure for batch processing
         let process_batch = |batch: &[Key]| {
-            // Check circuit breaker before each batch
-            if global_resource_monitor().is_circuit_open() {
-                eprintln!("⚠️  Circuit breaker open - aborting batch processing");
-                return;
-            }
-
-            // Apply throttling if needed
-            let throttle_delay = global_resource_monitor().throttle_if_needed();
-            if throttle_delay.as_millis() > 0 {
-                std::thread::sleep(throttle_delay);
-            }
-
             let ids = context.ensure_records_batch(&source_name, batch);
             let mut local_map = FxHashMap::default();
             for (key, id) in batch.iter().zip(ids.iter()) {
@@ -345,52 +300,16 @@ impl PyCollection {
             key_to_id_mutex.lock().unwrap().extend(local_map);
         };
 
-        // Process batches based on strategy and current system pressure
-        let should_use_streaming = requires_streaming(&strategy)
-            || adaptive_limits.should_throttle
-            || adaptive_limits.should_spill_to_disk;
+        // Normal parallel processing
+        unique_keys.par_chunks(batch_size).for_each(process_batch);
 
-        if should_use_streaming {
-            // Sequential streaming processing with memory management
-            let delay_msg = if adaptive_limits.delay_between_batches_ms > 0 {
-                format!(
-                    " ({}ms delay between batches)",
-                    adaptive_limits.delay_between_batches_ms
-                )
-            } else {
-                String::new()
-            };
-
-            for batch in unique_keys.chunks(adaptive_limits.batch_size) {
-                process_batch(batch);
-
-                // Add delay if under resource pressure
-                if adaptive_limits.delay_between_batches_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        adaptive_limits.delay_between_batches_ms,
-                    ));
-                }
-            }
-
-            if let Some(ref callback) = progress_callback {
-                let msg = format!(
-                    "Streaming mode: batch size {}, resource throttling active{}",
-                    adaptive_limits.batch_size, delay_msg
-                );
-                callback(0.35, &msg);
-            }
-        } else {
-            // Normal parallel processing when resources are abundant
-            unique_keys.par_chunks(batch_size).for_each(process_batch);
-
-            if let Some(ref callback) = progress_callback {
-                let msg = format!(
-                    "Parallel processing: batch size {}, {} threads active",
-                    batch_size,
-                    rayon::current_num_threads()
-                );
-                callback(0.35, &msg);
-            }
+        if let Some(ref callback) = progress_callback {
+            let msg = format!(
+                "Parallel processing: batch size {}, {} threads active",
+                batch_size,
+                rayon::current_num_threads()
+            );
+            callback(0.35, &msg);
         }
 
         let key_to_id = key_to_id_mutex.into_inner().unwrap();
@@ -525,9 +444,7 @@ impl PyCollection {
     ///     ```
     fn at(&mut self, threshold: f64) -> PyResult<PyPartition> {
         let partition = self.hierarchy.at_threshold(threshold);
-        Ok(PyPartition {
-            partition: partition.clone(),
-        })
+        Ok(PyPartition { partition })
     }
 
     /// Create a deep copy of this collection with independent context.
@@ -587,7 +504,8 @@ fn generate_entity_resolution_edges(
     _py: Python<'_>,
 ) -> PyResult<EdgeGenerator> {
     // CRITICAL FIX: Add pre-flight safety check BEFORE generating edges
-    let estimated_mb = (n * 5 * 150) / (1024 * 1024); // n entities * 5 edges * 150 bytes per edge
+    // Ensure at least 1MB for small datasets to avoid integer division to 0
+    let estimated_mb = ((n * 5 * 100) / (1024 * 1024)).max(1); // n entities * 5 edges * 100 bytes per edge
     ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
 
     let edges = test_utils::generate_entity_resolution_edges(n, num_thresholds);
@@ -628,10 +546,63 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
     }
 }
 
+/// Generate all combinations of thresholds for cartesian product analysis
+fn generate_threshold_combinations(
+    expressions: &[ExpressionType],
+) -> PyResult<Vec<Vec<(ExpressionType, f64)>>> {
+    let mut threshold_sets = Vec::new();
+
+    for expr in expressions {
+        let thresholds = match expr {
+            ExpressionType::Point { threshold, .. } => vec![*threshold],
+            ExpressionType::Sweep {
+                start, stop, step, ..
+            } => generate_sweep_thresholds(*start, *stop, *step),
+        };
+        threshold_sets.push(thresholds);
+    }
+
+    // Generate cartesian product of all threshold combinations
+    let mut combinations = vec![vec![]];
+
+    for (expr_idx, thresholds) in threshold_sets.iter().enumerate() {
+        let mut new_combinations = Vec::new();
+
+        for combination in &combinations {
+            for &threshold in thresholds {
+                let mut new_combination = combination.clone();
+                new_combination.push((expressions[expr_idx].clone(), threshold));
+                new_combinations.push(new_combination);
+            }
+        }
+
+        combinations = new_combinations;
+    }
+
+    Ok(combinations)
+}
+
+/// Get metric name as string
+fn metric_name(metric: &MetricType) -> &'static str {
+    match metric {
+        MetricType::F1 => "f1",
+        MetricType::Precision => "precision",
+        MetricType::Recall => "recall",
+        MetricType::ARI => "ari",
+        MetricType::NMI => "nmi",
+        MetricType::VMeasure => "v_measure",
+        MetricType::BCubedPrecision => "bcubed_precision",
+        MetricType::BCubedRecall => "bcubed_recall",
+        MetricType::EntityCount => "entity_count",
+        MetricType::Entropy => "entropy",
+    }
+}
+
 /// Multi-collection container that enables hierarchies to share DataContext
 #[pyclass(name = "EntityFrame")]
 pub struct PyEntityFrame {
     frame: EntityFrame,
+    engine: MetricEngine,
 }
 
 #[pymethods]
@@ -641,6 +612,7 @@ impl PyEntityFrame {
     fn new() -> Self {
         PyEntityFrame {
             frame: EntityFrame::new(),
+            engine: MetricEngine::new(),
         }
     }
 
@@ -736,9 +708,666 @@ impl PyEntityFrame {
         self.frame.remove_collection(name).is_some()
     }
 
+    /// Universal analysis method using expressions.
+    ///
+    /// Always returns List[Dict[str, float]] where each dict represents one measurement.
+    /// This uniform format works seamlessly with DataFrame libraries.
+    ///
+    /// Args:
+    ///     expressions: Variable number of expression objects from sl.col()
+    ///     metrics: List of metric functions to compute
+    ///
+    /// Returns:
+    ///     List[Dict[str, float]]: Results where each dict contains:
+    ///     - "{collection}_threshold" for all threshold values
+    ///     - Direct metric names ("f1", "precision", "entity_count", etc.)
+    ///
+    /// Example:
+    ///     ```python
+    ///     # Point comparison
+    ///     result = ef.analyse(
+    ///         sl.col("splink").at(0.85),
+    ///         sl.col("truth").at(1.0),
+    ///         metrics=[sl.Metrics.eval.f1, sl.Metrics.eval.precision]
+    ///     )
+    ///     # Returns: [{"splink_threshold": 0.85, "truth_threshold": 1.0, "f1": 0.92, ...}]
+    ///     ```
+    #[pyo3(signature = (*expressions, metrics=None, progress_callback=None))]
+    fn analyse(
+        &mut self,
+        expressions: &Bound<'_, pyo3::types::PyTuple>,
+        metrics: Option<Vec<Bound<'_, PyAny>>>,
+        progress_callback: Option<Py<PyAny>>,
+        py: Python,
+    ) -> PyResult<Vec<std::collections::HashMap<String, f64>>> {
+        use std::collections::HashMap;
+
+        // Parse expressions from Python
+        let mut parsed_expressions = Vec::new();
+        for expr in expressions.iter() {
+            let parsed = parse_expression(&expr)?;
+            parsed_expressions.push(parsed);
+        }
+
+        // Determine which collection is the reference for asymmetric metrics
+        // This logs info about implicit reference if needed
+        let _ = self.determine_reference(&parsed_expressions, py)?;
+
+        // Parse metrics from Python, providing defaults if none specified
+        let parsed_metrics = if let Some(metric_objs) = metrics {
+            let mut metrics = Vec::new();
+            for metric_obj in metric_objs {
+                let parsed = parse_metric(&metric_obj)?;
+                metrics.push(parsed);
+            }
+            metrics
+        } else {
+            // Provide default metrics based on number of expressions
+            if parsed_expressions.len() >= 2 {
+                // Multiple collections - use comparison metrics
+                vec![MetricType::F1, MetricType::Precision, MetricType::Recall]
+            } else {
+                // Single collection - use statistics metrics
+                vec![MetricType::EntityCount, MetricType::Entropy]
+            }
+        };
+
+        // Report initial progress
+        if let Some(ref callback) = progress_callback {
+            callback.call1(py, (0.05, "Preparing analysis"))?;
+        }
+
+        // OPTIMIZED PATH for single-collection sweeps
+        if parsed_expressions.len() == 1 {
+            if let ExpressionType::Sweep {
+                collection,
+                start,
+                stop,
+                step,
+                ..
+            } = &parsed_expressions[0]
+            {
+                debug_println!("🚀 Optimized path: single collection sweep");
+
+                let hierarchy = self.frame.get_collection(collection).ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                        "Collection '{}' not found",
+                        collection
+                    ))
+                })?;
+
+                // Thresholds are generated HIGH to LOW for Delta algorithm
+                let thresholds = generate_sweep_thresholds(*start, *stop, *step);
+                if thresholds.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                // 1. Build ONLY the first partition (highest threshold)
+                let first_partition = hierarchy.at_threshold(thresholds[0]);
+
+                // 2. Get merge events between all subsequent thresholds
+                let mut merge_events_between = Vec::new();
+                for i in 0..thresholds.len() - 1 {
+                    let from = thresholds[i];
+                    let to = thresholds[i + 1];
+                    let merges = hierarchy
+                        .get_merge_events_between(from, to)
+                        .map_err(map_storage_error)?;
+                    merge_events_between.push(merges);
+                }
+
+                // 3. Call the optimised sweep function in the metric engine
+                let engine_metrics: Vec<CoreMetricType> =
+                    parsed_metrics.iter().map(convert_metric_type).collect();
+                let metric_results_vec = self.engine.compute_single_sweep_with_merges(
+                    &first_partition,
+                    &thresholds,
+                    &merge_events_between,
+                    &engine_metrics,
+                    &hierarchy.context,
+                );
+
+                // 4. Format results
+                let mut results = Vec::new();
+                for (i, threshold) in thresholds.iter().enumerate() {
+                    let mut result_map = HashMap::new();
+                    result_map.insert(format!("{}_threshold", collection), *threshold);
+                    for (metric_name, value) in &metric_results_vec[i] {
+                        result_map.insert(metric_name.clone(), *value);
+                    }
+                    results.push(result_map);
+                }
+
+                return Ok(results);
+            }
+        }
+
+        // Generate all combinations of thresholds for cartesian product
+        let threshold_combinations = generate_threshold_combinations(&parsed_expressions)?;
+
+        let mut results = Vec::new();
+
+        // Cache for partitions to avoid redundant reconstruction
+        let mut partition_cache: HashMap<(String, u64), Arc<PartitionLevel>> = HashMap::new();
+
+        // Cache for metric results to avoid redundant computation
+        let mut metrics_cache: HashMap<(String, u64, String, u64), MetricResults> = HashMap::new();
+
+        // Extract collection names for potential future optimisation
+        let _expr_collection_names: Vec<String> = parsed_expressions
+            .iter()
+            .map(|expr| match expr {
+                ExpressionType::Point { collection, .. } => collection.clone(),
+                ExpressionType::Sweep { collection, .. } => collection.clone(),
+            })
+            .collect();
+
+        // Special optimisation for sweep × sweep comparisons
+        // This path uses efficient batch partition building and the MetricEngine's sweep methods
+        if parsed_expressions.len() == 2
+            && matches!(
+                (&parsed_expressions[0], &parsed_expressions[1]),
+                (ExpressionType::Sweep { .. }, ExpressionType::Sweep { .. })
+            )
+        {
+            // Using optimised sweep × sweep computation path
+
+            // Extract sweep parameters
+            let (col1, thresholds1) = match &parsed_expressions[0] {
+                ExpressionType::Sweep {
+                    collection,
+                    start,
+                    stop,
+                    step,
+                    ..
+                } => (
+                    collection.clone(),
+                    generate_sweep_thresholds(*start, *stop, *step),
+                ),
+                _ => unreachable!("Sweep × sweep case should only have Sweep expressions"),
+            };
+            let (col2, thresholds2) = match &parsed_expressions[1] {
+                ExpressionType::Sweep {
+                    collection,
+                    start,
+                    stop,
+                    step,
+                    ..
+                } => (
+                    collection.clone(),
+                    generate_sweep_thresholds(*start, *stop, *step),
+                ),
+                _ => unreachable!("Sweep × sweep case should only have Sweep expressions"),
+            };
+
+            // Report progress for partition building
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.1, "Building partitions"))?;
+            }
+
+            // Build all partitions upfront
+            let partitions1 = self.build_partitions_for_thresholds(&col1, &thresholds1)?;
+            let partitions2 = self.build_partitions_for_thresholds(&col2, &thresholds2)?;
+
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.4, "Partitions built"))?;
+            }
+
+            // Get shared context
+            let context = if let Some(hierarchy) = self.frame.get_collection(&col1) {
+                hierarchy.context.clone()
+            } else {
+                return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                    "Collection '{}' not found",
+                    col1
+                )));
+            };
+
+            // Use MetricEngine for efficient computation
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.5, "Computing metrics"))?;
+            }
+
+            // Convert expressions metrics to engine metrics
+            let engine_metrics: Vec<CoreMetricType> = parsed_metrics
+                .iter()
+                .map(|m| match m {
+                    MetricType::F1 => CoreMetricType::F1,
+                    MetricType::Precision => CoreMetricType::Precision,
+                    MetricType::Recall => CoreMetricType::Recall,
+                    MetricType::ARI => CoreMetricType::ARI,
+                    MetricType::NMI => CoreMetricType::NMI,
+                    MetricType::VMeasure => CoreMetricType::VMeasure,
+                    MetricType::BCubedPrecision => CoreMetricType::BCubedPrecision,
+                    MetricType::BCubedRecall => CoreMetricType::BCubedRecall,
+                    MetricType::EntityCount => CoreMetricType::EntityCount,
+                    MetricType::Entropy => CoreMetricType::Entropy,
+                })
+                .collect();
+
+            // Determine if this is a same-collection comparison
+            let same_collection = col1 == col2;
+
+            // Use MetricEngine to compute all metrics efficiently with Arc support
+            let metric_results_vec = if partitions1.len() == 1 && partitions2.len() == 1 {
+                // Single comparison - use compute_single_arc directly
+                vec![self.engine.compute_single_arc(
+                    &partitions1[0],
+                    Some(&partitions2[0]),
+                    &engine_metrics,
+                    &context,
+                    same_collection,
+                )]
+            } else {
+                // Sweep comparison - use the new Arc-aware method
+                self.engine.compute_sweep_arc(
+                    &partitions1,
+                    Some(&partitions2),
+                    &engine_metrics,
+                    &context,
+                    same_collection,
+                )
+            };
+
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (0.7, "Processing results"))?;
+            }
+
+            // Convert results to the expected format
+            let total_combinations = thresholds1.len() * thresholds2.len();
+            let mut completed = 0;
+            let mut result_idx = 0;
+            for threshold1 in thresholds1.iter() {
+                for threshold2 in thresholds2.iter() {
+                    let mut result = HashMap::new();
+                    result.insert(format!("{}_threshold", col1), *threshold1);
+                    result.insert(format!("{}_threshold", col2), *threshold2);
+
+                    // Add all metrics from the engine results
+                    for (metric_name, value) in &metric_results_vec[result_idx] {
+                        result.insert(metric_name.clone(), *value);
+                    }
+                    result_idx += 1;
+
+                    results.push(result);
+
+                    // Update progress
+                    completed += 1;
+                    if let Some(ref callback) = progress_callback {
+                        let progress = 0.7 + (0.3 * completed as f64 / total_combinations as f64);
+                        callback.call1(
+                            py,
+                            (
+                                progress,
+                                format!(
+                                    "Processing combination {}/{}",
+                                    completed, total_combinations
+                                ),
+                            ),
+                        )?;
+                    }
+                }
+            }
+
+            // Report completion
+            if let Some(ref callback) = progress_callback {
+                callback.call1(py, (1.0, "Analysis complete"))?;
+            }
+
+            return Ok(results);
+        }
+
+        // General path for all other cases (point comparisons, mixed sweep/point, etc.)
+        let total_combinations = threshold_combinations.len();
+        let mut combination_idx = 0;
+
+        for combination in threshold_combinations {
+            let mut result = HashMap::new();
+
+            // Add threshold values to result
+            for (expr, threshold) in &combination {
+                let collection_name = match expr {
+                    ExpressionType::Point { collection, .. } => collection,
+                    ExpressionType::Sweep { collection, .. } => collection,
+                };
+                result.insert(format!("{}_threshold", collection_name), *threshold);
+            }
+
+            // Get partitions for this combination, using cache when possible
+            let mut owned_partitions: Vec<Arc<PartitionLevel>> = Vec::new();
+            let mut collection_names = Vec::new();
+
+            // Build partitions efficiently using cache
+            for (expr, threshold) in &combination {
+                let collection_name = match expr {
+                    ExpressionType::Point { collection, .. } => collection,
+                    ExpressionType::Sweep { collection, .. } => collection,
+                };
+                collection_names.push(collection_name.clone());
+
+                // Create cache key using fixed-point representation
+                let threshold_key = threshold_to_cache_key(*threshold);
+                let cache_key = (collection_name.clone(), threshold_key);
+
+                let partition = if let Some(cached) = partition_cache.get(&cache_key) {
+                    // Use cached partition
+                    cached.clone()
+                } else {
+                    // Get hierarchy and build partition
+                    let hierarchy =
+                        self.frame.get_collection(collection_name).ok_or_else(|| {
+                            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                                "Collection '{}' not found",
+                                collection_name
+                            ))
+                        })?;
+
+                    let partition = hierarchy.at_threshold(*threshold);
+                    partition_cache.insert(cache_key, partition.clone());
+                    partition
+                };
+                owned_partitions.push(partition);
+            }
+
+            // Compute comparison metrics efficiently (all at once to avoid cache issues)
+            let comparison_metrics: Vec<&MetricType> = parsed_metrics
+                .iter()
+                .filter(|m| m.requires_comparison())
+                .collect();
+
+            let mut metric_values = HashMap::new();
+
+            if !comparison_metrics.is_empty() {
+                if owned_partitions.len() < 2 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Comparison metrics require at least 2 collections".to_string(),
+                    ));
+                }
+
+                // Check contingency table cache
+                let threshold_key1 = threshold_to_cache_key(combination[0].1);
+                let threshold_key2 = threshold_to_cache_key(combination[1].1);
+                let cont_cache_key = (
+                    collection_names[0].clone(),
+                    threshold_key1,
+                    collection_names[1].clone(),
+                    threshold_key2,
+                );
+
+                // Check cache first
+                let cached_results = if let Some(cached) = metrics_cache.get(&cont_cache_key) {
+                    cached.clone()
+                } else {
+                    // Get shared context
+                    let context =
+                        if let Some(hierarchy) = self.frame.get_collection(&collection_names[0]) {
+                            hierarchy.context.clone()
+                        } else {
+                            return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                                "Collection '{}' not found",
+                                collection_names[0]
+                            )));
+                        };
+
+                    // Convert all comparison metrics to engine metric types
+                    let engine_metrics: Vec<CoreMetricType> = comparison_metrics
+                        .iter()
+                        .map(|m| match m {
+                            MetricType::F1 => CoreMetricType::F1,
+                            MetricType::Precision => CoreMetricType::Precision,
+                            MetricType::Recall => CoreMetricType::Recall,
+                            MetricType::ARI => CoreMetricType::ARI,
+                            MetricType::NMI => CoreMetricType::NMI,
+                            MetricType::VMeasure => CoreMetricType::VMeasure,
+                            MetricType::BCubedPrecision => CoreMetricType::BCubedPrecision,
+                            MetricType::BCubedRecall => CoreMetricType::BCubedRecall,
+                            _ => CoreMetricType::F1, // Shouldn't happen
+                        })
+                        .collect();
+
+                    // Compute all metrics at once using Arc method
+                    let same_collection = collection_names[0] == collection_names[1];
+                    let metric_results = self.engine.compute_single_arc(
+                        &owned_partitions[0],
+                        Some(&owned_partitions[1]),
+                        &engine_metrics,
+                        &context,
+                        same_collection,
+                    );
+
+                    // Cache the results
+                    metrics_cache.insert(cont_cache_key.clone(), metric_results.clone());
+
+                    metric_results
+                };
+
+                // Extract values for comparison metrics
+                for metric in &comparison_metrics {
+                    let value = cached_results
+                        .get(metric_name(metric))
+                        .copied()
+                        .unwrap_or(0.0);
+                    metric_values.insert(metric_name(metric), value);
+                }
+            }
+
+            // Now add all metric values to the result
+            for metric in &parsed_metrics {
+                let metric_value = if metric.requires_comparison() {
+                    metric_values
+                        .get(metric_name(metric))
+                        .copied()
+                        .unwrap_or(0.0)
+                } else {
+                    if owned_partitions.is_empty() {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "No collections specified for metric computation".to_string(),
+                        ));
+                    }
+                    // Use first partition for single-collection metrics
+                    compute_single_metric(&owned_partitions[0], metric).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+                    })?
+                };
+
+                result.insert(metric_name(metric).to_string(), metric_value);
+            }
+
+            results.push(result);
+
+            // Update progress
+            combination_idx += 1;
+            if let Some(ref callback) = progress_callback {
+                let progress = 0.1 + (0.9 * combination_idx as f64 / total_combinations as f64);
+                callback.call1(
+                    py,
+                    (
+                        progress,
+                        format!(
+                            "Processing combination {}/{}",
+                            combination_idx, total_combinations
+                        ),
+                    ),
+                )?;
+            }
+
+            // Progressive cache management based on collection sizes
+            // Keep more cache for smaller collections, less for larger ones
+            let max_entities = owned_partitions
+                .iter()
+                .map(|p| p.entities().len())
+                .max()
+                .unwrap_or(0);
+
+            let (partition_limit, contingency_limit) = if max_entities > 100_000 {
+                // Very large collections: minimal cache
+                (10, 5)
+            } else if max_entities > 10_000 {
+                // Large collections: moderate cache
+                (20, 10)
+            } else if max_entities > 1_000 {
+                // Medium collections: good cache
+                (50, 25)
+            } else {
+                // Small collections: maximum cache
+                (100, 50)
+            };
+
+            // Clear caches if they exceed adaptive limits
+            if partition_cache.len() > partition_limit {
+                // Simple strategy: clear half the cache when limit exceeded
+                partition_cache.clear();
+            }
+            if metrics_cache.len() > contingency_limit {
+                // Simple strategy: clear half the cache when limit exceeded
+                metrics_cache.clear();
+            }
+        }
+
+        // Report completion
+        if let Some(ref callback) = progress_callback {
+            callback.call1(py, (1.0, "Analysis complete"))?;
+        }
+
+        Ok(results)
+    }
+
     /// String representation
     fn __repr__(&self) -> String {
         format!("EntityFrame(collections={})", self.frame.len())
+    }
+}
+
+impl PyEntityFrame {
+    /// Helper method to log info messages via Python's logging module
+    fn log_info(&self, py: Python, message: &str) {
+        use pyo3::types::PyModule;
+
+        // Best effort logging - ignore failures silently
+        if let Ok(logging) = PyModule::import(py, "logging") {
+            if let Ok(logger) = logging.getattr("getLogger").and_then(|f| f.call0()) {
+                let _ = logger.call_method1("info", (message,));
+            }
+        }
+    }
+
+    /// Helper function to determine which collection is the reference for metrics
+    fn determine_reference(
+        &self,
+        expressions: &[ExpressionType],
+        py: Python,
+    ) -> PyResult<Option<String>> {
+        // Check for explicit reference marking
+        let explicit_refs: Vec<_> = expressions
+            .iter()
+            .filter_map(|expr| {
+                let (collection, is_reference) = match expr {
+                    ExpressionType::Point {
+                        collection,
+                        is_reference,
+                        ..
+                    } => (collection, is_reference),
+                    ExpressionType::Sweep {
+                        collection,
+                        is_reference,
+                        ..
+                    } => (collection, is_reference),
+                };
+
+                if *is_reference {
+                    Some(collection.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Check for multiple references (error condition)
+        if explicit_refs.len() > 1 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Multiple collections marked as reference. Only one reference is allowed.",
+            ));
+        }
+
+        // Return explicit reference if found
+        if !explicit_refs.is_empty() {
+            return Ok(Some(explicit_refs[0].clone()));
+        }
+
+        // If no explicit reference and we have multiple collections, use implicit (last expression)
+        if expressions.len() >= 2 {
+            let last_collection = match &expressions[expressions.len() - 1] {
+                ExpressionType::Point { collection, .. }
+                | ExpressionType::Sweep { collection, .. } => collection.clone(),
+            };
+
+            // Log that we're using implicit reference
+            self.log_info(
+                py,
+                &format!(
+                    "No explicit reference specified. Using '{}' (last expression) as implicit reference for asymmetric metrics.",
+                    last_collection
+                ),
+            );
+
+            return Ok(Some(last_collection));
+        }
+
+        // Single collection or no collections - no reference needed
+        Ok(None)
+    }
+
+    /// Helper: Build partitions for a collection at multiple thresholds
+    fn build_partitions_for_thresholds(
+        &self,
+        collection_name: &str,
+        thresholds: &[f64],
+    ) -> PyResult<Vec<Arc<PartitionLevel>>> {
+        #[cfg(debug_assertions)]
+        use starlings_core::debug_println;
+
+        #[cfg(debug_assertions)]
+        let start = std::time::Instant::now();
+
+        let hierarchy = self.frame.get_collection(collection_name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Collection '{}' not found",
+                collection_name
+            ))
+        })?;
+
+        #[cfg(debug_assertions)]
+        debug_println!(
+            "      🔧 Building {} partitions incrementally for {}",
+            thresholds.len(),
+            collection_name
+        );
+
+        // Use incremental building for all partitions
+        let partitions = hierarchy.build_partitions_incrementally(thresholds);
+
+        #[cfg(debug_assertions)]
+        {
+            let total_time = start.elapsed();
+            debug_println!(
+                "      🔧 Total incremental partition building: {:?} ({} partitions)",
+                total_time,
+                partitions.len()
+            );
+
+            // Log some statistics about the partitions
+            for (i, (threshold, partition)) in thresholds.iter().zip(&partitions).enumerate() {
+                debug_println!(
+                    "         Partition {} at {:.2}: {} entities, {} records",
+                    i + 1,
+                    threshold,
+                    partition.entities().len(),
+                    partition.total_records()
+                );
+            }
+        }
+
+        Ok(partitions)
     }
 }
 

@@ -8,6 +8,7 @@ import logging
 
 import pytest
 import starlings as sl
+from starlings import generators
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class TestEndToEndOutOfCore:
         num_entities = 100_000
 
         logger.info(f"   Generating {num_entities:,} entity dataset...")
-        edge_generator = sl.generate_entity_resolution_edges(num_entities)
+        edge_generator = generators.edges(num_entities)
 
         # Create collection with resource monitoring enabled
         logger.info("   Creating collection with automatic resource management...")
@@ -83,7 +84,7 @@ class TestEndToEndOutOfCore:
         logger.info(
             f"   Generating {num_entities:,} entity dataset for spilling test..."
         )
-        edge_generator = sl.generate_entity_resolution_edges(num_entities)
+        edge_generator = generators.edges(num_entities)
 
         # Create collection - this should trigger automatic spilling
         collection = sl.Collection.from_edges(
@@ -116,7 +117,7 @@ class TestEndToEndOutOfCore:
 
         # Create a dataset that would normally fit in memory
         num_entities = 50_000
-        edge_generator = sl.generate_entity_resolution_edges(num_entities)
+        edge_generator = generators.edges(num_entities)
 
         # Create collection normally
         collection = sl.Collection.from_edges(edge_generator, show_progress=False)
@@ -147,7 +148,7 @@ class TestEndToEndOutOfCore:
 
         # Generate dataset that should trigger resource monitoring
         num_entities = 75_000
-        edge_generator = sl.generate_entity_resolution_edges(num_entities)
+        edge_generator = generators.edges(num_entities)
 
         # Create collection with monitoring (should happen automatically)
         collection = sl.Collection.from_edges(edge_generator, show_progress=False)

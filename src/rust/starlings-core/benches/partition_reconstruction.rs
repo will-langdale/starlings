@@ -33,7 +33,7 @@ fn generate_test_hierarchy(entity_count: usize) -> PartitionHierarchy {
 
 fn bench_partition_reconstruction_1m(c: &mut Criterion) {
     // Use 200k entities which produces ~1M edges for realistic benchmarking
-    let mut hierarchy = generate_test_hierarchy(200_000);
+    let hierarchy = generate_test_hierarchy(200_000);
 
     let mut group = c.benchmark_group("partition_reconstruction_production");
     group.sample_size(10);
@@ -51,5 +51,52 @@ fn bench_partition_reconstruction_1m(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_partition_reconstruction_1m);
+fn bench_sweep_reconstruction(c: &mut Criterion) {
+    // Test incremental reconstruction for sweep operations
+
+    let mut group = c.benchmark_group("sweep_reconstruction");
+    group.sample_size(10);
+
+    // Benchmark naive approach (individual at_threshold calls) - with fresh hierarchy each time
+    group.bench_function("naive_11_thresholds_uncached", |b| {
+        b.iter(|| {
+            // Create fresh hierarchy to avoid cache hits
+            let hierarchy = generate_test_hierarchy(50_000);
+            let thresholds: Vec<f64> = (0..=10).map(|i| i as f64 / 10.0).collect();
+            let partitions: Vec<_> = thresholds
+                .iter()
+                .map(|&t| hierarchy.at_threshold(t))
+                .collect();
+            black_box(partitions)
+        })
+    });
+
+    // Benchmark incremental approach - also with fresh hierarchy to be fair
+    group.bench_function("incremental_11_thresholds_uncached", |b| {
+        b.iter(|| {
+            let hierarchy = generate_test_hierarchy(50_000);
+            let thresholds: Vec<f64> = (0..=10).map(|i| i as f64 / 10.0).collect();
+            let partitions = hierarchy.build_partitions_incrementally(&thresholds);
+            black_box(partitions)
+        })
+    });
+
+    // Benchmark with larger sweep (21 thresholds) - incremental only
+    group.bench_function("incremental_21_thresholds_uncached", |b| {
+        b.iter(|| {
+            let hierarchy = generate_test_hierarchy(50_000);
+            let thresholds: Vec<f64> = (0..=20).map(|i| i as f64 / 20.0).collect();
+            let partitions = hierarchy.build_partitions_incrementally(&thresholds);
+            black_box(partitions)
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_partition_reconstruction_1m,
+    bench_sweep_reconstruction
+);
 criterion_main!(benches);
