@@ -91,11 +91,24 @@ impl ResourceMonitor {
 
         // Parse STARLINGS_MEMORY_LIMIT environment variable
         let memory_limit_mb = if let Ok(limit_str) = env::var("STARLINGS_MEMORY_LIMIT") {
+            crate::debug_println!("📊 STARLINGS_MEMORY_LIMIT env var: '{}'", limit_str);
             Self::parse_memory_limit(&limit_str, total_memory_mb)
         } else {
-            // Use 80% default like DuckDB if not specified
-            (total_memory_mb * 80) / 100
+            let default_mb = (total_memory_mb * 80) / 100;
+            crate::debug_println!(
+                "📊 STARLINGS_MEMORY_LIMIT not set, using default: {}MB (80% of {}MB)",
+                default_mb,
+                total_memory_mb
+            );
+            default_mb
         };
+
+        crate::debug_println!(
+            "📊 Memory config: total={}MB, limit={}MB ({:.0}%)",
+            total_memory_mb,
+            memory_limit_mb,
+            (memory_limit_mb as f64 / total_memory_mb as f64) * 100.0
+        );
 
         Self::with_memory_limit(memory_limit_mb)
     }
@@ -193,6 +206,14 @@ impl ResourceMonitor {
 
         // Check if operation would exceed limit
         let projected_usage = usage.memory_used_mb + estimated_mb;
+
+        crate::debug_println!(
+            "🔍 Memory check: need={}MB, used={}MB, limit={}MB, projected={}MB",
+            estimated_mb,
+            usage.memory_used_mb,
+            self.memory_limit_mb,
+            projected_usage
+        );
 
         if projected_usage > effective_limit {
             let available = effective_limit.saturating_sub(usage.memory_used_mb);
