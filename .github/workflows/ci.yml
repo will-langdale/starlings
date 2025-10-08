@@ -67,6 +67,8 @@ jobs:
 
     - name: Run Python tests
       run: just test python
+      env:
+        STARLINGS_MEMORY_LIMIT: ${{ matrix.os == 'macos-latest' && '2GB' || '50%' }}
     
     - name: Run Rust tests
       run: just test rust
