@@ -11,7 +11,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::merge_event::MergeEvent;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Trait for different storage backends
 pub trait HierarchyStorage: Send + Sync {
@@ -400,124 +399,6 @@ impl std::fmt::Debug for DiskStorage {
     }
 }
 
-/// Hybrid storage that starts in-memory and spills to disk when memory pressure is detected
-pub struct HybridStorage {
-    storage: Box<dyn HierarchyStorage>,
-    memory_threshold_bytes: u64,
-    spilled_to_disk: bool,
-    access_counter: AtomicU64,
-    last_memory_check: AtomicU64,
-}
-
-impl HybridStorage {
-    pub fn new(memory_threshold_bytes: u64) -> Self {
-        Self {
-            storage: Box::new(InMemoryStorage::new()),
-            memory_threshold_bytes,
-            spilled_to_disk: false,
-            access_counter: AtomicU64::new(0),
-            last_memory_check: AtomicU64::new(0),
-        }
-    }
-
-    fn should_spill_to_disk(&self) -> bool {
-        !self.spilled_to_disk && self.storage.memory_usage_bytes() > self.memory_threshold_bytes
-    }
-
-    /// Check if we should monitor memory pressure (every 1000 accesses or first time)
-    fn should_check_memory_pressure(&self) -> bool {
-        let current_access = self.access_counter.fetch_add(1, Ordering::Relaxed);
-        let last_check = self.last_memory_check.load(Ordering::Relaxed);
-
-        // Check every 1000 accesses or if we haven't checked yet
-        current_access - last_check >= 1000 || last_check == 0
-    }
-
-    /// Check and potentially warn about memory pressure during read operations  
-    fn check_memory_pressure_on_read(&self) {
-        if self.should_check_memory_pressure() {
-            self.last_memory_check.store(
-                self.access_counter.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-
-            // System automatically handles memory pressure via spilling
-            // Only warn about truly critical situations that require user attention
-        }
-    }
-
-    fn spill_to_disk(&mut self) -> Result<(), StorageError> {
-        if self.spilled_to_disk {
-            return Ok(());
-        }
-
-        // Create disk storage
-        let mut disk_storage = DiskStorage::new()?;
-
-        // Copy all events from memory to disk
-        for event in self.storage.iter()? {
-            disk_storage.push(event)?;
-        }
-
-        // Replace storage backend
-        self.storage = Box::new(disk_storage);
-        self.spilled_to_disk = true;
-
-        // Spilling is now a normal part of automatic resource management
-        // No need to warn users about routine operational decisions
-
-        Ok(())
-    }
-}
-
-impl HierarchyStorage for HybridStorage {
-    fn push(&mut self, event: MergeEvent) -> Result<(), StorageError> {
-        // Check if we should spill to disk before adding
-        if self.should_spill_to_disk() {
-            self.spill_to_disk()?;
-        }
-
-        self.storage.push(event)
-    }
-
-    fn get(&self, index: usize) -> Result<Option<&MergeEvent>, StorageError> {
-        self.check_memory_pressure_on_read();
-        self.storage.get(index)
-    }
-
-    fn len(&self) -> usize {
-        self.storage.len()
-    }
-
-    fn memory_usage_bytes(&self) -> u64 {
-        self.storage.memory_usage_bytes()
-    }
-
-    fn iter(&self) -> Result<Box<dyn Iterator<Item = MergeEvent>>, StorageError> {
-        self.check_memory_pressure_on_read();
-        self.storage.iter()
-    }
-
-    fn sync(&mut self) -> Result<(), StorageError> {
-        self.storage.sync()
-    }
-
-    fn clone_box(&self) -> Box<dyn HierarchyStorage + Send + Sync> {
-        // Clone the underlying storage
-        self.storage.clone_box()
-    }
-}
-
-impl std::fmt::Debug for HybridStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HybridStorage")
-            .field("memory_threshold_bytes", &self.memory_threshold_bytes)
-            .field("spilled_to_disk", &self.spilled_to_disk)
-            .field("current_memory_usage", &self.storage.memory_usage_bytes())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,56 +544,6 @@ mod tests {
         for (i, event) in read_events.iter().enumerate() {
             assert_eq!(event.threshold, expected_thresholds[i]);
         }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_hybrid_storage_memory_monitoring() -> Result<(), StorageError> {
-        let small_threshold = 500; // 500 bytes - will trigger monitoring
-        let mut storage = HybridStorage::new(small_threshold);
-
-        // Add enough events to approach the threshold
-        for i in 0..5 {
-            let event = create_test_merge_event(0.9 - (i as f64 * 0.1), 2);
-            storage.push(event)?;
-        }
-
-        // Access events multiple times to trigger memory monitoring
-        // (every 1000 accesses, but we can test the access counter functionality)
-        assert_eq!(storage.len(), 5);
-
-        // Force memory pressure check by accessing data
-        let _ = storage.iter()?;
-        let _ = storage.get(0);
-
-        // Verify the access counter is working
-        assert!(
-            storage
-                .access_counter
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_hybrid_storage_spilling() -> Result<(), StorageError> {
-        let small_threshold = 100; // 100 bytes - very small to trigger spilling
-        let mut storage = HybridStorage::new(small_threshold);
-
-        assert!(!storage.spilled_to_disk);
-
-        // Add enough events to exceed memory threshold
-        for i in 0..10 {
-            let event = create_test_merge_event(0.5 + (i as f64 * 0.01), 3);
-            storage.push(event)?;
-        }
-
-        assert_eq!(storage.len(), 10);
-        // Should have spilled to disk due to memory pressure
-        assert!(storage.spilled_to_disk);
 
         Ok(())
     }

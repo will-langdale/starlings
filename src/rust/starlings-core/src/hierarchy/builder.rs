@@ -9,7 +9,7 @@ use super::bitmap_pool::BitmapPool;
 use super::memory_cache::MemoryBoundedCache;
 use super::merge_event::MergeEvent;
 use super::partition::PartitionLevel;
-use super::storage::{DiskStorage, HierarchyStorage, HybridStorage, InMemoryStorage};
+use super::storage::{DiskStorage, HierarchyStorage, InMemoryStorage};
 use super::union_find::UnionFind;
 use crate::core::DataContext;
 use crate::debug_println;
@@ -158,24 +158,24 @@ impl PartitionHierarchy {
             let monitor = global_resource_monitor();
             let memory_limit_mb = monitor.get_memory_limit_mb();
 
-            // Estimate memory needed for the full hierarchy construction.
-            // This is a rough heuristic. A more accurate estimate would be based on
-            // the number of edges and records.
-            // Let's use ~150 bytes per edge as a conservative estimate for the hierarchy.
+            // Estimate memory needed: ~150 bytes per edge
             let estimated_mb = (edges.len() as u64 * 150) / (1024 * 1024);
 
-            if estimated_mb < memory_limit_mb / 4 {
-                // Use in-memory storage if estimate is < 25% of limit
-                debug_println!("   ✅ Small dataset detected, using in-memory storage");
+            if estimated_mb < memory_limit_mb / 2 {
+                // Fast path: fits comfortably in memory
+                debug_println!(
+                    "   ✅ Using in-memory storage ({}MB < {}MB limit)",
+                    estimated_mb,
+                    memory_limit_mb / 2
+                );
                 Box::new(InMemoryStorage::new())
-            } else if estimated_mb < memory_limit_mb / 2 {
-                // Use hybrid storage if estimate is < 50% of limit
-                let spill_threshold_bytes = (memory_limit_mb / 4) * 1024 * 1024;
-                debug_println!("   🔶 Medium dataset detected, using hybrid storage");
-                Box::new(HybridStorage::new(spill_threshold_bytes))
             } else {
-                // Use disk storage for large datasets
-                debug_println!("   ⚠️  Large dataset detected, using disk storage");
+                // Defensive path: use disk storage for large datasets
+                debug_println!(
+                    "   💾 Using disk storage ({}MB >= {}MB limit)",
+                    estimated_mb,
+                    memory_limit_mb / 2
+                );
                 Box::new(
                     DiskStorage::new()
                         .map_err(|e| format!("Failed to create disk storage: {}", e))?,
