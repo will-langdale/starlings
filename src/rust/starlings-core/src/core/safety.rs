@@ -46,7 +46,10 @@ static GLOBAL_RESOURCE_MONITOR: OnceLock<ResourceMonitor> = OnceLock::new();
 /// }
 /// ```
 pub fn ensure_memory_safety(estimated_mb: u64) -> Result<(), SafetyError> {
-    let monitor = GLOBAL_RESOURCE_MONITOR.get_or_init(ResourceMonitor::from_env);
+    let monitor = GLOBAL_RESOURCE_MONITOR.get_or_init(|| {
+        crate::debug_println!("🔧 Initializing global ResourceMonitor from environment");
+        ResourceMonitor::from_env()
+    });
     monitor.can_proceed(estimated_mb)
 }
 
@@ -69,7 +72,10 @@ pub fn ensure_memory_safety(estimated_mb: u64) -> Result<(), SafetyError> {
 /// println!("Memory limit: {}MB", usage.memory_limit_mb);
 /// ```
 pub fn global_resource_monitor() -> &'static ResourceMonitor {
-    GLOBAL_RESOURCE_MONITOR.get_or_init(ResourceMonitor::from_env)
+    GLOBAL_RESOURCE_MONITOR.get_or_init(|| {
+        crate::debug_println!("🔧 Initializing global ResourceMonitor from environment");
+        ResourceMonitor::from_env()
+    })
 }
 
 #[cfg(test)]

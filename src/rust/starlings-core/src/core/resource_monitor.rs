@@ -9,7 +9,7 @@
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Pid, ProcessesToUpdate, RefreshKind, System};
 
 /// Errors that can occur during memory checks
 #[derive(Debug, Clone)]
@@ -48,6 +48,7 @@ pub struct ResourceMonitor {
     last_refresh: Arc<Mutex<Instant>>,
     refresh_interval: Duration,
     memory_limit_mb: u64,
+    process_pid: Pid,
 }
 
 #[derive(Debug, Clone)]
@@ -122,11 +123,15 @@ impl ResourceMonitor {
 
         let system = System::new_with_specifics(refresh_kind);
 
+        // Get current process PID for process-specific memory tracking
+        let process_pid = sysinfo::get_current_pid().expect("Failed to get current process PID");
+
         Self {
             system: Arc::new(Mutex::new(system)),
             last_refresh: Arc::new(Mutex::new(Instant::now())),
             refresh_interval: Duration::from_secs(1),
             memory_limit_mb,
+            process_pid,
         }
     }
 
@@ -165,22 +170,41 @@ impl ResourceMonitor {
         (total_memory_mb * 80) / 100
     }
 
-    /// Get current system resource usage
+    /// Get current process resource usage
     #[must_use]
     pub fn get_usage(&self) -> ResourceUsage {
         self.refresh_if_needed();
 
         let system = self.system.lock().unwrap();
         let total_bytes = system.total_memory();
-        let available_bytes = system.available_memory();
-        let used_bytes = total_bytes - available_bytes;
-
         let total_memory_mb = total_bytes / (1024 * 1024);
-        let available_memory_mb = available_bytes / (1024 * 1024);
-        let used_memory_mb = used_bytes / (1024 * 1024);
 
-        let memory_percent = if total_memory_mb > 0 {
-            (used_memory_mb as f64 / total_memory_mb as f64 * 100.0) as f32
+        // Use PROCESS memory instead of SYSTEM memory
+        // This prevents false positives when the OS is using lots of cache/buffers
+        let used_memory_mb = if let Some(process) = system.process(self.process_pid) {
+            let process_memory_bytes = process.memory();
+            let process_mb = process_memory_bytes / (1024 * 1024);
+
+            crate::debug_println!(
+                "📊 Process memory: {}MB (limit: {}MB, available: {}MB)",
+                process_mb,
+                self.memory_limit_mb,
+                self.memory_limit_mb.saturating_sub(process_mb)
+            );
+
+            process_mb
+        } else {
+            // Fallback: if we can't get process info, use system memory
+            crate::debug_println!("⚠️  Could not get process memory, using system memory");
+            let available_bytes = system.available_memory();
+            let used_bytes = total_bytes - available_bytes;
+            used_bytes / (1024 * 1024)
+        };
+
+        let available_memory_mb = self.memory_limit_mb.saturating_sub(used_memory_mb);
+
+        let memory_percent = if self.memory_limit_mb > 0 {
+            (used_memory_mb as f64 / self.memory_limit_mb as f64 * 100.0) as f32
         } else {
             0.0
         };
@@ -244,6 +268,8 @@ impl ResourceMonitor {
         if last_refresh.elapsed() >= self.refresh_interval {
             let mut system = self.system.lock().unwrap();
             system.refresh_memory();
+            // Refresh process info to get current memory usage
+            system.refresh_processes(ProcessesToUpdate::Some(&[self.process_pid]), false);
             *last_refresh = Instant::now();
         }
     }
