@@ -4,6 +4,7 @@ pub mod key;
 pub mod record;
 pub mod resource_monitor;
 pub mod safety;
+pub mod spilling;
 
 pub use data_context::DataContext;
 pub use key::Key;
