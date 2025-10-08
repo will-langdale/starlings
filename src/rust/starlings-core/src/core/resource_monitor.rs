@@ -121,10 +121,14 @@ impl ResourceMonitor {
             .with_cpu(CpuRefreshKind::everything())
             .with_memory(MemoryRefreshKind::everything());
 
-        let system = System::new_with_specifics(refresh_kind);
+        let mut system = System::new_with_specifics(refresh_kind);
 
         // Get current process PID for process-specific memory tracking
         let process_pid = sysinfo::get_current_pid().expect("Failed to get current process PID");
+
+        // CRITICAL: Load process info immediately so first get_usage() call works
+        // Without this, refresh_if_needed() won't refresh (elapsed=0) and process lookup fails
+        system.refresh_processes(ProcessesToUpdate::Some(&[process_pid]), false);
 
         Self {
             system: Arc::new(Mutex::new(system)),
