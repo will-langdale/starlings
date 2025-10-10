@@ -83,6 +83,112 @@ impl ComponentManager<'_> {
     }
 }
 
+/// Detector for chain-like graph patterns that cause O(n²) memory usage
+struct ChainDetector {
+    edges_processed: usize,
+    total_edges: usize,
+    max_component_size: usize,
+    total_bitmap_bytes: u64,
+    growth_rates: Vec<f64>,
+    warning_triggered: bool,
+}
+
+impl ChainDetector {
+    fn new(total_edges: usize) -> Self {
+        Self {
+            edges_processed: 0,
+            total_edges,
+            max_component_size: 0,
+            total_bitmap_bytes: 0,
+            growth_rates: Vec::new(),
+            warning_triggered: false,
+        }
+    }
+
+    fn record_merge(
+        &mut self,
+        merged_component: &RoaringBitmap,
+        merging_components: &[RoaringBitmap],
+    ) {
+        self.edges_processed += 1;
+
+        // Track component growth
+        let new_size = merged_component.len() as usize;
+        let old_size = merging_components
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(1) as usize;
+        self.growth_rates.push(new_size as f64 / old_size as f64);
+
+        // Track max component size
+        if new_size > self.max_component_size {
+            self.max_component_size = new_size;
+        }
+
+        // Track memory usage (RoaringBitmap serialised size estimate)
+        self.total_bitmap_bytes += merged_component.serialized_size() as u64;
+    }
+
+    fn check_and_error(&mut self) -> Result<(), String> {
+        if self.warning_triggered || self.edges_processed < 10_000 {
+            return Ok(());
+        }
+
+        // Check every 50k edges
+        if !self.edges_processed.is_multiple_of(50_000) {
+            return Ok(());
+        }
+
+        let progress = self.edges_processed as f64 / self.total_edges as f64;
+        let memory_per_edge = self.total_bitmap_bytes / self.edges_processed as u64;
+        let avg_growth_rate: f64 =
+            self.growth_rates.iter().sum::<f64>() / self.growth_rates.len() as f64;
+
+        // Detection logic
+        let is_chain = (avg_growth_rate < 1.1) ||  // Slow consistent growth
+            (memory_per_edge > 10_000 && self.edges_processed > 100_000) ||  // High memory per edge
+            (self.max_component_size as f64 > 0.5 * self.total_edges as f64 && progress < 0.8); // Giant component early
+
+        if is_chain {
+            self.warning_triggered = true;
+            Err(format!(
+                "❌ UNSUPPORTED DATA PATTERN DETECTED\n\
+                 \n\
+                 Your data contains some long sequential chains where records link one after another:\n\
+                   Record 1 → Record 2 → Record 3 → ... → Record {}\n\
+                 \n\
+                 This pattern would use large amounts of memory and is not supported.\n\
+                 \n\
+                 WHY THIS MATTERS:\n\
+                 Typical entity resolution data forms clusters (groups of duplicates),\n\
+                 not long chains. For example:\n\
+                 \n\
+                   ✓ Normal:  [Customer A: 5 duplicates]  [Customer B: 3 duplicates]  [Singletons...]\n\
+                   ✗ Chain:   Record 1 → 2 → 3 → 4 → ... → 500,000\n\
+                 \n\
+                 POSSIBLE CAUSES:\n\
+                 - Synthetic test data using sequential IDs\n\
+                 - Entity resolution model needs better tuning (thresholds too low?)\n\
+                 - Data needs more cleaning before matching\n\
+                 \n\
+                 If you're using synthetic test data, create realistic clusters instead:\n\
+                 \n\
+                   # ❌ Don't create chains:\n\
+                   edges = [(i, i+1, 0.85) for i in range(n)]\n\
+                 \n\
+                   # ✅ Do create clusters (100 records per group):\n\
+                   edges = [(base+i, base+i+1, 0.85)\n\
+                            for base in range(0, n, 100)  # Start of each cluster\n\
+                            for i in range(99)]           # Links within cluster",
+                self.max_component_size
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Hierarchy of merge events that can generate partitions at any threshold
 pub struct PartitionHierarchy {
     pub context: Arc<DataContext>,
@@ -158,15 +264,34 @@ impl PartitionHierarchy {
             let monitor = global_resource_monitor();
             let memory_limit_mb = monitor.get_memory_limit_mb();
 
-            // Estimate memory needed: ~150 bytes per edge
-            let estimated_mb = (edges.len() as u64 * 150) / (1024 * 1024);
+            // Improved memory estimation accounting for worst-case O(n²) behavior:
+            // - MergeEvents store full component bitmaps
+            // - For chain-like patterns, memory usage is O(n²)
+            // - Observed: 100k edges = 1.6GB, 500k edges ≈ 40GB
+            // - Conservative estimate: 16KB per edge for >=100k edges
+            let bytes_per_edge = if edges.len() >= 100_000 {
+                // Large datasets: assume potential chain patterns, be very conservative
+                16_000
+            } else if edges.len() >= 10_000 {
+                // Medium datasets: use middle-ground estimate
+                10_000
+            } else {
+                // Small datasets: use optimistic estimate (normal O(n) behavior)
+                1_000
+            };
 
-            if estimated_mb < memory_limit_mb / 2 {
+            let estimated_mb = (edges.len() as u64 * bytes_per_edge) / (1024 * 1024);
+
+            // Use 50% threshold - chain detection will catch pathological O(n²) cases
+            // Normal cluster-based ER data deserves fast in-memory storage
+            let disk_threshold_mb = memory_limit_mb / 2;
+
+            if estimated_mb < disk_threshold_mb {
                 // Fast path: fits comfortably in memory
                 debug_println!(
                     "   ✅ Using in-memory storage ({}MB < {}MB limit)",
                     estimated_mb,
-                    memory_limit_mb / 2
+                    disk_threshold_mb
                 );
                 Box::new(InMemoryStorage::new())
             } else {
@@ -174,7 +299,7 @@ impl PartitionHierarchy {
                 debug_println!(
                     "   💾 Using disk storage ({}MB >= {}MB limit)",
                     estimated_mb,
-                    memory_limit_mb / 2
+                    disk_threshold_mb
                 );
                 Box::new(
                     DiskStorage::new()
@@ -321,6 +446,9 @@ impl PartitionHierarchy {
         let mut processed_edges = 0;
         let mut last_progress_report = std::time::Instant::now();
 
+        // Chain pattern detection for O(n²) memory usage warning
+        let mut chain_detector = ChainDetector::new(total_edges);
+
         for (group_idx, (threshold, edges_at_threshold)) in threshold_groups.iter().enumerate() {
             // Pre-allocate for this threshold's processing
             let mut processed_pairs = HashSet::with_capacity(edges_at_threshold.len());
@@ -355,6 +483,10 @@ impl PartitionHierarchy {
 
                         let merged_component =
                             component_manager.create_merged_component(&merging_components);
+
+                        // Record merge for chain pattern detection
+                        chain_detector.record_merge(&merged_component, &merging_components);
+
                         let merge_event = MergeEvent::new(*threshold, merging_components);
                         self.storage
                             .push(merge_event)
@@ -364,6 +496,9 @@ impl PartitionHierarchy {
                     }
                 }
             }
+
+            // Check for chain pattern and fail fast if detected
+            chain_detector.check_and_error()?;
 
             // Progress reporting for large datasets
             processed_edges += edges_at_threshold.len();
@@ -378,11 +513,11 @@ impl PartitionHierarchy {
                     total_edges as f64 / 1_000_000.0
                 );
 
-                // Use callback if available, otherwise fall back to eprintln
+                // Use callback if available, otherwise fall back to debug logging
                 if let Some(ref callback) = progress_callback {
                     callback(hierarchy_progress, &progress_message);
                 } else {
-                    eprintln!("      🔄 {}", progress_message);
+                    debug_println!("      🔄 {}", progress_message);
                 }
                 last_progress_report = std::time::Instant::now();
             }
@@ -599,7 +734,7 @@ impl PartitionHierarchy {
             // Report progress for large datasets
             if num_records > 1_000_000 && batch_end.is_multiple_of(500_000) {
                 let progress = batch_end as f64 / num_records as f64;
-                eprintln!(
+                debug_println!(
                     "      🔄 Reconstructing partition: {:.1}% ({:.1}M/{:.1}M records)",
                     progress * 100.0,
                     batch_end as f64 / 1_000_000.0,
@@ -695,9 +830,9 @@ mod tests {
 
     fn create_test_context() -> Arc<DataContext> {
         let ctx = DataContext::new();
-        ctx.ensure_record("test", Key::String("A".to_string()));
-        ctx.ensure_record("test", Key::String("B".to_string()));
-        ctx.ensure_record("test", Key::String("C".to_string()));
+        ctx.ensure_record("test", Key::U32(0));
+        ctx.ensure_record("test", Key::U32(1));
+        ctx.ensure_record("test", Key::U32(2));
         Arc::new(ctx)
     }
 
@@ -741,10 +876,10 @@ mod tests {
     fn test_disconnected_components() {
         let ctx = DataContext::new();
         // Create 4 records: A, B, C, D
-        ctx.ensure_record("test", Key::String("A".to_string()));
-        ctx.ensure_record("test", Key::String("B".to_string()));
-        ctx.ensure_record("test", Key::String("C".to_string()));
-        ctx.ensure_record("test", Key::String("D".to_string()));
+        ctx.ensure_record("test", Key::U32(0));
+        ctx.ensure_record("test", Key::U32(1));
+        ctx.ensure_record("test", Key::U32(2));
+        ctx.ensure_record("test", Key::U32(3));
         let ctx = Arc::new(ctx);
 
         // Create two disconnected components: A-B (0.8), C-D (0.7)
@@ -771,10 +906,10 @@ mod tests {
     fn test_same_threshold_edges_nway_merge() {
         let ctx = DataContext::new();
         // Create 4 records: A, B, C, D
-        ctx.ensure_record("test", Key::String("A".to_string()));
-        ctx.ensure_record("test", Key::String("B".to_string()));
-        ctx.ensure_record("test", Key::String("C".to_string()));
-        ctx.ensure_record("test", Key::String("D".to_string()));
+        ctx.ensure_record("test", Key::U32(0));
+        ctx.ensure_record("test", Key::U32(1));
+        ctx.ensure_record("test", Key::U32(2));
+        ctx.ensure_record("test", Key::U32(3));
         let ctx = Arc::new(ctx);
 
         // All edges have the same threshold - should create n-way merge
@@ -1085,7 +1220,7 @@ mod tests {
         let ctx = DataContext::new();
         // Create 6 records: A, B, C, D, E, F
         for i in 0..6 {
-            ctx.ensure_record("test", Key::String(format!("{}", (b'A' + i) as char)));
+            ctx.ensure_record("test", Key::U32(i as u32));
         }
         let ctx = Arc::new(ctx);
 
@@ -1129,7 +1264,7 @@ mod tests {
         let ctx = DataContext::new();
         // Create 8 records for complex hierarchy
         for i in 0..8 {
-            ctx.ensure_record("test", Key::String(format!("record_{}", i)));
+            ctx.ensure_record("test", Key::U32(i as u32));
         }
         let ctx = Arc::new(ctx);
 
@@ -1188,7 +1323,7 @@ mod tests {
         let ctx = DataContext::new();
         // Create 4 records
         for i in 0..4 {
-            ctx.ensure_record("test", Key::String(format!("record_{}", i)));
+            ctx.ensure_record("test", Key::U32(i as u32));
         }
         let ctx = Arc::new(ctx);
 
@@ -1222,5 +1357,58 @@ mod tests {
             2,
             "Below quantised thresholds: 2 pairs"
         );
+    }
+
+    #[test]
+    fn test_chain_pattern_detection() {
+        let ctx = DataContext::new();
+        // Create 200k sequential edges (chain pattern)
+        for i in 0..200_001 {
+            ctx.ensure_record("test", Key::U32(i));
+        }
+        let ctx = Arc::new(ctx);
+
+        let edges: Vec<_> = (0..200_000).map(|i| (i, i + 1, 0.85)).collect();
+
+        // Chain pattern should be rejected with an error
+        let result = PartitionHierarchy::from_edges(edges, ctx, 2, None);
+
+        assert!(result.is_err(), "Chain pattern should be rejected");
+        if let Err(error_msg) = result {
+            assert!(
+                error_msg.contains("UNSUPPORTED DATA PATTERN"),
+                "Error should mention unsupported pattern, got: {}",
+                error_msg
+            );
+            assert!(
+                error_msg.contains("sequential chain"),
+                "Error should describe chain pattern, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_cluster_pattern_no_warning() {
+        let ctx = DataContext::new();
+        // Create 200k edges in cluster pattern (2000 clusters of 100)
+        for i in 0..200_000 {
+            ctx.ensure_record("test", Key::U32(i));
+        }
+        let ctx = Arc::new(ctx);
+
+        let mut edges = Vec::new();
+        for cluster_id in 0..2000 {
+            let base = cluster_id * 100;
+            for i in 0..99 {
+                edges.push((base + i, base + i + 1, 0.85));
+            }
+        }
+
+        let hierarchy = PartitionHierarchy::from_edges(edges, ctx, 2, None).unwrap();
+
+        // Cluster pattern should NOT trigger warning (stays in-memory)
+        // This is harder to test without capturing stderr, but we can check it completes
+        assert!(hierarchy.merge_events_count() > 0);
     }
 }

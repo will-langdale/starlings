@@ -18,9 +18,12 @@ mod tests {
     fn test_basic_functionality() {
         let ctx = DataContext::new();
 
-        let id1 = ctx.ensure_record("test", Key::String("hello".to_string()));
-        let id2 = ctx.ensure_record("test", Key::String("world".to_string()));
-        let id3 = ctx.ensure_record("test", Key::String("hello".to_string()));
+        let hello_id = ctx.intern_string("hello");
+        let world_id = ctx.intern_string("world");
+
+        let id1 = ctx.ensure_record("test", Key::InternedString(hello_id));
+        let id2 = ctx.ensure_record("test", Key::InternedString(world_id));
+        let id3 = ctx.ensure_record("test", Key::InternedString(hello_id));
 
         assert_eq!(id1, 0);
         assert_eq!(id2, 1);

@@ -163,8 +163,8 @@ mod tests {
     fn test_assimilate_different_context() {
         // Create source context and hierarchy
         let source_context = Arc::new(DataContext::new());
-        source_context.ensure_record("source1", Key::String("key1".to_string()));
-        source_context.ensure_record("source1", Key::String("key2".to_string()));
+        source_context.ensure_record("source1", Key::U32(1));
+        source_context.ensure_record("source1", Key::U32(2));
 
         let edges = vec![(0, 1, 0.9)];
         let source_hierarchy =
@@ -187,9 +187,9 @@ mod tests {
     fn test_assimilate_overlapping_records() {
         // Create source context with some records
         let source_context = Arc::new(DataContext::new());
-        source_context.ensure_record("source1", Key::String("key1".to_string()));
-        source_context.ensure_record("source1", Key::String("key2".to_string()));
-        source_context.ensure_record("source1", Key::String("key3".to_string()));
+        source_context.ensure_record("source1", Key::U32(1));
+        source_context.ensure_record("source1", Key::U32(2));
+        source_context.ensure_record("source1", Key::U32(3));
 
         let edges = vec![(0, 1, 0.9), (1, 2, 0.8)];
         let source_hierarchy =
@@ -197,8 +197,8 @@ mod tests {
 
         // Create target context with overlapping records
         let target_context = Arc::new(DataContext::new());
-        target_context.ensure_record("source1", Key::String("key1".to_string())); // Overlaps
-        target_context.ensure_record("source1", Key::String("key4".to_string())); // Different
+        target_context.ensure_record("source1", Key::U32(1)); // Overlaps
+        target_context.ensure_record("source1", Key::U32(4)); // Different
 
         // Assimilate
         let result = assimilate_hierarchy(source_hierarchy, &target_context).unwrap();

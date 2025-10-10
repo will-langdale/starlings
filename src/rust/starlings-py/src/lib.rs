@@ -203,7 +203,7 @@ impl PyCollection {
         // Pre-flight safety check using global safety system
         let _num_entities = edges.len() / 5; // Rough estimate: 5 edges per entity on average
                                              // Ensure at least 1MB for small datasets to avoid integer division to 0
-        let estimated_mb = ((edges.len() * 100) / (1024 * 1024)).max(1); // 100 bytes per edge estimate
+        let estimated_mb = ((edges.len() * 60) / (1024 * 1024)).max(1); // 60 bytes per edge estimate (with interning)
 
         // Global safety check replaces context.resource_monitor
         ensure_memory_safety(estimated_mb as u64).map_err(map_safety_error)?;
@@ -245,9 +245,9 @@ impl PyCollection {
         key_to_id.reserve(estimated_records);
 
         for (key1_obj, key2_obj, threshold) in edges {
-            // Convert Python objects to Rust Keys (bulk extraction)
-            let key1 = python_obj_to_key_fast(key1_obj, py)?;
-            let key2 = python_obj_to_key_fast(key2_obj, py)?;
+            // Convert Python objects to Rust Keys (bulk extraction with interning)
+            let key1 = python_obj_to_key_fast(key1_obj, py, &context)?;
+            let key2 = python_obj_to_key_fast(key2_obj, py, &context)?;
 
             extracted_edges.push((key1, key2, threshold));
         }
@@ -523,7 +523,7 @@ fn generate_entity_resolution_edges(
 }
 
 /// Convert Python object to Rust Key (optimised for performance)
-fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
+fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python, context: &DataContext) -> PyResult<Key> {
     // Try integer types first (most common in large datasets)
     if let Ok(i) = obj.extract::<i64>(py) {
         if i < 0 {
@@ -536,7 +536,10 @@ fn python_obj_to_key_fast(obj: Py<PyAny>, py: Python) -> PyResult<Key> {
             Ok(Key::U64(i as u64))
         }
     } else if let Ok(s) = obj.downcast_bound::<PyString>(py) {
-        Ok(Key::String(s.to_string()))
+        // CRITICAL: Intern the string instead of allocating
+        let string_value = s.to_str()?;
+        let interned_id = context.intern_string(string_value);
+        Ok(Key::InternedString(interned_id))
     } else if let Ok(b) = obj.downcast_bound::<PyBytes>(py) {
         Ok(Key::Bytes(b.as_bytes().to_vec()))
     } else {
@@ -777,7 +780,7 @@ impl PyEntityFrame {
             callback.call1(py, (0.05, "Preparing analysis"))?;
         }
 
-        // OPTIMIZED PATH for single-collection sweeps
+        // OPTIMISED PATH for single-collection sweeps
         if parsed_expressions.len() == 1 {
             if let ExpressionType::Sweep {
                 collection,
@@ -787,7 +790,7 @@ impl PyEntityFrame {
                 ..
             } = &parsed_expressions[0]
             {
-                debug_println!("🚀 Optimized path: single collection sweep");
+                debug_println!("🚀 Optimised path: single collection sweep");
 
                 let hierarchy = self.frame.get_collection(collection).ok_or_else(|| {
                     PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(

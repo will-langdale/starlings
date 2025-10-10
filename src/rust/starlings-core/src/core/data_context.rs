@@ -7,6 +7,7 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHasher;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -15,7 +16,8 @@ type FxDashMap<K, V> = DashMap<K, V, BuildHasherDefault<FxHasher>>;
 #[derive(Debug)]
 pub struct DataContext {
     pub records: BoxcarVec<InternedRecord>,
-    pub source_interner: Arc<ThreadedRodeo>,
+    pub source_interner: Arc<ThreadedRodeo>, // For source names
+    pub string_interner: Arc<ThreadedRodeo>, // For record keys
     pub identity_map: FxDashMap<InternedRecord, u32>,
     pub source_index: FxDashMap<u32, RoaringBitmap>,
     next_record_id: AtomicU32,
@@ -53,17 +55,31 @@ impl DataContext {
     pub fn with_capacity(estimated_records: usize) -> Self {
         let hasher = BuildHasherDefault::<FxHasher>::default();
 
-        // Use appropriate capacity for large datasets - don't cap at 10k
-        let interner_capacity = if estimated_records > 100_000 {
-            // For large datasets, use proportional capacity
-            Capacity::for_strings(estimated_records / 100) // 1% of records as unique strings
+        // CRITICAL FIX: Use Capacity::new(strings, bytes) instead of for_strings()
+        // for_strings() over-allocates by 32x (31GB for 350k strings!)
+        // We use explicit byte limits: ~100 bytes per string (2x safety margin over actual ~50 bytes)
+
+        // String interner: conservative byte allocation
+        let string_interner = if estimated_records > 0 {
+            // Calculate conservative byte allocation: 100 bytes per string
+            let string_bytes = NonZeroUsize::new((estimated_records * 100).max(4096)).expect(
+                "Failed to create NonZeroUsize for string interner capacity (minimum 4096 bytes)",
+            );
+
+            Arc::new(ThreadedRodeo::with_capacity(Capacity::new(
+                estimated_records,
+                string_bytes,
+            )))
         } else {
-            Capacity::for_strings(estimated_records.max(1000))
+            // No pre-allocation for empty contexts
+            Arc::new(ThreadedRodeo::new())
         };
 
         DataContext {
             records: BoxcarVec::new(),
-            source_interner: Arc::new(ThreadedRodeo::with_capacity(interner_capacity)),
+            // Source interner: small, no pre-allocation needed
+            source_interner: Arc::new(ThreadedRodeo::new()),
+            string_interner,
             identity_map: DashMap::with_capacity_and_hasher(estimated_records, hasher.clone()),
             source_index: DashMap::with_hasher(hasher),
             next_record_id: AtomicU32::new(0),
@@ -224,26 +240,31 @@ impl DataContext {
     ///
     /// This is used when creating an owned copy of a collection with its own context.
     pub fn deep_copy(&self) -> Self {
-        use lasso::Key as LassoKey;
-
-        // Create new interner with same capacity
-        let new_interner = Arc::new(ThreadedRodeo::with_capacity(Capacity::for_strings(
+        // Clone source interner - collect and sort by key to preserve ID order
+        let new_source_interner = Arc::new(ThreadedRodeo::with_capacity(Capacity::for_strings(
             self.source_interner.len(),
         )));
+        let mut source_entries: Vec<_> = self.source_interner.iter().collect();
+        source_entries.sort_by_key(|(key, _)| LassoKey::into_usize(*key));
+        for (_key, string) in source_entries {
+            new_source_interner.get_or_intern(string);
+        }
 
-        // Clone all strings from old interner to new
-        // Note: This preserves the same IDs if done in order
-        for i in 0..self.source_interner.len() {
-            let spur = lasso::Spur::try_from_usize(i).unwrap();
-            if let Some(string) = self.source_interner.try_resolve(&spur) {
-                new_interner.get_or_intern(string);
-            }
+        // Clone string interner - collect and sort by key to preserve ID order
+        let new_string_interner = Arc::new(ThreadedRodeo::with_capacity(Capacity::for_strings(
+            self.string_interner.len(),
+        )));
+        let mut string_entries: Vec<_> = self.string_interner.iter().collect();
+        string_entries.sort_by_key(|(key, _)| LassoKey::into_usize(*key));
+        for (_key, string) in string_entries {
+            new_string_interner.get_or_intern(string);
         }
 
         // Create new DataContext with cloned data
         let record_count = self.len();
         let mut new_context = DataContext::with_capacity(record_count);
-        new_context.source_interner = new_interner;
+        new_context.source_interner = new_source_interner;
+        new_context.string_interner = new_string_interner;
 
         // Copy all records
         for (_idx, record) in self.records.iter() {
@@ -290,6 +311,42 @@ impl DataContext {
         size.max(1) // Never return 0
     }
 
+    /// Intern a string and return its ID
+    ///
+    /// This is the ONLY place where strings are converted to InternedString keys.
+    /// Thread-safe: ThreadedRodeo handles concurrent access.
+    pub fn intern_string(&self, s: &str) -> u32 {
+        let spur = self.string_interner.get_or_intern(s);
+        Self::lasso_key_to_u32(spur)
+    }
+
+    /// Resolve an interned string ID back to its string value
+    ///
+    /// Used for debugging, display, and Python conversion.
+    pub fn resolve_string(&self, id: u32) -> Option<String> {
+        match LassoKey::try_from_usize(id as usize) {
+            Some(spur) => match self.string_interner.try_resolve(&spur) {
+                Some(s) => Some(s.to_string()),
+                None => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "⚠️  Failed to resolve string ID {}: Spur exists but not in interner",
+                        id
+                    );
+                    None
+                }
+            },
+            None => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "⚠️  Failed to resolve string ID {}: Invalid Spur conversion",
+                    id
+                );
+                None
+            }
+        }
+    }
+
     pub fn get_source_name(&self, source_id: u32) -> Option<String> {
         let spur = LassoKey::try_from_usize(source_id as usize)?;
         self.source_interner
@@ -322,9 +379,12 @@ mod tests {
     fn test_record_deduplication() {
         let ctx = DataContext::new();
 
-        let id1 = ctx.ensure_record("source1", Key::String("key1".to_string()));
-        let id2 = ctx.ensure_record("source1", Key::String("key1".to_string()));
-        let id3 = ctx.ensure_record("source1", Key::String("key2".to_string()));
+        let key1_id = ctx.intern_string("key1");
+        let key2_id = ctx.intern_string("key2");
+
+        let id1 = ctx.ensure_record("source1", Key::InternedString(key1_id));
+        let id2 = ctx.ensure_record("source1", Key::InternedString(key1_id));
+        let id3 = ctx.ensure_record("source1", Key::InternedString(key2_id));
 
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
@@ -346,10 +406,15 @@ mod tests {
     fn test_source_index() {
         let ctx = DataContext::new();
 
-        ctx.ensure_record("source1", Key::String("a".to_string()));
-        ctx.ensure_record("source1", Key::String("b".to_string()));
-        ctx.ensure_record("source2", Key::String("c".to_string()));
-        ctx.ensure_record("source1", Key::String("d".to_string()));
+        let a_id = ctx.intern_string("a");
+        let b_id = ctx.intern_string("b");
+        let c_id = ctx.intern_string("c");
+        let d_id = ctx.intern_string("d");
+
+        ctx.ensure_record("source1", Key::InternedString(a_id));
+        ctx.ensure_record("source1", Key::InternedString(b_id));
+        ctx.ensure_record("source2", Key::InternedString(c_id));
+        ctx.ensure_record("source1", Key::InternedString(d_id));
 
         let source1_records = ctx.get_records_by_source("source1").unwrap();
         let source2_records = ctx.get_records_by_source("source2").unwrap();
@@ -406,5 +471,121 @@ mod tests {
         assert_eq!(ctx.get_source_name(0), Some("source_a".to_string()));
         assert_eq!(ctx.get_source_name(1), Some("source_b".to_string()));
         assert_eq!(ctx.get_source_name(999), None);
+    }
+
+    #[test]
+    fn test_string_interning() {
+        let ctx = DataContext::new();
+
+        // Same string gets same ID
+        let id1 = ctx.intern_string("test");
+        let id2 = ctx.intern_string("test");
+        assert_eq!(id1, id2);
+
+        // Different strings get different IDs
+        let id3 = ctx.intern_string("other");
+        assert_ne!(id1, id3);
+
+        // Can resolve back to string
+        assert_eq!(ctx.resolve_string(id1), Some("test".to_string()));
+        assert_eq!(ctx.resolve_string(id3), Some("other".to_string()));
+    }
+
+    #[test]
+    fn test_record_with_interned_string() {
+        let ctx = DataContext::new();
+        let key_id = ctx.intern_string("customer_123");
+        let key = Key::InternedString(key_id);
+
+        let id1 = ctx.ensure_record("source1", key.clone());
+        let id2 = ctx.ensure_record("source1", key);
+
+        assert_eq!(id1, id2); // Same record
+        assert_eq!(ctx.len(), 1);
+    }
+
+    #[test]
+    fn test_deep_copy_preserves_all_strings() {
+        let ctx = DataContext::new();
+
+        // Intern a bunch of strings
+        let strings = vec!["foo", "bar", "baz", "qux", "test_123", "another"];
+        let mut ids = Vec::new();
+        for s in &strings {
+            let id = ctx.intern_string(s);
+            ids.push(id);
+        }
+
+        // Deep copy
+        let ctx2 = ctx.deep_copy();
+
+        // Verify all strings resolve in both contexts
+        for (&id, &expected) in ids.iter().zip(strings.iter()) {
+            let resolved1 = ctx
+                .resolve_string(id)
+                .expect("Original context should resolve");
+            let resolved2 = ctx2
+                .resolve_string(id)
+                .expect("Copied context should resolve");
+
+            assert_eq!(resolved1, expected);
+            assert_eq!(resolved2, expected);
+            assert_eq!(resolved1, resolved2);
+        }
+
+        // Verify lengths match
+        assert_eq!(ctx.string_interner.len(), ctx2.string_interner.len());
+    }
+
+    #[test]
+    fn test_deep_copy_with_potential_gaps() {
+        let ctx = DataContext::new();
+
+        // Intern many strings to potentially create gaps
+        for i in 0..1000 {
+            ctx.intern_string(&format!("string_{}", i));
+        }
+
+        // Deep copy should not panic
+        let ctx2 = ctx.deep_copy();
+
+        // Lengths should match
+        assert_eq!(ctx.string_interner.len(), ctx2.string_interner.len());
+    }
+
+    #[test]
+    fn test_deep_copy_with_records() {
+        let ctx = DataContext::new();
+
+        // Create some records with string keys
+        let key1_id = ctx.intern_string("record_0");
+        let key2_id = ctx.intern_string("record_1");
+        let key3_id = ctx.intern_string("record_2");
+
+        let rec1 = ctx.ensure_record("source_a", Key::InternedString(key1_id));
+        let rec2 = ctx.ensure_record("source_a", Key::InternedString(key2_id));
+        let rec3 = ctx.ensure_record("source_b", Key::InternedString(key3_id));
+
+        // Deep copy should preserve everything
+        let ctx2 = ctx.deep_copy();
+
+        // Verify all strings are preserved
+        assert_eq!(ctx2.resolve_string(key1_id), Some("record_0".to_string()));
+        assert_eq!(ctx2.resolve_string(key2_id), Some("record_1".to_string()));
+        assert_eq!(ctx2.resolve_string(key3_id), Some("record_2".to_string()));
+
+        // Verify source names are preserved
+        assert_eq!(ctx2.get_source_name(0), Some("source_a".to_string()));
+        assert_eq!(ctx2.get_source_name(1), Some("source_b".to_string()));
+
+        // Verify records exist
+        assert_eq!(ctx2.len(), 3);
+        let copied_rec1 = ctx2.get_record(rec1).unwrap();
+        let copied_rec2 = ctx2.get_record(rec2).unwrap();
+        let copied_rec3 = ctx2.get_record(rec3).unwrap();
+
+        assert_eq!(copied_rec1.key, Key::InternedString(key1_id));
+        assert_eq!(copied_rec2.key, Key::InternedString(key2_id));
+        assert_eq!(copied_rec3.key, Key::InternedString(key3_id));
     }
 }

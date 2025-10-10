@@ -136,11 +136,13 @@ def test_something(foo: bool, bar: int):
 ```
 
 **Code Quality Standards**:
-- All code follows British English spelling and conventions
+- All code follows British English spelling and conventions (comments, docs, variable names)
+- Note: External crate methods like `.serialized_size()` use American spelling - this is expected
 - Comprehensive type annotations and docstrings following Google style
 - DRY principles with extracted helper methods for common patterns
 - Context managers for resource management (environment variables, etc.)
 - Consistent error handling and validation patterns
+- Use `debug_println!` macro for all debug output, never direct `eprintln!` for user-facing messages
 
 ## Development workflow
 
@@ -197,6 +199,90 @@ Starlings supports several environment variables for configuration:
 
 - **`STARLINGS_DEBUG`**: Enable debug output (0 or 1, default: 0)
   - Set to 1 to enable detailed debug information during processing
+
+## Memory Spilling Architecture
+
+Starlings uses a simplified two-tier storage strategy with optional spilling for large operations. This enables safe processing of large datasets whilst maintaining excellent performance for typical workloads.
+
+### Storage Backends
+
+**Hierarchy Storage** (2 options):
+- **InMemoryStorage**: Fast, for datasets <50% of memory limit
+- **DiskStorage**: Disk-backed with LRU cache, for larger datasets
+
+Selection is automatic based on estimated size:
+```rust
+if estimated_mb < memory_limit_mb / 2 {
+    InMemoryStorage  // Fast path
+} else {
+    DiskStorage      // Large datasets (10M+ edges)
+}
+```
+
+### Spillable Operations
+
+Large operations can implement the `Spillable` trait for automatic memory management:
+
+```rust
+use starlings_core::core::spilling::{Spillable, SpillHandle, SpillError};
+
+impl Spillable for MyLargeOperation {
+    fn estimated_memory_bytes(&self) -> u64 { /* */ }
+    fn spill_to_disk(&mut self) -> Result<SpillHandle, SpillError> { /* */ }
+    fn restore_from_disk(&mut self, handle: SpillHandle) -> Result<(), SpillError> { /* */ }
+    fn is_spilled(&self) -> bool { /* */ }
+}
+```
+
+**When to spill**:
+- <100MB: Keep in memory (fast, simple)
+- 100-500MB: Check if fits in limit, spill if needed
+- >500MB: Always spill or stream
+
+**Current spillable operations**:
+- Delta algorithm state (auto-spills at 200MB)
+- Hierarchy storage (via DiskStorage backend)
+- Partition cache (self-manages with LRU eviction)
+
+### Adding Spillable Operations
+
+When adding memory-intensive features:
+
+1. **Estimate memory** before allocation:
+   ```rust
+   let estimated_mb = calculate_memory_needed();
+   ensure_memory_safety(estimated_mb)?;
+   ```
+
+2. **Implement Spillable** if operation >100MB possible:
+   ```rust
+   impl Spillable for MyOperation {
+       fn estimated_memory_bytes(&self) -> u64 {
+           // Calculate actual usage
+       }
+
+       fn spill_to_disk(&mut self) -> Result<SpillHandle, SpillError> {
+           // Serialize to temp file via create_spill_file()
+           // Clear in-memory data
+           // Return handle
+       }
+
+       fn restore_from_disk(&mut self, handle: SpillHandle) -> Result<(), SpillError> {
+           // Deserialize from handle.path
+           // Restore in-memory state
+       }
+   }
+   ```
+
+3. **Document behavior** in operation's docstring:
+   ```rust
+   /// Large operation that auto-spills at 200MB.
+   ///
+   /// Spilling is transparent - operation continues normally
+   /// but may be slower when accessing spilled data.
+   ```
+
+See `src/rust/starlings-core/src/core/spilling.rs` for complete trait definition and utilities.
 
 ## API Design
 

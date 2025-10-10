@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_record_creation() {
-        let key = Key::String("test_key".to_string());
+        let key = Key::InternedString(42); // Pretend 42 = "test_key"
         let record = InternedRecord::new(1, key.clone());
 
         assert_eq!(record.source_id, 1);
