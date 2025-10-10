@@ -588,7 +588,7 @@ class TestNewMetricsIntegration:
             assert "method_b_threshold" in result
 
 
-@pytest.mark.integration
+@pytest.mark.slow
 class TestLargeScaleExpressions:
     """Test expression API with large-scale datasets."""
 

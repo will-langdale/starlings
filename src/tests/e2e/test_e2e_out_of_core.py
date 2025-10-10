@@ -13,7 +13,7 @@ from starlings import generators
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.e2e
+@pytest.mark.slow
 class TestEndToEndOutOfCore:
     """End-to-end validation of complete out-of-core processing system."""
 

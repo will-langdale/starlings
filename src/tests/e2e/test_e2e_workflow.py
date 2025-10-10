@@ -10,7 +10,7 @@ from starlings import generators
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.e2e
+@pytest.mark.slow
 def test_user_eda_workflow():
     """Production-scale EDA workflow: Million-record minimum scale for library."""
     # Million-scale is the MINIMUM expected dataset size for production use

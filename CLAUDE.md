@@ -68,9 +68,10 @@ This project uses `just` as a command runner with a modular structure and `uv` f
   - `just build`: Standard development build
   - `just build pgo`: Profile-Guided Optimisation build for maximum performance
 - `just test`: Run test suite (see `just test list` for options)
-  - `just test`: Run all tests (Python integration + Rust core)
-  - `just test python`: Run Python integration tests only
-  - `just test rust`: Run Rust core tests only
+  - `just test`: Fast tests only (Python + Rust, <30s)
+  - `just test all`: All tests including slow tests (complete validation, 2-5min)
+  - `just test python`: Python tests only (fast)
+  - `just test rust`: Rust core tests only
 - `just bench`: Run benchmarks (see `just bench list` for options)
   - `just bench rust`: Rust core benchmarks for performance validation
   - `just bench collection`: End-to-end processing benchmarks (accepts scale parameter)
@@ -81,7 +82,7 @@ This project uses `just` as a command runner with a modular structure and `uv` f
 
 ## Testing strategy
 
-The project uses a **three-layer testing approach** that achieves comprehensive coverage whilst maintaining system safety:
+The project uses a **three-layer testing approach** that achieves comprehensive coverage whilst maintaining development velocity:
 
 **Layer 1: Pure Rust core tests** (69 tests)
 - All business logic tested in `starlings-core` crate
@@ -89,23 +90,25 @@ The project uses a **three-layer testing approach** that achieves comprehensive 
 - Full coverage of data structures, algorithms, and edge cases
 - Run via: `cargo test -p starlings-core`
 
-**Layer 2: Python integration tests** (19 tests)
-- Unit tests with small datasets (< 1000 entities) for basic functionality
-- E2E tests with production-scale datasets (100k-1M entities) for safety validation
-- Tests PyO3 wrapper functionality, type conversions, error handling
+**Layer 2: Python integration tests** (~70 tests)
+- **Fast tests** (default): Small to medium datasets, complete in <30s
+- **Slow tests** (optional): Large-scale datasets (100k-1M entities), complete in 2-5min
+- Tests PyO3 wrapper functionality, type conversions, error handling, safety validation
 - **SAFE**: All tests run with `STARLINGS_MEMORY_LIMIT=50%`
-- Run via: `just test` (safe by default with production validation)
+- Run via: `just test` (fast tests only) or `just test all` (complete validation)
 - **IMPORTANT**: When running Python tests directly (not via `just`), always use `uv run pytest` to ensure correct virtual environment
 
-**Layer 3: Stress testing** (12+ tests)  
-- Memory pressure simulation, resource exhaustion scenarios
-- Circuit breaker validation under artificial system stress
-- **DANGEROUS**: Artificially consumes system resources to test limits
-- Run via: `just test dangerous` (explicit opt-in required)
+**Layer 3: Benchmarks** (9 tests in separate suite)
+- Performance benchmarks for Rust core and end-to-end processing
+- Production-scale performance testing with PGO builds
+- Run via: `just bench` (never included in test suite)
 
 This **"Rust Core with Python Bindings"** pattern ensures complete test coverage whilst avoiding complex PyO3 test configuration. The Rust core handles all business logic testing, whilst Python tests validate the integration boundary.
 
-**Safety by Default**: The default `just test` command runs safe tests including production-scale validation that demonstrate the safety system working correctly. The safety system automatically prevents system crashes during large-scale operations. Only stress tests that artificially exhaust system resources require explicit opt-in via `just test dangerous`.
+**Testing workflow**:
+- **Development** (continuous): `just test` - fast tests only (~70 tests, <30s)
+- **Pre-commit** (occasional): `just test all` - all tests including slow (~75 tests, 2-5min)
+- **Performance validation**: `just bench` - benchmarks only (separate suite)
 
 ### Benchmarking and performance
 

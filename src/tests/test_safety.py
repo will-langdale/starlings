@@ -6,12 +6,10 @@ production-scale scenarios, without requiring artificial memory pressure.
 
 import os
 
-import pytest
 import starlings as sl
 from starlings import generators
 
 
-@pytest.mark.safety
 class TestSafetyMechanisms:
     """Test that operations respect memory limits."""
 

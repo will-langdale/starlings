@@ -68,13 +68,8 @@ testpaths = [
     "src/tests",
 ]
 markers = [
-    "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
-    "safety: marks tests as safety mechanism tests",
-    "stress: marks tests as stress/load tests", 
-    "performance: marks tests as performance impact tests",
-    "integration: marks tests as integration tests",
-    "e2e: marks tests as end-to-end validation tests",
-    "slow: marks tests as slow-running tests",
+    "benchmark: marks tests as benchmarks (run via just bench)",
+    "slow: marks tests as slow-running tests (>5s, large datasets)",
 ]
 addopts = "-m 'not benchmark'"
 log_cli = true

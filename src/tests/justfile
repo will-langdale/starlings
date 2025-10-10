@@ -5,35 +5,29 @@ set export
 STARLINGS_DEBUG := "1"
 STARLINGS_MEMORY_LIMIT := "50%"
 
-# Run all tests (Python + Rust) - SAFE BY DEFAULT with safety validation
+# Run fast tests (Python + Rust) - default for continuous development
 default: python rust
-    @echo "✅ Ran safe tests with production-scale safety validation (Python + Rust). Use 'just test dangerous' for stress tests."
+    @echo "✅ Fast tests passed (Python + Rust). Use 'just test all' for complete validation."
 
 # List all commands
 list:
     just -f ./src/tests/justfile --list
 
-# Run Python tests (safe tests + e2e safety validation)
+# Run Python tests (fast tests only, excludes slow tests)
 python:
-    @echo "Running Python tests (unit tests + e2e safety validation)..."
-    uv run pytest -m "not stress and not safety and not benchmark and not integration and not performance"
+    @echo "Running Python tests (fast tests, <30s)..."
+    uv run pytest -m "not benchmark and not slow"
+
+# Run all Python tests including slow tests
+all-python:
+    @echo "Running all Python tests including slow tests..."
+    uv run pytest -m "not benchmark"
 
 # Run only Rust tests
 rust:
     @echo "Running Rust core tests..."
     cargo test -p starlings-core
 
-# Run safety tests (memory limits, production scenarios)
-safety:
-    @echo "Running safety mechanism tests..."
-    STARLINGS_MEMORY_LIMIT=1GB uv run pytest src/tests/test_safety.py -v -m safety
-
-# Run end-to-end tests (large datasets, use with caution)
-e2e:
-    @echo "Running end-to-end tests (large datasets)..."
-    @echo "⚠️  WARNING: These tests use large datasets and may consume significant resources"
-    uv run pytest src/tests/e2e/ -v -m e2e
-
-# Run all dangerous tests (e2e large datasets)
-dangerous: safety e2e
-    @echo "✅ All dangerous tests completed"
+# Run all tests including slow tests (complete validation)
+all: all-python rust
+    @echo "✅ All tests passed (Python + Rust, including slow tests)"
