@@ -12,8 +12,7 @@ fn benchmark_10m_record_insertion(c: &mut Criterion) {
             for i in 0..1_000_000 {
                 // Mix different key types for realism
                 match i % 4 {
-                    0 => ctx
-                        .ensure_record("customers", Key::String(format!("cust_{}", black_box(i)))),
+                    0 => ctx.ensure_record("customers", Key::U32(black_box(i as u32))),
                     1 => ctx.ensure_record("transactions", Key::U64(black_box(i as u64))),
                     2 => ctx.ensure_record("products", Key::U32(black_box(i as u32))),
                     3 => ctx

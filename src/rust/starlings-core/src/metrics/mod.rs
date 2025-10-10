@@ -185,7 +185,7 @@ impl MetricEngine {
         algorithm.compute_sweep_arc(partitions1, partitions2, metrics, context)
     }
 
-    /// Optimized single-collection sweep using only merge events (no partition building)
+    /// Optimised single-collection sweep using only merge events (no partition building)
     /// This method builds ONLY the first partition and uses merge events for all others
     pub fn compute_single_sweep_with_merges(
         &mut self,

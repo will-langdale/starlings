@@ -10,7 +10,7 @@ fn generate_test_hierarchy(entity_count: usize) -> PartitionHierarchy {
     // Create mixed record types for realistic benchmarking
     for i in 0..entity_count {
         match i % 4 {
-            0 => ctx.ensure_record("customers", Key::String(format!("cust_{}", i))),
+            0 => ctx.ensure_record("customers", Key::U32(i as u32)),
             1 => ctx.ensure_record("transactions", Key::U64(1000000 + i as u64)),
             2 => ctx.ensure_record("products", Key::U32(i as u32)),
             3 => ctx.ensure_record("addresses", Key::Bytes(format!("addr_{}", i).into_bytes())),

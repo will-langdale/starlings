@@ -10,9 +10,9 @@ fn generate_test_edges(entity_count: usize) -> (Vec<(u32, u32, f64)>, Arc<DataCo
     // Create mixed record types for realistic benchmarking
     for i in 0..entity_count {
         match i % 4 {
-            0 => ctx.ensure_record("customers", Key::String(format!("cust_{}", i))),
+            0 => ctx.ensure_record("customers", Key::U32(i as u32)),
             1 => ctx.ensure_record("transactions", Key::U64(1000000 + i as u64)),
-            2 => ctx.ensure_record("products", Key::String(format!("prod_{}", i))),
+            2 => ctx.ensure_record("products", Key::U32((i + 1000000) as u32)),
             3 => ctx.ensure_record("addresses", Key::U32(i as u32)),
             _ => unreachable!(),
         };

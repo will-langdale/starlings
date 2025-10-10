@@ -36,12 +36,14 @@
 
 use super::common::choose_2;
 use super::{ComparisonType, ComplexityEstimate, MetricAlgorithm, MetricResults, MetricType};
+use crate::core::spilling::{create_spill_file, SpillError, SpillHandle, Spillable};
 use crate::hierarchy::MergeEvent;
 use crate::metrics::contingency::{
     compute_conditional_entropy, compute_entropy_from_sizes, ContingencyMetrics,
 };
 use crate::{debug_println, DataContext, PartitionLevel};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -57,12 +59,17 @@ type CanonicalId = u32;
 pub struct DeltaAlgorithm {
     /// Current incremental state (if any)
     state: Option<DeltaState>,
+    /// Handle to spilled state on disk (if spilled)
+    spilled_handle: Option<SpillHandle>,
+    /// Threshold for auto-spilling (200MB default)
+    spill_threshold_bytes: u64,
     /// Threshold for deciding when to rebuild vs update incrementally
     /// If the threshold gap exceeds this value, a full rebuild is performed
     rebuild_threshold: f64,
 }
 
 /// State maintained between computations for incremental updates
+#[derive(Serialize, Deserialize)]
 struct DeltaState {
     /// Last threshold processed
     last_threshold: f64,
@@ -316,6 +323,8 @@ impl DeltaAlgorithm {
     pub fn with_rebuild_threshold(rebuild_threshold: f64) -> Self {
         Self {
             state: None,
+            spilled_handle: None,
+            spill_threshold_bytes: 200 * 1024 * 1024, // 200MB default
             rebuild_threshold,
         }
     }
@@ -344,6 +353,16 @@ impl DeltaAlgorithm {
             first_partition.threshold()
         );
         self.state = Some(Self::build_initial_state(first_partition, None));
+        // Auto-spill if state is large
+        if let Some(ref state) = self.state {
+            let state_mb = state.estimated_memory_mb();
+            if state_mb * 1024 * 1024 > self.spill_threshold_bytes {
+                let _ = self
+                    .spill_to_disk()
+                    .map_err(|e| crate::debug_println!("⚠️  Failed to spill: {}", e));
+                crate::debug_println!("   💾 Auto-spilled delta state ({}MB)", state_mb);
+            }
+        }
         results.push(self.compute_metrics_from_state(metrics));
 
         // Process all subsequent thresholds using ONLY merge events
@@ -902,6 +921,63 @@ impl DeltaAlgorithm {
     }
 }
 
+impl Spillable for DeltaAlgorithm {
+    fn estimated_memory_bytes(&self) -> u64 {
+        if let Some(ref state) = self.state {
+            state.estimated_memory_mb() * 1024 * 1024
+        } else {
+            0
+        }
+    }
+
+    fn spill_to_disk(&mut self) -> Result<SpillHandle, SpillError> {
+        if self.is_spilled() {
+            return Err(SpillError::AlreadySpilled);
+        }
+
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| SpillError::Serialization("No state to spill".into()))?;
+
+        let temp_file = create_spill_file("delta_state")?;
+        let path = temp_file.path().to_path_buf();
+
+        // Serialize state to file
+        let serialized = bincode::serialize(&state)
+            .map_err(|e| SpillError::Serialization(format!("Bincode error: {}", e)))?;
+        let size_bytes = serialized.len() as u64;
+        std::fs::write(&path, serialized)?;
+
+        let handle = SpillHandle { path, size_bytes };
+
+        crate::debug_println!(
+            "💾 Spilled delta state ({} MB) to disk",
+            handle.size_bytes / (1024 * 1024)
+        );
+
+        self.spilled_handle = Some(handle.clone());
+        Ok(handle)
+    }
+
+    fn restore_from_disk(&mut self, _handle: SpillHandle) -> Result<(), SpillError> {
+        let handle = self.spilled_handle.take().ok_or(SpillError::NotSpilled)?;
+
+        let data = std::fs::read(&handle.path)?;
+        let state: DeltaState = bincode::deserialize(&data)
+            .map_err(|e| SpillError::Serialization(format!("Bincode error: {}", e)))?;
+
+        crate::debug_println!("♻️  Restored delta state from disk");
+
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn is_spilled(&self) -> bool {
+        self.spilled_handle.is_some()
+    }
+}
+
 impl MetricAlgorithm for DeltaAlgorithm {
     fn name(&self) -> &'static str {
         "Delta-based (O(k) incremental)"
@@ -1041,6 +1117,16 @@ impl MetricAlgorithm for DeltaAlgorithm {
             // Full rebuild
             debug_println!("  🔨 Building initial state at {}", partition1.threshold());
             self.state = Some(Self::build_initial_state(partition1, partition2));
+            // Auto-spill if state is large
+            if let Some(ref state) = self.state {
+                let state_mb = state.estimated_memory_mb();
+                if state_mb * 1024 * 1024 > self.spill_threshold_bytes {
+                    let _ = self
+                        .spill_to_disk()
+                        .map_err(|e| crate::debug_println!("⚠️  Failed to spill: {}", e));
+                    crate::debug_println!("   💾 Auto-spilled delta state ({}MB)", state_mb);
+                }
+            }
         }
 
         // Compute metrics from state

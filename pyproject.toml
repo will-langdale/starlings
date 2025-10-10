@@ -64,6 +64,9 @@ module = "starlings.starlings"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+testpaths = [
+    "src/tests",
+]
 markers = [
     "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
     "safety: marks tests as safety mechanism tests",

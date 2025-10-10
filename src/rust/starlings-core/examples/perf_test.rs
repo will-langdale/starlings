@@ -25,7 +25,7 @@ fn generate_entity_resolution_test_edges(
     let ctx = DataContext::new();
     for i in 0..num_entities {
         let key = match i % 4 {
-            0 => Key::String(format!("cust_{}", i)),
+            0 => Key::U32(i as u32),
             1 => Key::U64(1000000 + i as u64),
             2 => Key::U32(i as u32),
             3 => Key::Bytes(format!("addr_{}", i).into_bytes()),
@@ -73,7 +73,7 @@ fn generate_random_test_edges(num_edges: usize) -> (Vec<(u32, u32, f64)>, Arc<Da
     // Create mixed record types
     for i in 0..num_nodes {
         let key = match i % 4 {
-            0 => Key::String(format!("cust_{}", i)),
+            0 => Key::U32(i as u32),
             1 => Key::U64(1000000 + i as u64),
             2 => Key::U32(i as u32),
             3 => Key::Bytes(format!("addr_{}", i).into_bytes()),

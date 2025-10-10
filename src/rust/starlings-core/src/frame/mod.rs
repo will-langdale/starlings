@@ -120,9 +120,9 @@ mod tests {
         let context = frame.context().clone();
 
         // Add records to context first
-        context.ensure_record("source", Key::String("key1".to_string()));
-        context.ensure_record("source", Key::String("key2".to_string()));
-        context.ensure_record("source", Key::String("key3".to_string()));
+        context.ensure_record("source", Key::U32(1));
+        context.ensure_record("source", Key::U32(2));
+        context.ensure_record("source", Key::U32(3));
 
         // Create hierarchy with same context
         let edges = vec![(0, 1, 0.9), (1, 2, 0.8)];
@@ -139,8 +139,8 @@ mod tests {
         let context = frame.context().clone();
 
         // Add records to context first
-        context.ensure_record("source", Key::String("key1".to_string()));
-        context.ensure_record("source", Key::String("key2".to_string()));
+        context.ensure_record("source", Key::U32(1));
+        context.ensure_record("source", Key::U32(2));
 
         for i in 0..3 {
             let edges = vec![(0, 1, 0.9)];
@@ -164,10 +164,10 @@ mod tests {
         let context = frame.context().clone();
 
         // Add records to context first
-        context.ensure_record("source", Key::String("key1".to_string())); // 0
-        context.ensure_record("source", Key::String("key2".to_string())); // 1
-        context.ensure_record("source", Key::String("key3".to_string())); // 2
-        context.ensure_record("source", Key::String("key4".to_string())); // 3
+        context.ensure_record("source", Key::U32(1)); // 0
+        context.ensure_record("source", Key::U32(2)); // 1
+        context.ensure_record("source", Key::U32(3)); // 2
+        context.ensure_record("source", Key::U32(4)); // 3
 
         // Add two collections with same context
         let hierarchy1 =

@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 pub enum Key {
     U32(u32),
     U64(u64),
-    String(String),
+    InternedString(u32), // ID into DataContext.string_interner
     Bytes(Vec<u8>),
 }
 
@@ -13,7 +13,7 @@ impl PartialEq for Key {
         match (self, other) {
             (Key::U32(a), Key::U32(b)) => a == b,
             (Key::U64(a), Key::U64(b)) => a == b,
-            (Key::String(a), Key::String(b)) => a == b,
+            (Key::InternedString(a), Key::InternedString(b)) => a == b,
             (Key::Bytes(a), Key::Bytes(b)) => a == b,
             _ => false,
         }
@@ -28,7 +28,7 @@ impl Hash for Key {
         match self {
             Key::U32(v) => v.hash(state),
             Key::U64(v) => v.hash(state),
-            Key::String(v) => v.hash(state),
+            Key::InternedString(id) => id.hash(state),
             Key::Bytes(v) => v.hash(state),
         }
     }
@@ -46,18 +46,29 @@ impl Key {
     }
 
     #[must_use]
-    pub fn from_string(v: String) -> Self {
-        Key::String(v)
-    }
-
-    #[must_use]
-    pub fn from_str_value(v: &str) -> Self {
-        Key::String(v.to_string())
-    }
-
-    #[must_use]
     pub fn from_bytes(v: Vec<u8>) -> Self {
         Key::Bytes(v)
+    }
+
+    /// Create interned string key (requires DataContext to actually intern)
+    #[must_use]
+    pub fn from_interned_string(id: u32) -> Self {
+        Key::InternedString(id)
+    }
+
+    /// Check if this key is an interned string
+    #[must_use]
+    pub fn is_interned_string(&self) -> bool {
+        matches!(self, Key::InternedString(_))
+    }
+
+    /// Get the interner ID if this is an interned string
+    #[must_use]
+    pub fn as_interned_string(&self) -> Option<u32> {
+        match self {
+            Key::InternedString(id) => Some(*id),
+            _ => None,
+        }
     }
 }
 
@@ -73,9 +84,10 @@ mod tests {
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
 
-        let s1 = Key::String("hello".to_string());
-        let s2 = Key::String("hello".to_string());
-        let s3 = Key::String("world".to_string());
+        // Interned strings with same ID are equal
+        let s1 = Key::InternedString(42);
+        let s2 = Key::InternedString(42);
+        let s3 = Key::InternedString(43);
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
 
@@ -96,11 +108,12 @@ mod tests {
 
         let mut set = HashSet::new();
         set.insert(Key::U32(42));
-        set.insert(Key::String("hello".to_string()));
+        set.insert(Key::InternedString(100));
         set.insert(Key::Bytes(vec![1, 2, 3]));
 
         assert!(set.contains(&Key::U32(42)));
-        assert!(set.contains(&Key::String("hello".to_string())));
+        assert!(set.contains(&Key::InternedString(100)));
+        assert!(!set.contains(&Key::InternedString(101)));
         assert!(set.contains(&Key::Bytes(vec![1, 2, 3])));
         assert!(!set.contains(&Key::U32(43)));
     }
@@ -109,10 +122,21 @@ mod tests {
     fn test_different_types_not_equal() {
         let k1 = Key::U32(42);
         let k2 = Key::U64(42);
-        let k3 = Key::String("42".to_string());
+        let k3 = Key::InternedString(42);
 
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k2, k3);
+    }
+
+    #[test]
+    fn test_interned_string_helpers() {
+        let key = Key::InternedString(123);
+        assert!(key.is_interned_string());
+        assert_eq!(key.as_interned_string(), Some(123));
+
+        let key_u32 = Key::U32(42);
+        assert!(!key_u32.is_interned_string());
+        assert_eq!(key_u32.as_interned_string(), None);
     }
 }
