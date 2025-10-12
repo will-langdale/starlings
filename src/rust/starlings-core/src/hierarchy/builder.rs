@@ -73,11 +73,11 @@ impl ComponentManager<'_> {
         }
     }
 
-    fn create_merged_component(&self, components: &[RoaringBitmap]) -> RoaringBitmap {
+    fn create_merged_component(&self, components: &[&RoaringBitmap]) -> RoaringBitmap {
         let total_size = components.iter().map(|b| b.len()).sum::<u64>() as u32;
         let (mut merged, _) = self.bitmap_pool.get(total_size);
         for component in components {
-            merged |= component;
+            merged |= *component;
         }
         merged
     }
@@ -108,7 +108,7 @@ impl ChainDetector {
     fn record_merge(
         &mut self,
         merged_component: &RoaringBitmap,
-        merging_components: &[RoaringBitmap],
+        merging_components: &[&RoaringBitmap],
     ) {
         self.edges_processed += 1;
 
@@ -172,9 +172,9 @@ impl ChainDetector {
                  - Entity resolution model needs better tuning (thresholds too low?)\n\
                  - Data needs more cleaning before matching\n\
                  \n\
-                 If you're using synthetic test data, create realistic clusters instead:\n\
+                 If you are using synthetic test data, create realistic clusters instead:\n\
                  \n\
-                   # ❌ Don't create chains:\n\
+                   # ❌ Do not create chains:\n\
                    edges = [(i, i+1, 0.85) for i in range(n)]\n\
                  \n\
                    # ✅ Do create clusters (100 records per group):\n\
@@ -264,7 +264,7 @@ impl PartitionHierarchy {
             let monitor = global_resource_monitor();
             let memory_limit_mb = monitor.get_memory_limit_mb();
 
-            // Improved memory estimation accounting for worst-case O(n²) behavior:
+            // Improved memory estimation accounting for worst-case O(n²) behaviour:
             // - MergeEvents store full component bitmaps
             // - For chain-like patterns, memory usage is O(n²)
             // - Observed: 100k edges = 1.6GB, 500k edges ≈ 40GB
@@ -276,7 +276,7 @@ impl PartitionHierarchy {
                 // Medium datasets: use middle-ground estimate
                 10_000
             } else {
-                // Small datasets: use optimistic estimate (normal O(n) behavior)
+                // Small datasets: use optimistic estimate (normal O(n) behaviour)
                 1_000
             };
 
@@ -476,18 +476,32 @@ impl PartitionHierarchy {
                             component_manager.get_or_create_component(root_src, src);
                         let component_dst =
                             component_manager.get_or_create_component(root_dst, dst);
-                        let merging_components = vec![component_src, component_dst];
+
+                        // Determine parent and child for binary merge
+                        // Parent is the partition with the smaller canonical ID (more stable)
+                        let (parent_bitmap, child_bitmap) =
+                            if component_src.min().unwrap() < component_dst.min().unwrap() {
+                                (&component_src, &component_dst)
+                            } else {
+                                (&component_dst, &component_src)
+                            };
+
+                        let parent_id = parent_bitmap
+                            .min()
+                            .expect("Parent component cannot be empty");
+                        let child_nodes = child_bitmap.clone();
 
                         uf.union(src as usize, dst as usize);
                         let new_root = uf.find(src as usize);
 
-                        let merged_component =
-                            component_manager.create_merged_component(&merging_components);
+                        let merged_component = component_manager
+                            .create_merged_component(&[&component_src, &component_dst]);
 
                         // Record merge for chain pattern detection
-                        chain_detector.record_merge(&merged_component, &merging_components);
+                        chain_detector
+                            .record_merge(&merged_component, &[&component_src, &component_dst]);
 
-                        let merge_event = MergeEvent::new(*threshold, merging_components);
+                        let merge_event = MergeEvent::new(*threshold, parent_id, child_nodes);
                         self.storage
                             .push(merge_event)
                             .map_err(|e| format!("Storage error: {}", e))?;
@@ -678,19 +692,9 @@ impl PartitionHierarchy {
                 break;
             }
 
-            // Collect all records from all merging groups
-            let mut all_records = Vec::new();
-            for group in &merge.merging_groups {
-                for record in group.iter() {
-                    all_records.push(record);
-                }
-            }
-
-            // Union all records together (using first as representative)
-            if let Some(&first) = all_records.first() {
-                for &record in all_records.iter().skip(1) {
-                    uf.union(first as usize, record as usize);
-                }
+            // Apply binary delta: union all child nodes with parent
+            for node in merge.child_nodes.iter() {
+                uf.union(merge.parent_id as usize, node as usize);
             }
         }
 
@@ -865,11 +869,11 @@ mod tests {
 
         // First merge should be at threshold 0.8 (A-B)
         assert_eq!(merges[0].threshold, 0.8);
-        assert_eq!(merges[0].merging_groups.len(), 2); // Two singletons merge
+        assert_eq!(merges[0].child_nodes.len(), 1); // Binary merge: one singleton absorbed
 
         // Second merge should be at threshold 0.6 ((A,B)-C)
         assert_eq!(merges[1].threshold, 0.6);
-        assert_eq!(merges[1].merging_groups.len(), 2); // Group {A,B} merges with {C}
+        assert_eq!(merges[1].child_nodes.len(), 1); // Binary merge: singleton C absorbed
     }
 
     #[test]
@@ -893,12 +897,9 @@ mod tests {
         // Should have two independent merge events
         assert_eq!(hierarchy.merge_events_count(), 2);
 
-        // Each merge should involve exactly 2 singletons
+        // Each merge should be binary (parent + child)
         for merge in hierarchy.storage.iter().unwrap() {
-            assert_eq!(merge.merging_groups.len(), 2);
-            for group in &merge.merging_groups {
-                assert_eq!(group.len(), 1); // Each group is a singleton
-            }
+            assert_eq!(merge.child_nodes.len(), 1); // Each child is a singleton
         }
     }
 

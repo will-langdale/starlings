@@ -457,24 +457,6 @@ impl DeltaAlgorithm {
         // Cache single partition metrics
         state.last_entity_count = Some(state.row_marginals.len() as f64);
 
-        // Calculate entropy for partition1
-        if state.total_records > 0 {
-            let mut entropy = 0.0;
-            let total = state.total_records as f64;
-            for &size in state.row_marginals.values() {
-                if size > 0 {
-                    let proportion = size as f64 / total;
-                    entropy -= proportion * proportion.log2();
-                }
-            }
-            state.last_entropy = Some(entropy);
-        } else {
-            state.last_entropy = Some(0.0);
-        }
-
-        // Calculate initial single partition metrics
-        state.last_entity_count = Some(state.row_marginals.len() as f64);
-
         // Calculate initial entropy from marginals
         if state.total_records > 0 {
             let mut entropy = 0.0;
@@ -588,31 +570,18 @@ impl DeltaAlgorithm {
             //     event.merging_groups().len()
             // );
 
-            // Each merge event contains groups that are merging
+            // Each merge event is a binary merge: parent absorbs child
             // We need to:
-            // 1. Find which old entities these groups represent
+            // 1. Get the canonical IDs of parent and child
             // 2. Update our state to reflect the merge
 
-            let groups = event.merging_groups();
-            if groups.len() < 2 {
-                continue; // No actual merge if less than 2 groups
-            }
+            // Binary delta: we have parent and child
+            let child_canonical = event.child_id();
+            let parent_canonical = event.parent_id;
 
-            // Find canonical IDs of merging entities
-            let mut merging_canonicals = Vec::new();
-            for group in groups {
-                // The minimum record in each group is its canonical ID
-                if let Some(min_record) = group.min() {
-                    merging_canonicals.push(min_record);
-                }
-            }
-
-            if merging_canonicals.len() < 2 {
-                continue; // No merge needed
-            }
-
-            // The new canonical ID is the minimum of all merging canonicals
-            let new_canonical = *merging_canonicals.iter().min().unwrap();
+            // The parent becomes the new canonical ID (it's the "winner")
+            let new_canonical = parent_canonical;
+            let merging_canonicals = vec![parent_canonical, child_canonical];
 
             // Update row marginals: sum the sizes of merging entities
             let mut merged_size = 0u32;

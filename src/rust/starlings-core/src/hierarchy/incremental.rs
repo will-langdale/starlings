@@ -159,27 +159,15 @@ impl IncrementalPartitionBuilder {
         uf: &mut UnionFind<B>,
         merge: &MergeEvent,
     ) {
-        // Collect all records from all merging groups
-        let all_records: Vec<u32> = merge
-            .merging_groups
-            .iter()
-            .flat_map(|group| group.iter())
-            .collect();
-
-        // Early return if no records to merge
-        let Some(&first) = all_records.first() else {
-            return;
-        };
-
-        // Union all records together (using first as representative)
-        for &record in &all_records[1..] {
-            uf.union(first as usize, record as usize);
+        // Apply binary delta: union all child nodes with parent
+        for node in merge.child_nodes.iter() {
+            uf.union(merge.parent_id as usize, node as usize);
         }
 
-        // Update canonical ID for the new root
-        let root = uf.find(first as usize);
-        let min_record = all_records.into_iter().min().unwrap_or(first);
-        self.canonical_ids.insert(root, min_record);
+        // Update canonical ID for the merged entity
+        let root = uf.find(merge.parent_id as usize);
+        // Parent ID is already the canonical ID, so keep it
+        self.canonical_ids.insert(root, merge.parent_id);
     }
 
     /// Build a PartitionLevel from the current union-find state

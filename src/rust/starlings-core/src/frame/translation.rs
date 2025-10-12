@@ -105,17 +105,20 @@ fn translate_merge_events(
     let source_merges = hierarchy.get_merge_events();
 
     for merge in source_merges {
-        let mut translated_groups = Vec::new();
+        // Translate parent_id
+        let new_parent_id = translation_map
+            .translate(merge.parent_id)
+            .ok_or_else(|| format!("Failed to translate parent_id {}", merge.parent_id))?;
 
-        for group in merge.merging_groups() {
-            let translated_group = translation_map.translate_bitmap(group);
-            if !translated_group.is_empty() {
-                translated_groups.push(translated_group);
-            }
-        }
+        // Translate child_nodes bitmap
+        let new_child_nodes = translation_map.translate_bitmap(&merge.child_nodes);
 
-        if !translated_groups.is_empty() {
-            translated_merges.push(MergeEvent::new(merge.threshold(), translated_groups));
+        if !new_child_nodes.is_empty() {
+            translated_merges.push(MergeEvent::new(
+                merge.threshold,
+                new_parent_id,
+                new_child_nodes,
+            ));
         }
     }
 
