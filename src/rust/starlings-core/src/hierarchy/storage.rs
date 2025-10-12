@@ -106,7 +106,7 @@ impl HierarchyStorage for InMemoryStorage {
         let bitmap_size: u64 = self
             .events
             .iter()
-            .map(|e| e.merging_groups.iter().map(|b| b.len() * 4).sum::<u64>()) // Rough estimate: 4 bytes per element
+            .map(|e| e.child_nodes.len() * 4) // Only one bitmap per event now
             .sum();
         (event_overhead as u64) + bitmap_size
     }
@@ -191,32 +191,34 @@ impl DiskStorage {
         // Write threshold as 8 bytes
         buffer.extend_from_slice(&event.threshold.to_le_bytes());
 
-        // Write number of groups as 4 bytes
-        buffer.extend_from_slice(&(event.merging_groups.len() as u32).to_le_bytes());
+        // Write parent_id as 4 bytes
+        buffer.extend_from_slice(&event.parent_id.to_le_bytes());
 
-        // Write each bitmap
-        for bitmap in &event.merging_groups {
-            let mut bitmap_data = Vec::new();
-            bitmap.serialize_into(&mut bitmap_data).map_err(|e| {
+        // Write child_nodes bitmap
+        let mut bitmap_data = Vec::new();
+        event
+            .child_nodes
+            .serialize_into(&mut bitmap_data)
+            .map_err(|e| {
                 StorageError::Serialization(format!("Bitmap serialization failed: {}", e))
             })?;
-            // Write bitmap size as 4 bytes, then bitmap data
-            buffer.extend_from_slice(&(bitmap_data.len() as u32).to_le_bytes());
-            buffer.extend_from_slice(&bitmap_data);
-        }
+
+        // Write bitmap size as 4 bytes, then bitmap data
+        buffer.extend_from_slice(&(bitmap_data.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&bitmap_data);
 
         Ok(buffer)
     }
 
     fn deserialize_event(data: &[u8]) -> Result<MergeEvent, StorageError> {
-        if data.len() < 12 {
-            // At least threshold + group count + one bitmap size
+        if data.len() < 16 {
+            // threshold + parent_id + bitmap_size minimum
             return Err(StorageError::Serialization("Data too short".to_string()));
         }
 
         let mut offset = 0;
 
-        // Read threshold
+        // Read threshold (8 bytes)
         let threshold = f64::from_le_bytes(
             data[offset..offset + 8]
                 .try_into()
@@ -224,43 +226,34 @@ impl DiskStorage {
         );
         offset += 8;
 
-        // Read number of groups
-        let num_groups =
+        // Read parent_id (4 bytes)
+        let parent_id = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .map_err(|_| StorageError::Serialization("Invalid parent_id bytes".to_string()))?,
+        );
+        offset += 4;
+
+        // Read bitmap size (4 bytes)
+        let bitmap_size =
             u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
-                StorageError::Serialization("Invalid group count bytes".to_string())
+                StorageError::Serialization("Invalid bitmap size bytes".to_string())
             })?) as usize;
         offset += 4;
 
-        // Read each bitmap
-        let mut merging_groups = Vec::with_capacity(num_groups);
-        for _ in 0..num_groups {
-            if offset + 4 > data.len() {
-                return Err(StorageError::Serialization(
-                    "Unexpected end of data".to_string(),
-                ));
-            }
-
-            let bitmap_size =
-                u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
-                    StorageError::Serialization("Invalid bitmap size bytes".to_string())
-                })?) as usize;
-            offset += 4;
-
-            if offset + bitmap_size > data.len() {
-                return Err(StorageError::Serialization(
-                    "Bitmap data truncated".to_string(),
-                ));
-            }
-
-            let bitmap = RoaringBitmap::deserialize_from(&data[offset..offset + bitmap_size])
-                .map_err(|e| {
-                    StorageError::Serialization(format!("Bitmap deserialization failed: {}", e))
-                })?;
-            merging_groups.push(bitmap);
-            offset += bitmap_size;
+        if offset + bitmap_size > data.len() {
+            return Err(StorageError::Serialization(
+                "Bitmap data truncated".to_string(),
+            ));
         }
 
-        Ok(MergeEvent::new(threshold, merging_groups))
+        // Read child_nodes bitmap
+        let child_nodes = RoaringBitmap::deserialize_from(&data[offset..offset + bitmap_size])
+            .map_err(|e| {
+                StorageError::Serialization(format!("Bitmap deserialization failed: {}", e))
+            })?;
+
+        Ok(MergeEvent::new(threshold, parent_id, child_nodes))
     }
 }
 
@@ -403,15 +396,13 @@ impl std::fmt::Debug for DiskStorage {
 mod tests {
     use super::*;
 
-    fn create_test_merge_event(threshold: f64, num_groups: usize) -> MergeEvent {
-        let mut groups = Vec::new();
-        for i in 0..num_groups {
-            let mut bitmap = RoaringBitmap::new();
-            bitmap.insert((i * 10) as u32);
-            bitmap.insert((i * 10 + 1) as u32);
-            groups.push(bitmap);
+    fn create_test_merge_event(threshold: f64, num_records: usize) -> MergeEvent {
+        // num_records parameter controls size of child_nodes
+        let mut child_bitmap = RoaringBitmap::new();
+        for i in 0..num_records {
+            child_bitmap.insert((10 + i) as u32);
         }
-        MergeEvent::new(threshold, groups)
+        MergeEvent::new(threshold, 0, child_bitmap) // parent_id=0
     }
 
     #[test]
@@ -430,7 +421,8 @@ mod tests {
 
         let retrieved = storage.get(0).unwrap().unwrap();
         assert_eq!(retrieved.threshold, 0.8);
-        assert_eq!(retrieved.merging_groups.len(), 2);
+        assert_eq!(retrieved.parent_id, 0);
+        assert_eq!(retrieved.child_nodes.len(), 2);
     }
 
     #[test]
@@ -442,18 +434,8 @@ mod tests {
         let deserialized = DiskStorage::deserialize_event(&serialized).unwrap();
 
         assert_eq!(deserialized.threshold, event.threshold);
-        assert_eq!(
-            deserialized.merging_groups.len(),
-            event.merging_groups.len()
-        );
-
-        for (orig, deser) in event
-            .merging_groups
-            .iter()
-            .zip(&deserialized.merging_groups)
-        {
-            assert_eq!(orig, deser);
-        }
+        assert_eq!(deserialized.parent_id, event.parent_id);
+        assert_eq!(deserialized.child_nodes, event.child_nodes);
     }
 
     #[test]
@@ -500,13 +482,11 @@ mod tests {
         let read_events: Vec<_> = storage.iter()?.collect();
         assert_eq!(read_events.len(), 3);
 
-        // Verify events match by checking thresholds (they should be in same order)
+        // Verify events match by checking thresholds and structure
         for (i, read_event) in read_events.iter().enumerate() {
             assert_eq!(read_event.threshold, events[i].threshold);
-            assert_eq!(
-                read_event.merging_groups.len(),
-                events[i].merging_groups.len()
-            );
+            assert_eq!(read_event.parent_id, events[i].parent_id);
+            assert_eq!(read_event.child_nodes, events[i].child_nodes);
         }
 
         Ok(())
