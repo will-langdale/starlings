@@ -118,35 +118,23 @@ impl RecordState {
             table.col_marginals.insert(entity_id, entity.len() as u32);
         }
 
-        // Use parallel processing for large datasets
-        if num_records > 10000 {
-            // Parallel collection of entity pairs
-            let pairs: Vec<(usize, usize)> = (0..num_records)
-                .into_par_iter()
-                .filter_map(|record_idx| {
-                    let e1 = record_to_entity1.index.get(record_idx)?.as_ref()?;
-                    let e2 = record_to_entity2.index.get(record_idx)?.as_ref()?;
-                    Some((*e1, *e2))
-                })
-                .collect();
+        // Parallel collection of entity pairs
+        // Trust Rayon's work-stealing for graceful performance on all dataset sizes
+        let pairs: Vec<(usize, usize)> = (0..num_records)
+            .into_par_iter()
+            .filter_map(|record_idx| {
+                let e1 = record_to_entity1.index.get(record_idx)?.as_ref()?;
+                let e2 = record_to_entity2.index.get(record_idx)?.as_ref()?;
+                Some((*e1, *e2))
+            })
+            .collect();
 
-            // Aggregate into contingency table
-            for (entity1_idx, entity2_idx) in pairs {
-                *table
-                    .nonzero_cells
-                    .entry((entity1_idx, entity2_idx))
-                    .or_insert(0) += 1;
-            }
-        } else {
-            // Sequential processing for small datasets
-            for record_idx in 0..num_records {
-                if let (Some(Some(e1)), Some(Some(e2))) = (
-                    record_to_entity1.index.get(record_idx),
-                    record_to_entity2.index.get(record_idx),
-                ) {
-                    *table.nonzero_cells.entry((*e1, *e2)).or_insert(0) += 1;
-                }
-            }
+        // Aggregate into contingency table
+        for (entity1_idx, entity2_idx) in pairs {
+            *table
+                .nonzero_cells
+                .entry((entity1_idx, entity2_idx))
+                .or_insert(0) += 1;
         }
 
         // Compute pair counts once from the built table
