@@ -665,12 +665,12 @@ pub fn create_starlings_schema() -> Schema {
             Field::new("merge_events", DataType::List(
                 Box::new(DataType::Struct(vec![
                     Field::new("threshold", DataType::Float64, false),
-                    // RoaringBitmaps are expanded to nested lists for Arrow serialisation
-                    Field::new("merging_groups", DataType::List(
-                        Box::new(DataType::List(
-                            Box::new(DataType::UInt32)
-                        ))
-                    ), false),  // Nested lists for Vec<RoaringBitmap>
+                    // Binary delta format: parent ID + child nodes
+                    Field::new("parent_id", DataType::UInt32, false),
+                    // RoaringBitmap (child_nodes) expanded to list for Arrow serialisation
+                    Field::new("child_nodes", DataType::List(
+                        Box::new(DataType::UInt32)
+                    ), false),
                 ]))
             ), false),
         ]))), false),

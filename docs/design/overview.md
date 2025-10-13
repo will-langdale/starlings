@@ -4,9 +4,9 @@
 
 Starlings is a Python library for systematically exploring and comparing entity resolution results across different thresholds and methods. Instead of forcing threshold decisions at processing time, Starlings preserves the complete resolution space as a hierarchy of merge events, enabling instant threshold exploration, efficient metric computation, and lossless data transport between pipeline stages.
 
-## The core insight: merge events, not partitions
+## The core insight: binary delta merge events, not partitions
 
-Traditional entity resolution tools force you to choose a threshold and compute clusters at that point. To explore different thresholds, you recompute from scratch each time. Starlings takes a different approach:
+Traditional entity resolution tools force you to choose a threshold and compute clusters at that point. To explore different thresholds, you recompute from scratch each time. Starlings takes a different approach, using binary delta merge events that store only the minimal information needed to reconstruct any partition:
 
 ```python
 import starlings as sl
@@ -22,7 +22,7 @@ partition_at_90 = collection.at(0.90)  # O(1) from cache
 partition_at_8739 = collection.at(0.8739)  # Any threshold, instantly
 ```
 
-By storing the merge events—the moments when entities combine as thresholds change—we can generate any partition on demand. This isn't possible with standard dataframe libraries because they lack this hierarchical concept.
+By storing merge events in a binary delta format (parent ID + child nodes)—capturing only the moments when entities combine as thresholds change—we can generate any partition on demand whilst using O(N) memory instead of O(N²). This isn't possible with standard dataframe libraries because they lack this hierarchical concept.
 
 ## Key capabilities
 
@@ -34,6 +34,7 @@ By storing the merge events—the moments when entities combine as thresholds ch
 
 ### Represent: complete resolution space
 - Store infinite thresholds in ~60-115MB (vs ~10GB for explicit storage)
+- Binary delta merge events achieve O(N) memory scaling instead of O(N²)
 - Support n-way merges naturally (when 5 entities merge simultaneously)
 - Preserve all information for downstream decisions
 - Handle both probabilistic scores and fixed clusters uniformly

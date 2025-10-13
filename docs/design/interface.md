@@ -723,8 +723,10 @@ schema = pa.schema([
         ("name", pa.dictionary(pa.int8(), pa.string())),
         ("merge_events", pa.list_(pa.struct([
             ("threshold", pa.float64()),
-            # RoaringBitmaps are expanded to nested lists for Arrow serialisation
-            ("merging_groups", pa.list_(pa.list_(pa.uint32()))),  # Nested lists for Vec<RoaringBitmap>
+            # Binary delta format: parent ID + child nodes
+            ("parent_id", pa.uint32()),
+            # RoaringBitmap (child_nodes) expanded to list for Arrow serialisation
+            ("child_nodes", pa.list_(pa.uint32())),
         ])))
     ]))),
     
@@ -753,24 +755,20 @@ CREATE TABLE collections (
     name VARCHAR(255) UNIQUE
 );
 
--- Merge events table
+-- Merge events table (binary delta format)
 CREATE TABLE merge_events (
     merge_id INTEGER PRIMARY KEY,
     collection_id INTEGER REFERENCES collections(collection_id),
-    threshold DOUBLE
+    threshold DOUBLE,
+    parent_id INTEGER,  -- Canonical ID of surviving partition
+    INDEX idx_parent (parent_id)
 );
 
--- Merge groups table (each group within a merge event)
-CREATE TABLE merge_groups (
-    group_id INTEGER PRIMARY KEY,
-    merge_id INTEGER REFERENCES merge_events(merge_id)
-);
-
--- Records in each merge group
-CREATE TABLE merge_group_records (
-    group_id INTEGER REFERENCES merge_groups(group_id),
+-- Child nodes for each merge event (absorbed partition)
+CREATE TABLE merge_event_child_nodes (
+    merge_id INTEGER REFERENCES merge_events(merge_id),
     record_index INTEGER REFERENCES records(record_index),
-    PRIMARY KEY (group_id, record_index)
+    PRIMARY KEY (merge_id, record_index)
 );
 ```
 
