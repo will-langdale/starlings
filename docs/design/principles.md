@@ -421,6 +421,7 @@ When collections are removed from a frame, automatic compaction can reclaim unus
 - **Full threshold sweep**: O(m·k) where m is number of merge events
 - **Storage**: O(m) where m is number of edges/merge events
 - **Memory in practice**: For 1M edges, expect 60-115MB depending on merge complexity
+- **Binary delta representation**: Merge events store only the delta (child nodes + parent ID), achieving O(N) total memory usage across all events compared to O(N²) when storing full state
 
 **Mathematical properties**
 
